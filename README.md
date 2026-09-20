@@ -22,7 +22,7 @@
   - [4. Zero-Allocation Local Suggestion Index](#4-zero-allocation-local-suggestion-index)
   - [5. Document-Start YouTube Recovery Engine](#5-document-start-youtube-recovery-engine)
 - [Empirical Benchmarks & Verification](#empirical-benchmarks--verification)
-- [Q&A](#technical-interview-talking-points)
+- [Q&A](#qa)
 - [Project Structure](#project-structure)
 - [Getting Started & Build Commands](#getting-started--build-commands)
 - [License & Attributions](#license--attributions)
@@ -142,7 +142,7 @@ npm run desktop:check
 
 ---
 
-## Technical Interview Talking Points
+## Q&A
 
 ### 1. Why WinForms + WebView2 instead of Electron or Chromium Embedded Framework (CEF)?
 > *"Electron bundles both Chromium and Node.js with every application, resulting in 200–300 MB of base RAM usage and binary sizes exceeding 100 MB. By building MishaWeb in C# WinForms on top of Microsoft Edge WebView2 Evergreen, we leverage the OS-shared Chromium binaries and hardware acceleration while keeping our own host binary under 4 MB. Cold startup is sub-300ms, and we retain absolute programmatic control over process lifecycle, network request filtering, and memory targets."*
