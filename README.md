@@ -22,7 +22,7 @@
   - [4. Zero-Allocation Local Suggestion Index](#4-zero-allocation-local-suggestion-index)
   - [5. Document-Start YouTube Recovery Engine](#5-document-start-youtube-recovery-engine)
 - [Empirical Benchmarks & Verification](#empirical-benchmarks--verification)
-- [Technical Interview Talking Points](#technical-interview-talking-points)
+- [Q&A](#technical-interview-talking-points)
 - [Project Structure](#project-structure)
 - [Getting Started & Build Commands](#getting-started--build-commands)
 - [License & Attributions](#license--attributions)
