@@ -16,7 +16,7 @@ MishaWeb 2.2.0 is a compact native Windows browser built with WinForms and the i
 - Native named sessions, restart-persistent recently closed tabs, and lazy 64-tab session restoration
 - Bare-domain, localhost, IP-address, and search-aware address parsing
 - Back, forward, reload/stop, home, in-page find, zoom, and fullscreen
-- Exact-origin microphone and camera controls plus native request prompts, saved-permission management, and Windows privacy-settings shortcuts
+- Exact-origin microphone and camera controls, voice and audio input/output settings with strict whitelist policies, saved-permission management, and Windows device/privacy-settings shortcuts
 - Explicit clean-link copy, link-context cleanup, and address-bar Paste and go
 - On-demand dependency-free reader mode and manual tab unloading
 - Favorites plus a capped, local browsing-history list
@@ -54,7 +54,7 @@ YouTube also receives an audited document-start module. It removes ad placements
 
 Any HTTPS site that has been granted microphone or camera access keeps its same-origin secure WebSocket and media transport available while the shield continues filtering ordinary and third-party requests. Known Messenger/Facebook, Discord, and Zoom call transports also receive a narrow preflight exception so their connection setup can reach the permission step. Related HTTPS and `about:blank` popup compatibility stays limited to those known providers; temporary popup bootstrap URLs remain un-navigated until WebView2 attaches the real call tab, and device permission alone never grants a site scripted-popup access. Granting microphone or camera access also protects that tab from Memory Saver and Ultra-light suspension until it navigates, so a silent connecting call is not mistaken for an idle page.
 
-Use the site-information button beside the address bar to set **Microphone** or **Camera** to **Allow**, **Ask every time**, or **Block** for the current origin. The same menu opens the matching Windows privacy pages. Windows must also have **Let desktop apps access your microphone/camera** enabled; website permission cannot override an operating-system privacy block.
+Use the site-information button beside the address bar to set **Microphone** or **Camera** to **Allow**, **Ask every time**, or **Block** for the current origin. The site-information button, command palette, and main menu also offer **Voice and audio settings…** to configure strict sound output policies (allow all, only specific sites, or mute all) and microphone input policies (ask every time, only specific sites, or block all). Direct shortcuts also open Windows sound device preferences and Windows microphone privacy pages. Windows must also have **Let desktop apps access your microphone/camera** enabled; website permission cannot override an operating-system privacy block.
 
 ## Resource modes
 

@@ -1550,6 +1550,7 @@ public sealed class MainForm : Form
         appMenu.Items.Add(searchProviderMenu);
         AddMenuItem(appMenu, "Saved items\u2026", string.Empty, ShowSavedItemsDialog);
         AddMenuItem(appMenu, "Saved sessions\u2026", string.Empty, ShowSessionManager);
+        AddMenuItem(appMenu, "Voice and audio settings\u2026", string.Empty, ShowVoiceAudioSettingsDialog);
         extensionsMenuItem.Click += (_, _) => RunUiTask(
             ShowExtensionsManagerAsync,
             "Could not open the extensions manager");
@@ -7274,7 +7275,7 @@ public sealed class MainForm : Form
                 : SitePreferencePolicy.GetZoom(state.SiteZoom, tab.Url);
             tab.IsMuted = isPrivateMode
                 ? tab.IsMuted
-                : SitePreferencePolicy.IsMuted(state.MutedHosts, tab.Url);
+                : SitePreferencePolicy.ShouldMuteAudio(state.AudioOutputPolicy, state.AllowedAudioHosts, state.MutedHosts, tab.Url);
         }
 
         if (tab.View is { CoreWebView2: not null } view)
@@ -7370,14 +7371,44 @@ public sealed class MainForm : Form
 
         var host = SitePreferencePolicy.GetHost(tab.Url);
         if (host is null) return;
-        var muted = !SitePreferencePolicy.IsMuted(state.MutedHosts, host);
-        state.MutedHosts.RemoveAll(item => BrowserPolicy.IsExactHost(item, host));
-        if (muted) state.MutedHosts.Insert(0, host);
-        if (state.MutedHosts.Count > BrowserStateStore.MaximumMutedHosts)
+
+        bool muted;
+        if (state.AudioOutputPolicy == AudioOutputPolicy.SpecificSitesOnly)
         {
-            state.MutedHosts.RemoveRange(
-                BrowserStateStore.MaximumMutedHosts,
-                state.MutedHosts.Count - BrowserStateStore.MaximumMutedHosts);
+            var currentlyAllowed = state.AllowedAudioHosts.Any(item => BrowserPolicy.IsExactHost(item, host));
+            state.AllowedAudioHosts.RemoveAll(item => BrowserPolicy.IsExactHost(item, host));
+            if (!currentlyAllowed)
+            {
+                state.AllowedAudioHosts.Insert(0, host);
+                if (state.AllowedAudioHosts.Count > BrowserStateStore.MaximumAudioHosts)
+                {
+                    state.AllowedAudioHosts.RemoveRange(
+                        BrowserStateStore.MaximumAudioHosts,
+                        state.AllowedAudioHosts.Count - BrowserStateStore.MaximumAudioHosts);
+                }
+                muted = false;
+            }
+            else
+            {
+                muted = true;
+            }
+        }
+        else if (state.AudioOutputPolicy == AudioOutputPolicy.MuteAll)
+        {
+            ShowTransientStatus("Web audio is muted globally in Voice & Audio settings");
+            return;
+        }
+        else
+        {
+            muted = !SitePreferencePolicy.IsMuted(state.MutedHosts, host);
+            state.MutedHosts.RemoveAll(item => BrowserPolicy.IsExactHost(item, host));
+            if (muted) state.MutedHosts.Insert(0, host);
+            if (state.MutedHosts.Count > BrowserStateStore.MaximumMutedHosts)
+            {
+                state.MutedHosts.RemoveRange(
+                    BrowserStateStore.MaximumMutedHosts,
+                    state.MutedHosts.Count - BrowserStateStore.MaximumMutedHosts);
+            }
         }
 
         foreach (var liveTab in tabs.Where(item =>
@@ -7630,6 +7661,9 @@ public sealed class MainForm : Form
         var permissions = new ToolStripMenuItem("Review saved permissions");
         permissions.Click += (_, _) => ShowPermissionManager();
         siteInfoMenu.Items.Add(permissions);
+        var voiceAudio = new ToolStripMenuItem("Voice and audio settings\u2026");
+        voiceAudio.Click += (_, _) => ShowVoiceAudioSettingsDialog();
+        siteInfoMenu.Items.Add(voiceAudio);
         var resetPreferences = new ToolStripMenuItem("Reset site preferences");
         resetPreferences.Click += (_, _) => ResetSitePreferences(uri);
         siteInfoMenu.Items.Add(resetPreferences);
@@ -8282,6 +8316,33 @@ public sealed class MainForm : Form
                 return;
             }
 
+            if (args.PermissionKind == CoreWebView2PermissionKind.Microphone)
+            {
+                if (!SitePreferencePolicy.CanRequestMicrophone(
+                    state.AudioInputPolicy,
+                    state.AllowedMicrophoneHosts,
+                    state.BlockedMicrophoneHosts,
+                    origin,
+                    out var autoDecision))
+                {
+                    args.State = CoreWebView2PermissionState.Deny;
+                    args.SavesInProfile = false;
+                    deferral.Complete();
+                    ShowTransientStatus(state.AudioInputPolicy == AudioInputPolicy.BlockAll
+                        ? "Microphone access blocked by Voice & Audio settings"
+                        : $"Microphone access blocked for {origin} by Voice & Audio settings");
+                    return;
+                }
+                if (autoDecision == true)
+                {
+                    args.State = CoreWebView2PermissionState.Allow;
+                    args.SavesInProfile = !isPrivateMode;
+                    UpdateTabMediaPermissionState(tab, origin, args.PermissionKind, CoreWebView2PermissionState.Allow);
+                    deferral.Complete();
+                    return;
+                }
+            }
+
             if (IsMediaCapturePermission(args.PermissionKind))
             {
                 if (tab.PendingMediaPermissionRequests == 0)
@@ -8464,6 +8525,68 @@ public sealed class MainForm : Form
         permissionQueue.Clear();
         foreach (var request in remaining) permissionQueue.Enqueue(request);
         if (!replacingWindow) ShowNextPermissionRequest();
+    }
+
+    private void ShowVoiceAudioSettingsDialog()
+    {
+        var activeHost = activeTab is not null && !activeTab.IsStartPage
+            ? SitePreferencePolicy.GetHost(activeTab.Url)
+            : null;
+
+        using var dialog = new VoiceAudioSettingsDialog(
+            state,
+            activeHost,
+            result =>
+            {
+                state.AudioOutputPolicy = result.AudioOutputPolicy;
+                state.AllowedAudioHosts = result.AllowedAudioHosts.ToList();
+                state.MutedHosts = result.MutedHosts.ToList();
+                state.AudioInputPolicy = result.AudioInputPolicy;
+                state.AllowedMicrophoneHosts = result.AllowedMicrophoneHosts.ToList();
+                state.BlockedMicrophoneHosts = result.BlockedMicrophoneHosts.ToList();
+
+                ApplyAudioOutputPolicyToAllTabs();
+                ApplyAudioInputPolicyToAllTabs();
+                ScheduleStateSave();
+
+                ShowTransientStatus("Voice and audio settings updated");
+            });
+
+        dialog.ShowDialog(this);
+    }
+
+    private void ApplyAudioOutputPolicyToAllTabs()
+    {
+        foreach (var liveTab in tabs.Where(item => !item.IsClosed && !item.IsStartPage))
+        {
+            var shouldMute = isPrivateMode
+                ? liveTab.IsMuted
+                : SitePreferencePolicy.ShouldMuteAudio(state.AudioOutputPolicy, state.AllowedAudioHosts, state.MutedHosts, liveTab.Url);
+            liveTab.IsMuted = shouldMute;
+            if (liveTab.Core is not null) liveTab.Core.IsMuted = shouldMute;
+            UpdateTabHeader(liveTab);
+        }
+    }
+
+    private void ApplyAudioInputPolicyToAllTabs()
+    {
+        foreach (var liveTab in tabs.Where(item => !item.IsClosed && !item.IsStartPage))
+        {
+            var host = SitePreferencePolicy.GetHost(liveTab.Url);
+            if (state.AudioInputPolicy == AudioInputPolicy.BlockAll)
+            {
+                ClearTabMediaPermissions(liveTab);
+            }
+            else if (state.AudioInputPolicy == AudioInputPolicy.SpecificSitesOnly)
+            {
+                if (host is null || !state.AllowedMicrophoneHosts.Any(h => BrowserPolicy.IsExactHost(h, host)))
+                {
+                    var changed = liveTab.MicrophoneAllowedOrigins.Count > 0;
+                    liveTab.MicrophoneAllowedOrigins.Clear();
+                    if (changed) OnTabMediaPermissionStateChanged(liveTab);
+                }
+            }
+        }
     }
 
     private void ShowPermissionManager()
@@ -8768,6 +8891,7 @@ public sealed class MainForm : Form
             or "session-manager"
             or "downloads"
             or "permissions"
+            or "voice-audio-settings"
             or "find");
     }
 
@@ -8807,6 +8931,7 @@ public sealed class MainForm : Form
             yield return Action("Toggle shield", "Enable or disable the exact-host page shield", "shield");
             yield return Action("Keep active in background", "Protect the current site from lifecycle release", "keep-awake");
             yield return Action("Mute site", "Remember mute for the current exact host", "mute-site");
+            yield return Action("Voice and audio settings", "Configure sound output and microphone input policies", "voice-audio-settings");
             yield return Action("Fullscreen", "Toggle browser fullscreen", "fullscreen", "F11");
             yield return Action("Toggle website theme", "Change the global website color mode", "theme");
         }
@@ -8985,6 +9110,9 @@ public sealed class MainForm : Form
                 break;
             case "mute-site":
                 ToggleActiveSiteMute();
+                break;
+            case "voice-audio-settings":
+                ShowVoiceAudioSettingsDialog();
                 break;
             case "fullscreen":
                 ToggleFullScreen();
@@ -12350,7 +12478,7 @@ public sealed class MainForm : Form
 
     private bool IsTabMuted(BrowserTab tab)
     {
-        return tab.IsMuted || (!isPrivateMode && SitePreferencePolicy.IsMuted(state.MutedHosts, tab.Url));
+        return tab.IsMuted || (!isPrivateMode && SitePreferencePolicy.ShouldMuteAudio(state.AudioOutputPolicy, state.AllowedAudioHosts, state.MutedHosts, tab.Url));
     }
 
     private void ResizeTabHeaders()

@@ -22,6 +22,11 @@ internal sealed class BrowserState
     public List<ClosedTabEntry> RecentlyClosed { get; set; } = [];
     public List<SiteZoomEntry> SiteZoom { get; set; } = [];
     public List<string> MutedHosts { get; set; } = [];
+    public AudioOutputPolicy AudioOutputPolicy { get; set; } = AudioOutputPolicy.AllowAll;
+    public List<string> AllowedAudioHosts { get; set; } = [];
+    public AudioInputPolicy AudioInputPolicy { get; set; } = AudioInputPolicy.AskEveryTime;
+    public List<string> AllowedMicrophoneHosts { get; set; } = [];
+    public List<string> BlockedMicrophoneHosts { get; set; } = [];
     public List<string> AdBlockExceptionHosts { get; set; } = [];
     public List<string> DismissedSuggestionUrls { get; set; } = [];
     public List<AddressSuggestionUsage> SuggestionUsage { get; set; } = [];
@@ -76,6 +81,20 @@ internal enum BrowserMode
     Private
 }
 
+internal enum AudioOutputPolicy
+{
+    AllowAll,
+    SpecificSitesOnly,
+    MuteAll
+}
+
+internal enum AudioInputPolicy
+{
+    AskEveryTime,
+    SpecificSitesOnly,
+    BlockAll
+}
+
 internal enum SavedWindowPresentation
 {
     Normal,
@@ -111,6 +130,8 @@ internal sealed class BrowserStateStore : IDisposable
     internal const int MaximumRecentlyClosed = 20;
     internal const int MaximumSiteZoomEntries = 200;
     internal const int MaximumMutedHosts = 200;
+    internal const int MaximumAudioHosts = 200;
+    internal const int MaximumMicrophoneHosts = 200;
     internal const double MinimumSiteZoom = 0.25;
     internal const double MaximumSiteZoom = 3.0;
     private readonly string settingsPath;
@@ -852,7 +873,7 @@ internal sealed class BrowserStateStore : IDisposable
         foreach (var item in normalizedByHost.Values.Take(MaximumSiteZoomEntries)) yield return item;
     }
 
-    private static IEnumerable<string> NormalizeMutedHosts(IEnumerable<string>? entries)
+    private static IEnumerable<string> NormalizeExactHostList(IEnumerable<string>? entries, int maxCount)
     {
         if (entries is null) yield break;
 
@@ -860,10 +881,15 @@ internal sealed class BrowserStateStore : IDisposable
                      .Select(BrowserPolicy.NormalizeExactHost)
                      .OfType<string>()
                      .Distinct(StringComparer.OrdinalIgnoreCase)
-                     .Take(MaximumMutedHosts))
+                     .Take(maxCount))
         {
             yield return host;
         }
+    }
+
+    private static IEnumerable<string> NormalizeMutedHosts(IEnumerable<string>? entries)
+    {
+        return NormalizeExactHostList(entries, MaximumMutedHosts);
     }
 
     internal static void NormalizeForPersistence(BrowserState state)
@@ -889,6 +915,15 @@ internal sealed class BrowserStateStore : IDisposable
         state.RecentlyClosed = NormalizeRecentlyClosed(state.RecentlyClosed).ToList();
         state.SiteZoom = NormalizeSiteZoom(state.SiteZoom).ToList();
         state.MutedHosts = NormalizeMutedHosts(state.MutedHosts).ToList();
+        state.AudioOutputPolicy = Enum.IsDefined(state.AudioOutputPolicy)
+            ? state.AudioOutputPolicy
+            : AudioOutputPolicy.AllowAll;
+        state.AllowedAudioHosts = NormalizeExactHostList(state.AllowedAudioHosts, MaximumAudioHosts).ToList();
+        state.AudioInputPolicy = Enum.IsDefined(state.AudioInputPolicy)
+            ? state.AudioInputPolicy
+            : AudioInputPolicy.AskEveryTime;
+        state.AllowedMicrophoneHosts = NormalizeExactHostList(state.AllowedMicrophoneHosts, MaximumMicrophoneHosts).ToList();
+        state.BlockedMicrophoneHosts = NormalizeExactHostList(state.BlockedMicrophoneHosts, MaximumMicrophoneHosts).ToList();
         state.AdBlockExceptionHosts = NormalizeAdBlockExceptionHosts(state.AdBlockExceptionHosts)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Take(MaximumAdBlockExceptionHosts)

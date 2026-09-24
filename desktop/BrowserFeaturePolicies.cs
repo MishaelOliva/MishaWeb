@@ -423,4 +423,52 @@ internal static class SitePreferencePolicy
         var host = GetHost(urlOrHost);
         return host is not null && entries?.Any(item => BrowserPolicy.IsExactHost(item, host)) == true;
     }
+
+    public static bool ShouldMuteAudio(
+        AudioOutputPolicy policy,
+        IEnumerable<string>? allowedAudioHosts,
+        IEnumerable<string>? mutedHosts,
+        string? urlOrHost)
+    {
+        if (policy == AudioOutputPolicy.MuteAll) return true;
+        var host = GetHost(urlOrHost);
+        if (host is null) return false;
+        if (policy == AudioOutputPolicy.SpecificSitesOnly)
+        {
+            return allowedAudioHosts?.Any(item => BrowserPolicy.IsExactHost(item, host)) != true;
+        }
+        return mutedHosts?.Any(item => BrowserPolicy.IsExactHost(item, host)) == true;
+    }
+
+    public static bool CanRequestMicrophone(
+        AudioInputPolicy policy,
+        IEnumerable<string>? allowedMicrophoneHosts,
+        IEnumerable<string>? blockedMicrophoneHosts,
+        string? urlOrHost,
+        out bool? autoDecision)
+    {
+        var host = GetHost(urlOrHost);
+        if (policy == AudioInputPolicy.BlockAll)
+        {
+            autoDecision = false;
+            return false;
+        }
+        if (host is not null && blockedMicrophoneHosts?.Any(item => BrowserPolicy.IsExactHost(item, host)) == true)
+        {
+            autoDecision = false;
+            return false;
+        }
+        if (host is not null && allowedMicrophoneHosts?.Any(item => BrowserPolicy.IsExactHost(item, host)) == true)
+        {
+            autoDecision = true;
+            return true;
+        }
+        if (policy == AudioInputPolicy.SpecificSitesOnly)
+        {
+            autoDecision = false;
+            return false;
+        }
+        autoDecision = null;
+        return true;
+    }
 }

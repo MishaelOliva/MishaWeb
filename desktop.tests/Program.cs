@@ -1983,7 +1983,10 @@ var featureState = new BrowserState
         new SiteZoomEntry("example.com", 1),
         new SiteZoomEntry("other.example", 0.1)
     ],
-    MutedHosts = ["EXAMPLE.com", "example.com", "bad host"]
+    MutedHosts = ["EXAMPLE.com", "example.com", "bad host"],
+    AllowedAudioHosts = ["SOUND.example.com", "sound.example.com", "bad host"],
+    AllowedMicrophoneHosts = ["MIC.example.com", "mic.example.com"],
+    BlockedMicrophoneHosts = ["BLOCKED.example.com", "blocked.example.com"]
 };
 BrowserStateStore.NormalizeForPersistence(featureState);
 Check(
@@ -2004,6 +2007,13 @@ Check(
         && featureState.SiteZoom[0].ZoomFactor == BrowserStateStore.MinimumSiteZoom
         && featureState.MutedHosts.SequenceEqual(["example.com"]));
 Check(
+    "voice and audio settings normalization normalizes and deduplicates host lists",
+    featureState.AudioOutputPolicy == AudioOutputPolicy.AllowAll
+        && featureState.AudioInputPolicy == AudioInputPolicy.AskEveryTime
+        && featureState.AllowedAudioHosts.SequenceEqual(["sound.example.com"])
+        && featureState.AllowedMicrophoneHosts.SequenceEqual(["mic.example.com"])
+        && featureState.BlockedMicrophoneHosts.SequenceEqual(["blocked.example.com"]));
+Check(
     "recently closed normalization sanitizes titles and filters unsafe URLs",
     featureState.RecentlyClosed.Count == 1
         && featureState.RecentlyClosed[0].Title == "New Title"
@@ -2014,6 +2024,50 @@ Check(
         && SitePreferencePolicy.GetZoom(featureState.SiteZoom, "http://other.example/page")
             == BrowserStateStore.MinimumSiteZoom
         && SitePreferencePolicy.IsMuted(featureState.MutedHosts, "https://example.com/page"));
+Check(
+    "ShouldMuteAudio respects AllowAll, SpecificSitesOnly, and MuteAll policies",
+    !SitePreferencePolicy.ShouldMuteAudio(AudioOutputPolicy.AllowAll, ["sound.example.com"], ["muted.example.com"], "https://sound.example.com/play")
+        && SitePreferencePolicy.ShouldMuteAudio(AudioOutputPolicy.AllowAll, ["sound.example.com"], ["muted.example.com"], "https://muted.example.com/play")
+        && !SitePreferencePolicy.ShouldMuteAudio(AudioOutputPolicy.SpecificSitesOnly, ["sound.example.com"], [], "https://sound.example.com/play")
+        && SitePreferencePolicy.ShouldMuteAudio(AudioOutputPolicy.SpecificSitesOnly, ["sound.example.com"], [], "https://other.example.com/play")
+        && SitePreferencePolicy.ShouldMuteAudio(AudioOutputPolicy.MuteAll, ["sound.example.com"], [], "https://sound.example.com/play"));
+
+bool? micDecision;
+Check(
+    "CanRequestMicrophone respects BlockAll, SpecificSitesOnly, and AskEveryTime policies",
+    !SitePreferencePolicy.CanRequestMicrophone(AudioInputPolicy.BlockAll, ["mic.example.com"], [], "https://mic.example.com/", out micDecision)
+        && micDecision == false
+        && SitePreferencePolicy.CanRequestMicrophone(AudioInputPolicy.SpecificSitesOnly, ["mic.example.com"], [], "https://mic.example.com/", out micDecision)
+        && micDecision == true
+        && !SitePreferencePolicy.CanRequestMicrophone(AudioInputPolicy.SpecificSitesOnly, ["mic.example.com"], [], "https://unlisted.example.com/", out micDecision)
+        && micDecision == false
+        && SitePreferencePolicy.CanRequestMicrophone(AudioInputPolicy.AskEveryTime, ["mic.example.com"], ["blocked.example.com"], "https://mic.example.com/", out micDecision)
+        && micDecision == true
+        && !SitePreferencePolicy.CanRequestMicrophone(AudioInputPolicy.AskEveryTime, ["mic.example.com"], ["blocked.example.com"], "https://blocked.example.com/", out micDecision)
+        && micDecision == false
+        && SitePreferencePolicy.CanRequestMicrophone(AudioInputPolicy.AskEveryTime, ["mic.example.com"], ["blocked.example.com"], "https://unlisted.example.com/", out micDecision)
+        && micDecision == null);
+
+var voiceAudioDialogVerified = false;
+var voiceAudioThread = new Thread(() =>
+{
+    using var voiceAudioDialog = new VoiceAudioSettingsDialog(
+        new BrowserState
+        {
+            AudioOutputPolicy = AudioOutputPolicy.SpecificSitesOnly,
+            AllowedAudioHosts = ["allowed.example.com"],
+            AudioInputPolicy = AudioInputPolicy.SpecificSitesOnly,
+            AllowedMicrophoneHosts = ["mic.example.com"]
+        },
+        "current.example.com",
+        _ => { });
+    voiceAudioDialogVerified = voiceAudioDialog.Text == "Voice and audio settings"
+        && voiceAudioDialog.Controls.Count > 0;
+});
+voiceAudioThread.SetApartmentState(ApartmentState.STA);
+voiceAudioThread.Start();
+voiceAudioThread.Join();
+Check("VoiceAudioSettingsDialog instantiates and exposes controls cleanly", voiceAudioDialogVerified);
 
 var mruModel = new MruTabModel<string>();
 mruModel.ObserveActivation("a");
@@ -7756,7 +7810,8 @@ bool FrontendSourcesAreEncodingClean()
         ReadRepositorySource("desktop", "SmartSearchBar.cs"),
         ReadRepositorySource("desktop", "NativeFeatureSurfaces.cs"),
         ReadRepositorySource("desktop", "AddressSuggestionPopup.cs"),
-        ReadRepositorySource("desktop", "SavedItemsDialog.cs")
+        ReadRepositorySource("desktop", "SavedItemsDialog.cs"),
+        ReadRepositorySource("desktop", "VoiceAudioSettingsDialog.cs")
     };
     var suspectCharacters = new[] { '\u00C2', '\u00C3', '\u00E2', '\uFFFD' };
     var requiredGlyphs = new[]
