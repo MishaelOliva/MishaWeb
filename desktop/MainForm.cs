@@ -2138,14 +2138,28 @@ public sealed class MainForm : Form
         !isPrivateMode
         && BrowserExtensions.IsChromeWebStoreOrigin(url);
 
+    /// <summary>
+    /// Environment variable that switches the GPU rasterization flags off for a
+    /// single run. WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS can only append, so
+    /// without this the memory acceptance probe cannot A/B the flags that
+    /// dominate GPU-process commit.
+    /// </summary>
+    internal const string DisableGpuRasterizationVariable = "MISHAWEB_DISABLE_GPU_RASTERIZATION";
+
     private static CoreWebView2EnvironmentOptions CreateEnvironmentOptions()
     {
         var extraArgs = Environment.GetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
+        // These three flags route all raster work into the WebView2 GPU process,
+        // which holds roughly 90% of the private commit measured by the memory
+        // acceptance probe. They are a memory/render trade-off, so keep them
+        // switchable and measurable rather than hard-wired.
+        var gpuRasterFlags = IsGpuRasterizationDisabled() ? string.Empty :
+            "--enable-gpu-rasterization "
+            + "--enable-zero-copy "
+            + "--enable-features=CanvasOopRasterization,ParallelDownloading ";
         var baseArgs =
             "--autoplay-policy=no-user-gesture-required "
-            + "--enable-gpu-rasterization "
-            + "--enable-zero-copy "
-            + "--enable-features=CanvasOopRasterization,ParallelDownloading "
+            + gpuRasterFlags
             + "--disable-features=BackForwardCache,SpareRendererForSitePerProcess,PeriodicBackgroundSync,AudioServiceOutOfProcess,AudioServiceSandbox "
             + "--enable-quic "
             + "--enable-hardware-overlays=single-fullscreen,single-on-top";
@@ -2165,6 +2179,16 @@ public sealed class MainForm : Form
             ExclusiveUserDataFolderAccess = true,
             AdditionalBrowserArguments = mergedArgs
         };
+    }
+
+    private static bool IsGpuRasterizationDisabled()
+    {
+        var value = Environment.GetEnvironmentVariable(DisableGpuRasterizationVariable);
+        return value is not null
+            && (value.Length == 0
+                || value.Equals("1", StringComparison.Ordinal)
+                || value.Equals("true", StringComparison.OrdinalIgnoreCase)
+                || value.Equals("yes", StringComparison.OrdinalIgnoreCase));
     }
 
     private static async Task<CoreWebView2Environment> CreateEnvironmentAsync()
@@ -3565,7 +3589,7 @@ public sealed class MainForm : Form
         // recorded as a subframe under the outgoing page must not stay classified
         // as SubDocument once a new top-level document is committed, or $document
         // rules would be skipped and $subdocument rules would fire on it.
-        tab.AdBlockSubframeUrls.Clear();
+        ResetAdBlockSubframeState(tab);
         tab.IsLoading = true;
         tab.ConsecutiveSuspendFailures = 0;
         tab.StatusText = "Loading\u2026";
@@ -3750,6 +3774,60 @@ public sealed class MainForm : Form
         public bool Contains(string url) => urls.Contains(url);
 
         public void Clear() => urls.Clear();
+    }
+
+    /// <summary>
+    /// Drops the recorded subframe identities for a tab. Subframe classification
+    /// belongs to one top-level document, so every path that replaces or discards
+    /// that document must call this. It is a named method rather than an inline
+    /// Clear so the navigation, view-replacement, start-page and teardown paths
+    /// all route through one place, and so a test can assert the wiring.
+    /// </summary>
+    private static void ResetAdBlockSubframeState(BrowserTab tab) =>
+        tab.AdBlockSubframeUrls.Clear();
+
+    /// <summary>
+    /// Verifies that every place which advances or tears down a tab's top-level
+    /// document also resets its subframe identities. The subframe set lives on a
+    /// private nested tab type that cannot be constructed without a live WebView2
+    /// core, so this is checked against the source rather than at runtime. Returns
+    /// the source lines that advance a document generation without a reset.
+    /// </summary>
+    internal static IReadOnlyList<string> FindTopLevelTransitionsMissingSubframeReset(
+        string mainFormSource)
+    {
+        var missing = new List<string>();
+        var lines = mainFormSource.Split('\n');
+        for (var index = 0; index < lines.Length; index++)
+        {
+            var line = lines[index].Trim();
+            if (!line.StartsWith("tab.DocumentNavigationGeneration++", StringComparison.Ordinal))
+            {
+                continue;
+            }
+            // Look at a small window after each document-generation bump. A reset
+            // is expected within it, on its own line.
+            var resetFound = false;
+            for (var lookahead = index + 1; lookahead < Math.Min(index + 8, lines.Length); lookahead++)
+            {
+                var candidate = lines[lookahead].Trim();
+                if (candidate.StartsWith("tab.DocumentNavigationGeneration++", StringComparison.Ordinal))
+                {
+                    break;
+                }
+                if (candidate.StartsWith("ResetAdBlockSubframeState(tab)", StringComparison.Ordinal)
+                    || candidate.StartsWith("tab.AdBlockSubframeUrls.Clear()", StringComparison.Ordinal))
+                {
+                    resetFound = true;
+                    break;
+                }
+            }
+            if (!resetFound)
+            {
+                missing.Add($"{index + 1}: {line}");
+            }
+        }
+        return missing;
     }
 
     internal static AdBlockSubframeState CreateAdBlockSubframeStateForTesting()
@@ -5313,7 +5391,7 @@ public sealed class MainForm : Form
         tab.ReaderModeActive = false;
         tab.NavigationRequestId++;
         tab.DocumentNavigationGeneration++;
-        tab.AdBlockSubframeUrls.Clear();
+        ResetAdBlockSubframeState(tab);
         tab.InitializationGeneration++;
         tab.MotionPolicyGeneration++;
         tab.AllowedPopupBootstrapUrl = null;

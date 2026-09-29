@@ -2394,12 +2394,21 @@ internal sealed class AdBlockEngine
                 {
                     var denyIncluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                     var denyExcluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    // Both separators are valid in the value; normalize commas to
-                    // the one ParseDomainList splits on.
-                    var denyAllowValue = rawOption[10..].Contains('|', StringComparison.Ordinal)
-                        ? rawOption[10..]
-                        : rawOption[10..].Replace(',', '|');
-                    if (!ParseDomainList(denyAllowValue, '|', denyIncluded, denyExcluded)) return null;
+                    // SplitFilterOptions has already joined every continuation of
+                    // this value with '|', so no comma can survive to here.
+                    //
+                    // This engine compares hosts by suffix and has no CIDR matching,
+                    // so a range entry cannot be honoured. Dropping just that entry
+                    // keeps the rule, where letting it reach ParseDomainList failed
+                    // the whole parse and deleted the rule by error.
+                    var denyAllowValue = rawOption[10..]
+                        .Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                        .Where(entry => entry.IndexOf('/') < 0)
+                        .ToArray();
+                    if (!ParseDomainList(string.Join('|', denyAllowValue), '|', denyIncluded, denyExcluded))
+                    {
+                        return null;
+                    }
                     // $denyallow scopes the rule by the document it appears in, so
                     // it belongs with the $domain=~ exclusions and must be tested
                     // against the source host. It used to be merged into
@@ -2629,18 +2638,42 @@ internal sealed class AdBlockEngine
     }
 
     /// <summary>
+    /// Bare option keywords, mirroring the names AddMappedTypes understands plus
+    /// the valueless flags. A $denyallow value continues until one of these
+    /// appears. Testing "is this a known option" is the only sound discriminator:
+    /// host validity cannot be used, because Uri.CheckHostName happily accepts
+    /// bare words like "third-party" as DNS names, and a dot test rejects
+    /// legitimate entries such as "localhost" and the CIDR "10.0.0.0/8".
+    /// </summary>
+    private static readonly HashSet<string> BareOptionKeywords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        // Resource types and their aliases.
+        "document", "doc", "subdocument", "sub_frame", "frame", "popup", "popunder",
+        "script", "image", "image-set", "stylesheet", "css", "media", "font",
+        "object", "object-subrequest", "xmlhttprequest", "xhr", "fetch", "websocket",
+        "ping", "beacon", "other", "texttrack", "eventsource", "main_frame",
+        // Valueless flags.
+        "important", "match-case", "third-party", "3p", "strict3p", "~third-party",
+        "1p", "first-party", "strict1p", "~first-party", "popup", "all",
+        "generichide", "specifichide", "elemhide", "genericblock", "badfilter",
+        "csp", "replace", "removeparam", "redirect", "redirect-rule", "priority",
+        "empty", "mp4", "generichide", "specifichide", "remove", "header"
+    };
+
+    /// <summary>
     /// True when a token continues a $denyallow value rather than starting a new
-    /// option. A $denyallow value is a domain list, so a continuation is a bare
-    /// token containing a dot, such as "ads.example.com" or "~ads.example.com".
-    /// Option keywords never contain a dot, so this distinguishes them without
-    /// maintaining a list of keywords that would need updating as support grows.
+    /// option. Anything that is not a recognized option keyword continues the
+    /// value, which keeps single-label hosts, CIDR blocks and plain domains in
+    /// the list instead of letting them fall through as separate options, fail
+    /// option mapping, and delete the whole rule.
     /// </summary>
     private static bool IsDenyAllowValueContinuation(string token)
     {
+        if (token.Length == 0) return false;
         if (token.IndexOf('=') >= 0) return false;
-        var candidate = token.StartsWith('~') ? token[1..] : token;
-        return candidate.Contains('.', StringComparison.Ordinal)
-            && candidate.IndexOf('/') < 0;
+        if (BareOptionKeywords.Contains(token)) return false;
+        if (BareOptionKeywords.Contains(token.TrimStart('~'))) return false;
+        return true;
     }
 
     /// <summary>

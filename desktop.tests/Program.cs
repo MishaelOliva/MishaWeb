@@ -2877,6 +2877,36 @@ Check(
     && splitDenyAllow[1] == "denyallow=a.com|b.com"
     && splitDenyAllow[2] == "third-party");
 
+// A single-label host or a CIDR block is a valid $denyallow entry. Requiring a
+// dot in a continuation made these fall through as separate options, fail option
+// mapping, and delete the entire rule.
+Check(
+    "denyallow absorbs single-label and cidr continuations",
+    AdBlockEngine.SplitFilterOptionsForTesting("script,denyallow=a.com,localhost,10.0.0.0/8,third-party")
+        is ["script", "denyallow=a.com|localhost|10.0.0.0/8", "third-party"]);
+var denyAllowHostFormsEngine = new AdBlockEngine(initialRules:
+[
+    "||denyallow-forms.invalid^$script,denyallow=a.com,localhost,10.0.0.0/8"
+]);
+Check(
+    "a denyallow list of host forms does not delete its rule",
+    // The rule must survive intact, which is what the option splitting and the
+    // unhonorable-entry filter protect. Only domain and single-label entries are
+    // matched; this engine has no CIDR matching, so the range entry is dropped
+    // rather than allowed to delete the rule.
+    !denyAllowHostFormsEngine.ShouldBlock(
+        "https://denyallow-forms.invalid/ad.js",
+        "https://localhost/page",
+        AdBlockResourceType.Script)
+    && !denyAllowHostFormsEngine.ShouldBlock(
+        "https://denyallow-forms.invalid/ad.js",
+        "https://a.com/page",
+        AdBlockResourceType.Script)
+    && denyAllowHostFormsEngine.ShouldBlock(
+        "https://denyallow-forms.invalid/ad.js",
+        "https://allowed.invalid/page",
+        AdBlockResourceType.Script));
+
 // The subframe URL set is per-tab session state. It has to be bounded, and it has
 // to be emptied whenever the top-level document is replaced, otherwise a URL seen
 // as a subframe under one page keeps its SubDocument classification under the next.
@@ -2893,11 +2923,18 @@ for (var index = 0; index < 512; index++)
 Check(
     "subframe url set never exceeds its bound under sustained recording",
     subframeAfterOverflow == 128 && subframePeak == 128);
-var releasableSeam = MainForm.CreateAdBlockSubframeStateForTesting();
-releasableSeam.Clear();
+// The previous subframe-reset check built a state, called Clear() on it, and
+// asserted the count was zero, so it tested HashSet.Clear rather than MainForm's
+// wiring and passed even with every reset call deleted. The tab type is private
+// and needs a live WebView2 core, so the wiring is asserted against the source:
+// every top-level document transition must be followed by a reset.
+var mainFormSource = File.ReadAllText(Path.Combine(
+    AppContext.BaseDirectory, "..", "..", "..", "..", "desktop", "MainForm.cs"));
+var transitionsMissingReset = MainForm.FindTopLevelTransitionsMissingSubframeReset(mainFormSource);
 Check(
-    "subframe url set empties when the top-level document is replaced",
-    releasableSeam.Remaining == 0);
+    "every top-level document transition resets the subframe url set",
+    transitionsMissingReset.Count == 0,
+    string.Join(" | ", transitionsMissingReset));
 var boundedSeam = MainForm.CreateAdBlockSubframeStateForTesting();
 Check(
     "subframe url set holds a bounded number of entries",
@@ -8726,10 +8763,10 @@ void WriteZipText(ZipArchive archive, string path, string content)
     writer.Write(content);
 }
 
-void Check(string name, bool condition)
+void Check(string name, bool condition, string? detail = null)
 {
     checkCount++;
-    if (!condition) failures.Add(name);
+    if (!condition) failures.Add(detail is null ? name : $"{name}: {detail}");
 }
 
 bool IsRoseHue(Color color)

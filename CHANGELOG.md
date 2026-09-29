@@ -5,13 +5,26 @@
 ### Ad blocking correctness follow-up
 
 - Restored 315 wildcard `||host` rules that a single-label-host relaxation had silently disabled. `*` and `?` are host terminators, so `||cacheserve.*/promodisplay/` was being read as the host `cacheserve`, yielding a path pattern of `*/promodisplay/*` that can never match. A wildcard host is now a glob and falls back to the generic matching path.
-- Fixed a compile abort introduced while optimizing the `$badfilter` identity key. A hand-written span buffer overflowed on any rule with more options than its fixed capacity, and because the compile has no per-line recovery the entire filter set was discarded: the shipped 20-source catalog silently reduced to the 88 built-in fallback rules while reporting success. The key is built with a bounded, allocation-safe sort again, and is skipped entirely for lists that contain no `$badfilter`. Measured over the real 20-list catalog: 164,754 unique lines, 115,602 network rules, 31,135 cosmetic rules, 464 ms, 116.9 MiB.
+- Fixed a compile abort introduced while optimizing the `$badfilter` identity key. A hand-written span buffer overflowed on any rule with more options than its fixed capacity, and because the compile has no per-line recovery the entire filter set was discarded: the shipped 20-source catalog silently reduced to the 88 built-in fallback rules while reporting success. The key is built with a bounded, allocation-safe sort again, and is skipped entirely for lists that contain no `$badfilter`. Measured over the real 20-list catalog: 164,754 unique lines, 115,602 network rules, 31,135 cosmetic rules, 17,574 unsupported candidates, 0 capacity drops, identical to the pre-regression rule set. Compile time is within run-to-run noise of the unguarded pipeline (about 0.5 s either way) and allocation is about 1.6 MiB higher than the unguarded baseline, not lower: the guard saves work only for lists that contain no `$badfilter`, and the standard catalog does contain them.
+- Bounded `$denyallow` to its own value. Absorbing the whole remainder of the option text turned a trailing `$third-party` into a denyallow domain and dropped the rule's third-party scoping, so it began firing on first-party requests. A value now continues only until a recognized option keyword, so single-label hosts and CIDR blocks stay in the list. This engine has no CIDR matching, so a range entry is dropped rather than allowed to fail the parse and delete the whole rule.
 - Restored `$badfilter` matching for space-padded options, where a hand-written trim measured its length from the wrong end and left a trailing space in the comparison key.
-- Bounded `$denyallow` to its own value. Absorbing the whole remainder of the option text turned a trailing `$third-party` into a denyallow domain and dropped the rule's third-party scoping, so it began firing on first-party requests.
 - Classified subframes from URLs recorded by each frame's own navigation event. `RequestedSourceKind` cannot identify them: per the WebView2 SDK it reads `Document` for the main page, dedicated workers, iframes, and the shared-worker main script alike, so the previous fallback never fired for an iframe and instead mislabelled worker scripts as subdocuments.
 - Accept the comma form of `$denyallow`. Splitting the option text on commas truncated the value, left its tail looking like a separate option, and deleted the whole rule by failure rather than by error.
 - Restored the reordered-`$badfilter` regression test's second assertion, which had been an exact duplicate of the first and so proved nothing.
-- Kept the subframe URL set bounded at 128 entries and reset it whenever the top-level document is replaced, so a URL recorded as a subframe under one page cannot leak its classification into the next.
+- Kept the subframe URL set bounded at 128 entries and reset it through one named call on every top-level document transition, so a URL recorded as a subframe under one page cannot leak its classification into the next. A source-level guard fails if a transition is added without the reset, because the tab type cannot be constructed without a live WebView2 core.
+
+### Known issue
+
+- The memory acceptance probe (`npm run desktop:memory-churn`) currently fails its private-bytes limits on this machine. The breach is dominated by the WebView2 GPU process, which holds roughly 90% of the private commit while its working set stays around 9 MiB, and it collapses back within two cooldown samples. The managed host process returns memory during cooldown and residual process count is flat. Runs before and after these changes land in the same band, so the failure predates them.
+
+  The GPU rasterization flags were the obvious suspect and were measured rather than assumed. `MISHAWEB_DISABLE_GPU_RASTERIZATION=1` now disables them for a single run, because `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` can only append and the probe could not otherwise A/B them. A 12-cycle A/B on identical hardware:
+
+  | | GPU private | final private | churn retained | verdict |
+  | --- | --- | --- | --- | --- |
+  | flags on (default) | 329.0 MiB | 538.3 | 201.4 | FAIL |
+  | flags off | 317.1 MiB | 530.2 | 190.7 | FAIL |
+
+  The flags account for about 12 MiB, under 4% of the breach, and all three limits still fail without them. The GPU process commits roughly 317 MiB either way on this machine, so the residue is a WebView2 baseline for the current environment rather than a MishaWeb managed leak or a consequence of these flags. The flags are retained, since they are worth far more for rendering than the 12 MiB they cost, and the acceptance limits are left unchanged: this is reported as a failing gate, not re-tuned to pass.
 
 ### Ad blocking correctness
 
