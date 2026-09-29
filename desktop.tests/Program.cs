@@ -2882,19 +2882,72 @@ Check(
 // mapping, and delete the entire rule.
 // The denyallow splitter must end a value on every token the option loop would
 // handle, or the leftover token fails option mapping and deletes the whole rule.
-// Asserted against the parser rather than a hand-maintained list.
-var unrecognizedResourceTypes = AdBlockEngine.SupportedResourceTypeNamesForTesting
+//
+// Set equality, not a one-directional subset test. A subset test let the shared
+// list be pruned on either side without a red check, which is how three names
+// came to be listed as supported resource types while AddMappedTypes rejected
+// them: a $denyallow value ending in one of those was truncated and the rule
+// deleted.
+var supportedResourceTypes = AdBlockEngine.SupportedResourceTypeNamesForTesting;
+var resourceTypesUnknownToParser = supportedResourceTypes
+    .Where(name => !AdBlockEngine.IsSupportedResourceTypeNameForTesting(name))
+    .ToArray();
+var resourceTypesThatDoNotTerminateAValue = supportedResourceTypes
     .Where(name => !AdBlockEngine.IsRecognizedBareOptionForTesting(name))
     .ToArray();
+var valuelessFlagsUnknownToParser = AdBlockEngine.ValuelessOptionFlagsForTesting
+    .Where(flag => !AdBlockEngine.IsRecognizedBareOptionForTesting(flag))
+    .ToArray();
 Check(
-    "denyallow terminates a value on every supported resource type",
-    unrecognizedResourceTypes.Length == 0,
-    string.Join(", ", unrecognizedResourceTypes));
+    "every listed resource type is accepted by the option parser",
+    resourceTypesUnknownToParser.Length == 0,
+    string.Join(", ", resourceTypesUnknownToParser));
 Check(
-    "denyallow terminates a value on valueless flags and named options",
-    new[] { "third-party", "~third-party", "important", "match-case", "badfilter",
-            "generichide", "genericblock", "elemhide", "redirect", "mp4", "empty",
-            "all", "domain=a.com", "denyallow=a.com", "redirect=1x1.gif" }
+    "every listed resource type terminates a denyallow value",
+    resourceTypesThatDoNotTerminateAValue.Length == 0,
+    string.Join(", ", resourceTypesThatDoNotTerminateAValue));
+Check(
+    "every listed valueless flag terminates a denyallow value",
+    valuelessFlagsUnknownToParser.Length == 0,
+    string.Join(", ", valuelessFlagsUnknownToParser));
+
+// True set equality, read from the parser's own switch. The one-directional
+// checks above cannot catch a name being pruned from the shared list, which is
+// the edit a maintainer is most likely to make and which previously left all
+// checks green while leaving the name unhandled by the option loop.
+var adBlockEngineSource = ReadRepositorySource("desktop", "AdBlockEngine.cs");
+// Anchor on the declaration, not the name: AddMappedTypes is called from two
+// places before it is defined, and the first textual occurrence of the bare name
+// is a call site with no body.
+var addMappedTypesBody = ExtractMethodBody(adBlockEngineSource, "bool AddMappedTypes(");
+var parserTypeNames = System.Text.RegularExpressions.Regex
+    .Matches(addMappedTypesBody, "case\\s+\"([a-z0-9_\\-]+)\"\\s*:")
+    .Select(match => match.Groups[1].Value)
+    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+var listedNotInParser = supportedResourceTypes
+    .Where(name => !parserTypeNames.Contains(name))
+    .ToArray();
+var inParserNotListed = parserTypeNames
+    .Where(name => !supportedResourceTypes.Contains(name))
+    .ToArray();
+Check(
+    "the supported resource type list matches the parser's own mapping exactly",
+    parserTypeNames.Count > 0
+        && listedNotInParser.Length == 0
+        && inParserNotListed.Length == 0,
+    $"listed-not-in-parser: [{string.Join(", ", listedNotInParser)}]"
+        + $" in-parser-not-listed: [{string.Join(", ", inParserNotListed)}]");
+Check(
+    "a denyallow value ending in a resource type is not truncated",
+    AdBlockEngine.SplitFilterOptionsForTesting("script,denyallow=a.com,texttrack,main_frame,eventsource")
+        is ["script", "denyallow=a.com", "texttrack", "main_frame", "eventsource"]);
+Check(
+    "a denyallow value ending in an unsupported name is not truncated either",
+    AdBlockEngine.SplitFilterOptionsForTesting("script,denyallow=a.com,notatype")
+        is ["script", "denyallow=a.com|notatype"]);
+Check(
+    "denyallow terminates a value on named options",
+    new[] { "domain=a.com", "denyallow=a.com", "redirect=1x1.gif", "replace=/x//" }
         .All(AdBlockEngine.IsRecognizedBareOptionForTesting));
 Check(
     "denyallow continues a value for host-shaped tokens",
@@ -4183,14 +4236,20 @@ Check(
 // actually determines both behaviours.
 // The status label's paint fixes two defects: a two-line wrap, and an 11 px
 // vertical misalignment caused by pinning MaximumSize.Height, which caps the
-// control rather than the text. An ink-measurement probe was tried here and
-// removed: TextRenderer clips rather than wraps, so dropping either SingleLine
-// or VerticalCenter still produced a single centred band and the probe passed
-// against the defect it was meant to catch.
+// control rather than the text.
 //
-// The flags are asserted against the label's own body rather than the whole
-// file, because other chrome controls also call TextRenderer and a file-wide
-// match stays green when the label's flags are removed.
+// An ink-measurement probe was tried here and removed: TextRenderer clips
+// rather than wraps, so dropping either SingleLine or VerticalCenter still
+// produced a single centred band and the probe passed against the defect it was
+// meant to catch. A file-wide assertion was tried next and also removed, because
+// five other chrome controls call TextRenderer with near-identical flags. The
+// assertions are scoped to the label's own body by brace matching.
+//
+// ExtractTypeBody is a naive brace matcher with no string or comment awareness,
+// and it takes the first occurrence of the signature, so a comment naming the
+// class above its declaration would retarget it. That failure direction is
+// safe: the body truncates or shifts, the flag assertions fail loudly, and the
+// body length is reported with the failure.
 var statusLabelSource = ExtractTypeBody(mainFormThemeSource, "class AnnouncingStatusLabel");
 Check(
     "the status label paints single-line, vertically centred, right-aligned text",
@@ -4206,14 +4265,11 @@ Check(
     !mainFormThemeSource.Contains("statusLabel.MaximumSize", StringComparison.Ordinal)
         && !mainFormThemeSource.Contains("statusLabel.TextAlign", StringComparison.Ordinal)
         && !mainFormThemeSource.Contains("statusLabel.AutoEllipsis", StringComparison.Ordinal)
-        && !statusLabelSource.Contains("new SolidBrush(BackColor)", StringComparison.Ordinal));
-Check(
-    "the status label owns its own paint and carries no size cap",
-    !mainFormThemeSource.Contains("statusLabel.MaximumSize", StringComparison.Ordinal)
-        && !mainFormThemeSource.Contains("statusLabel.TextAlign", StringComparison.Ordinal)
-        && !mainFormThemeSource.Contains("statusLabel.AutoEllipsis", StringComparison.Ordinal)
-        && !mainFormThemeSource.Contains("new SolidBrush(BackColor)", StringComparison.Ordinal));
-
+        && !statusLabelSource.Contains("new SolidBrush(BackColor)", StringComparison.Ordinal),
+    $"size cap present: {mainFormThemeSource.Contains("statusLabel.MaximumSize", StringComparison.Ordinal)}"
+        + $" textAlign present: {mainFormThemeSource.Contains("statusLabel.TextAlign", StringComparison.Ordinal)}"
+        + $" autoEllipsis present: {mainFormThemeSource.Contains("statusLabel.AutoEllipsis", StringComparison.Ordinal)}"
+        + $" brush fill in label: {statusLabelSource.Contains("new SolidBrush(BackColor)", StringComparison.Ordinal)}");
 Check(
     "hover updates use stable status geometry without repeated text measurement or relayout",
     !mainFormThemeSource.Contains("statusLabel.GetPreferredSize", StringComparison.Ordinal)
@@ -8671,6 +8727,26 @@ string ReadRepositorySource(params string[] parts)
 {
     var path = FindRepositoryFile(parts);
     return path is null ? string.Empty : File.ReadAllText(path);
+}
+
+/// <summary>
+/// Returns the body of the method whose signature contains
+/// <paramref name="signature"/>, by brace matching from the opening brace to the
+/// one that closes it.
+/// </summary>
+string ExtractMethodBody(string source, string signature)
+{
+    var start = source.IndexOf(signature, StringComparison.Ordinal);
+    if (start < 0) return string.Empty;
+    var open = source.IndexOf('{', start);
+    if (open < 0) return string.Empty;
+    var depth = 0;
+    for (var index = open; index < source.Length; index++)
+    {
+        if (source[index] == '{') depth++;
+        else if (source[index] == '}' && --depth == 0) return source[open..(index + 1)];
+    }
+    return string.Empty;
 }
 
 /// <summary>
