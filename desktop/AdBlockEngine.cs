@@ -1091,7 +1091,7 @@ internal sealed class AdBlockEngine
     private static HttpClient CreateHttpClient()
     {
         var client = new HttpClient { Timeout = TimeSpan.FromSeconds(12) };
-        client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("MishaWeb", "2.2.0"));
+        client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("MishaWeb", "2.3.0"));
         return client;
     }
 

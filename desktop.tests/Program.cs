@@ -3944,9 +3944,9 @@ var informationalVersion = System.Reflection.CustomAttributeExtensions
     .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(productAssembly)
     ?.InformationalVersion;
 Check(
-    "release assemblies carry the 2.2.0 product version",
-    productAssembly.GetName().Version == new Version(2, 2, 0, 0)
-        && informationalVersion == "2.2.0");
+    "release assemblies carry the 2.3.0 product version",
+    productAssembly.GetName().Version == new Version(2, 3, 0, 0)
+        && informationalVersion == "2.3.0");
 Check(
     "new sessions default to standard memory saver",
     new BrowserState().MemorySaverEnabled && new BrowserState().UltraLightModeEnabled == false);
