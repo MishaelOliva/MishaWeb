@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import {
   analyzeChurnMemory,
   linearSlope,
-  longestIncreasingRun
+  longestIncreasingRun,
+  ownedPrivateBytes,
+  OWNED_PROCESS_GROUPS
 } from './MemoryChurnAnalysis.mjs';
 
 const MEBIBYTE = 1024 * 1024;
@@ -152,6 +154,67 @@ const ownedGroupLeak = analyzeChurnMemory({
 });
 assert.equal(ownedGroupLeak.passed, false);
 assert.ok(ownedGroupLeak.violations.some(item => item.name === 'churn-retained-private-mib'));
+
+// The peak summary wraps every group metric in { value, atElapsedMs, mib }. A
+// reader that accepts only raw numbers skips every group, returns 0, and the
+// ceiling passes for any real total. This is the shape that shipped.
+const peakShapedSample = {
+  total: { privateBytes: 690 * MEBIBYTE },
+  groups: Object.fromEntries(
+    [...OWNED_PROCESS_GROUPS, 'gpu'].map(group => [
+      group,
+      { privateBytes: { value: 40 * MEBIBYTE, atElapsedMs: 45701, mib: 40 } }
+    ])
+  )
+};
+const peakOwned = ownedPrivateBytes(peakShapedSample);
+assert.equal(peakOwned, 4 * 40 * MEBIBYTE, 'a peak-shaped sample must be summed, not zeroed');
+
+// An unreadable shape has to be distinguishable from a genuinely small figure,
+// otherwise a shape change is indistinguishable from an app that used nothing.
+assert.equal(ownedPrivateBytes({ total: { privateBytes: 100 } }), null);
+assert.equal(ownedPrivateBytes({ groups: {} }), null);
+assert.equal(
+  ownedPrivateBytes({
+    groups: Object.fromEntries(OWNED_PROCESS_GROUPS.map(group => [group, {}]))
+  }),
+  null,
+  'owned groups present but carrying no private bytes is not a measurement'
+);
+assert.throws(
+  () => analyzeChurnMemory({
+    baselineSample: { total: { privateBytes: 200 * MEBIBYTE, workingSetBytes: 0, processCount: 6, handles: 300, threads: 70 } },
+    cycleSamples: Array.from({ length: 3 }, () => ({ total: { privateBytes: 200 * MEBIBYTE, workingSetBytes: 0, processCount: 6, handles: 300, threads: 70 } })),
+    cooldownSamples: Array.from({ length: 2 }, () => ({ total: { privateBytes: 200 * MEBIBYTE, workingSetBytes: 0, processCount: 6, handles: 300, threads: 70 } }))
+  }),
+  /no readable private bytes/,
+  'a churn trace with no owned groups must abort rather than gate against zero'
+);
+
+// A trace whose owned groups are flat while the GPU helper oscillates by hundreds
+// of MiB must not read as monotonic growth. Gating the run length on the totals
+// made this fire: the totals grew 81 MiB across the cycles and produced a run of
+// 4 against a limit of 4, on series whose owned half never moved.
+const gpuChurnOnly = analyzeChurnMemory({
+  baselineSample: sample({ privateMiB: 344, gpuMiB: 151 }),
+  cycleSamples: [420, 337, 601, 402, 659, 480].map(privateMiB => sample({
+    privateMiB,
+    gpuMiB: privateMiB - 190
+  })),
+  cooldownSamples: [505, 501, 500, 502].map(privateMiB => sample({
+    privateMiB,
+    gpuMiB: privateMiB - 195
+  }))
+});
+assert.ok(
+  gpuChurnOnly.evidence.longestMonotonicGrowthRun < gpuChurnOnly.limits.maxMonotonicRun,
+  `GPU-only churn must not read as a monotonic run of ${gpuChurnOnly.evidence.longestMonotonicGrowthRun}`
+);
+assert.equal(gpuChurnOnly.evidence.suspiciousMonotonicGrowth, false);
+assert.ok(
+  gpuChurnOnly.evidence.totalCycleGrowthPrivateMiB > gpuChurnOnly.evidence.cycleGrowthPrivateMiB,
+  'the total series must still show the growth the owned series does not'
+);
 
 console.log(JSON.stringify({
   status: 'PASS',

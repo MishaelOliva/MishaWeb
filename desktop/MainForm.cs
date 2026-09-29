@@ -101,7 +101,12 @@ public sealed class MainForm : Form
     private const int MemoryScanCooldownSeconds = 1;
     private const int AddressSuggestionDebounceMs = 120;
     private const int MinimumToolbarOmniboxWidth = 240;
-    private const int MaximumToolbarStatusWidth = 150;
+    // Wide enough for the longest status the toolbar shows in practice, measured at
+// about 175 px for "Ready - 13 blocked - 1 downloading". At 150 the ellipsis
+// cut the download count off entirely. UpdateResponsiveToolbar protects
+// MinimumToolbarOmniboxWidth before showing the column, so a wider status gives
+// up space rather than pushing the omnibox below its minimum.
+private const int MaximumToolbarStatusWidth = 210;
     private const int WindowDragReserveLogicalWidth = 48;
     private static readonly Color ChromeColor = NativeUiTheme.Chrome;
     private static readonly Color ToolbarColor = NativeUiTheme.Toolbar;

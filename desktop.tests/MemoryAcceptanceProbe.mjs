@@ -44,6 +44,11 @@ const DEFAULTS = Object.freeze({
   maxFinalWorkingSetMiB: 650,
   maxPeakWorkingSetMiB: 725,
   maxFinalProcesses: 12,
+  // Fraction of the total private bytes the owned groups must account for. The
+  // managed host alone sits near 100 MiB of a ~530 MiB total, so a real run is
+  // around 0.35. A group renamed on the emitting side would drop this toward
+  // zero and quietly remove its terms from every private-bytes ceiling.
+  minOwnedPrivateShare: 0.2,
   churnCycles: 0,
   churnBatchSize: 3,
   churnDwellMs: 750,
@@ -101,10 +106,12 @@ Default churn retention ceilings (after all churn tabs close):
   cooldown plateau     ${DEFAULTS.churnPlateauToleranceMiB} MiB range
 
 Private-bytes ceilings cover the process groups this product owns (host,
-browser, renderer, utility). The process total and the WebView2 gpu helper's
-commit appear in the JSON output but are not gated: that helper reserves
-address space it does not touch, so gating on it measures Chromium's allocator
-rather than a leak in this product.
+browser, renderer, utility). The crashpad handler and the WebView2 gpu helper
+are excluded: crashpad is a crash reporter, and gpu reserves address space it
+does not touch, so gating on either measures something this product does not
+own. The process total and the gpu helper's commit appear in the JSON output
+but are not gated. owned-private-share is the floor that catches a group being
+renamed on the emitting side and silently dropped from the gated total.
 
 Output contract:
   stdout: one compact summary JSON object
@@ -146,6 +153,7 @@ function parseArgs(argv) {
     steadyToleranceMiB: DEFAULTS.steadyToleranceMiB,
     maxFinalPrivateMiB: DEFAULTS.maxFinalPrivateMiB,
     maxPeakPrivateMiB: DEFAULTS.maxPeakPrivateMiB,
+    minOwnedPrivateShare: DEFAULTS.minOwnedPrivateShare,
     maxFinalWorkingSetMiB: DEFAULTS.maxFinalWorkingSetMiB,
     maxPeakWorkingSetMiB: DEFAULTS.maxPeakWorkingSetMiB,
     maxFinalProcesses: DEFAULTS.maxFinalProcesses,
@@ -894,7 +902,12 @@ async function writeResult(outputFolder, result) {
   await mkdir(outputFolder, { recursive: true });
   const resultPath = path.join(outputFolder, 'memory-result.json');
   await writeFile(resultPath, `${JSON.stringify(result, null, 2)}\n`, 'utf8');
-  console.log(JSON.stringify({
+  // Gated figures. Read back from the checks rather than recomputed, so the
+// summary cannot disagree with the ceiling it documents. In observe-only mode
+// those gates never run and the fields are null, which is the honest answer.
+const gatedActual = name =>
+  result.acceptance?.checks?.find(item => item.name === name)?.actual ?? null;
+console.log(JSON.stringify({
     status: result.status,
     reason: result.reason,
     resultPath,
@@ -903,18 +916,22 @@ async function writeResult(outputFolder, result) {
     workload: result.configuration?.workload || null,
     processId: result.processId || null,
     steadyStateReached: result.steadyState?.reached ?? null,
-    finalPrivateMiB: result.measurement?.final?.total?.privateMiB ?? null,
-    peakPrivateMiB: result.measurement?.peak?.total?.privateBytes?.mib ?? null,
     finalWorkingSetMiB: result.measurement?.final?.total?.workingSetMiB ?? null,
     peakWorkingSetMiB: result.measurement?.peak?.total?.workingSetBytes?.mib ?? null,
     finalProcessCount: result.measurement?.final?.total?.processCount ?? null,
-    // Ungated totals, reported so the GPU reservation stays visible now that the
-    // private-bytes gates cover only the groups this product owns.
+    // Gated figures, covering only the groups this product owns. These are the
+    // same values the final-private-mib and peak-private-mib gates compare
+    // against.
     gatedProcessGroups: [...OWNED_PROCESS_GROUPS],
+    finalOwnedPrivateMiB: gatedActual('final-private-mib'),
+    peakOwnedPrivateMiB: gatedActual('peak-private-mib'),
+    ownedPrivateShare: gatedActual('owned-private-share'),
+    // Ungated totals, reported so the GPU reservation stays visible. The peak
+    // total is a sum taken across samples, so it exceeds any single sample and
+    // is not a real peak for the process set.
     totalFinalPrivateMiB: result.measurement?.final?.total?.privateMiB ?? null,
     totalPeakPrivateMiB: result.measurement?.peak?.total?.privateBytes?.mib ?? null,
     gpuFinalPrivateMiB: result.measurement?.final?.groups?.gpu?.privateMiB ?? null,
-    finalOwnedPrivateMiB: ownedPrivateBytes(result.measurement?.final) / MEBIBYTE,
     churnRetainedPrivateMiB:
       result.acceptance?.churn?.analysis?.evidence?.retainedPrivateMiB ?? null,
     churnGpuRetainedPrivateMiB:
@@ -950,6 +967,15 @@ function evaluateAcceptance(options, steadyStateReached, measurementSamples) {
     // are still reported, ungated, in the result so a real change stays visible.
     const finalOwnedPrivateBytes = ownedPrivateBytes(final);
     const peakOwnedPrivateBytes = ownedPrivateBytes(peak);
+    // A ceiling compared against null or zero is not a measurement, it is a
+    // pass. The peak summary wraps each group metric in { value, atElapsedMs },
+    // which an earlier version of this read as "no data" and reported 0 MiB
+    // against a 525 MiB limit. Fail the run loudly instead.
+    if (finalOwnedPrivateBytes === null || peakOwnedPrivateBytes === null) {
+      throw new Error(
+        'Owned process groups carry no readable private bytes. Checked groups: '
+        + `${OWNED_PROCESS_GROUPS.join(', ')}`);
+    }
     checks.push(
       {
         name: 'final-private-mib',
@@ -962,6 +988,17 @@ function evaluateAcceptance(options, steadyStateReached, measurementSamples) {
         actual: peakOwnedPrivateBytes / MEBIBYTE,
         limit: options.maxPeakPrivateMiB,
         passed: peakOwnedPrivateBytes <= options.maxPeakPrivateMiB * MEBIBYTE
+      },
+      {
+        // Ties the gated total back to the ungated one, so a group renamed on
+        // the emitting side cannot quietly remove ~100 MiB from every ceiling
+        // above while the run still reports PASS.
+        name: 'owned-private-share',
+        actual: Number(
+          (finalOwnedPrivateBytes / Math.max(1, final.total.privateBytes)).toFixed(3)
+        ),
+        limit: options.minOwnedPrivateShare,
+        passed: finalOwnedPrivateBytes >= options.minOwnedPrivateShare * final.total.privateBytes
       },
       {
         name: 'final-working-set-mib',
