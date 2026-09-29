@@ -1470,7 +1470,12 @@ public sealed class MainForm : Form
         statusLabel.Font = new Font("Segoe UI", 8.25f);
         statusLabel.AutoEllipsis = true;
         statusLabel.AutoSize = true;
-        statusLabel.MaximumSize = new Size(150, 0);
+        // Cap the width only. A zero height means "unlimited", so the previous
+        // 150x0 cap let a single-line status grow vertically and wrap to two
+        // lines inside a one-row toolbar, orphaning words next to the download
+        // button. Pinning the height to one line keeps it on one line and lets
+        // AutoEllipsis truncate instead.
+        statusLabel.MaximumSize = new Size(320, statusLabel.PreferredHeight);
         statusLabel.AccessibleName = "Browser status";
         statusLabel.AccessibleRole = AccessibleRole.StatusBar;
 
@@ -3589,7 +3594,6 @@ public sealed class MainForm : Form
         // recorded as a subframe under the outgoing page must not stay classified
         // as SubDocument once a new top-level document is committed, or $document
         // rules would be skipped and $subdocument rules would fire on it.
-        ResetAdBlockSubframeState(tab);
         tab.IsLoading = true;
         tab.ConsecutiveSuspendFailures = 0;
         tab.StatusText = "Loading\u2026";
@@ -3651,7 +3655,7 @@ public sealed class MainForm : Form
                 ? GetRequestHeader(e.Request.Headers, "Sec-Fetch-Dest")
                 : null,
             e.ResourceContext == CoreWebView2WebResourceContext.Document
-                && tab.AdBlockSubframeUrls.Contains(e.Request.Uri));
+                && tab.AdBlockSubframeUrls.Contains(e.Request.Uri, tab.DocumentNavigationGeneration));
         // A media stream is not an ad simply because it comes from one of
         // YouTube's rotating googlevideo hosts. Filter-list false positives
         // here produce the exact black/error player which a reload may hide.
@@ -3756,90 +3760,57 @@ public sealed class MainForm : Form
     /// the WebView2 SDK, can still drive the decision table.
     /// </summary>
     /// <summary>
-    /// Stand-in for the per-tab subframe URL set, used to verify its bounds and
-    /// release behaviour without constructing a WebView2-backed tab.
+    /// Per-tab record of which document URLs belong to a subframe.
+    ///
+    /// The set is scoped to a document generation rather than cleared by hand at
+    /// each transition. Four separate call sites used to have to remember to
+    /// clear it, two of them were missed by the test that was supposed to catch
+    /// exactly that, and ShowStartPage's no-view branch relies on its reset being
+    /// the only one on that path. Scoping the entries to the generation they were
+    /// recorded in makes a stale classification unreachable instead: a URL
+    /// recorded under one document simply does not match under the next.
     /// </summary>
     internal sealed class AdBlockSubframeState
     {
         private readonly HashSet<string> urls = new(StringComparer.OrdinalIgnoreCase);
+        private long recordedGeneration = -1;
 
         public int Remaining => urls.Count;
 
-        public void Record(string url)
+        public long RecordedGeneration => recordedGeneration;
+
+        public void Record(string url, long documentGeneration)
         {
+            if (recordedGeneration != documentGeneration)
+            {
+                urls.Clear();
+                recordedGeneration = documentGeneration;
+            }
             if (urls.Count >= MaximumTrackedSubframeUrlsPerTab) urls.Clear();
             urls.Add(url);
         }
 
-        public bool Contains(string url) => urls.Contains(url);
-
-        public void Clear() => urls.Clear();
+        /// <summary>
+        /// True only when this URL was recorded as a subframe of the document
+        /// identified by <paramref name="documentGeneration"/>.
+        /// </summary>
+        public bool Contains(string url, long documentGeneration) =>
+            recordedGeneration == documentGeneration && urls.Contains(url);
     }
-
     /// <summary>
-    /// Drops the recorded subframe identities for a tab. Subframe classification
-    /// belongs to one top-level document, so every path that replaces or discards
-    /// that document must call this. It is a named method rather than an inline
-    /// Clear so the navigation, view-replacement, start-page and teardown paths
-    /// all route through one place, and so a test can assert the wiring.
+    /// Creates a subframe state pre-loaded with one generation's worth of
+    /// entries, so tests can exercise the bound and the generation scoping
+    /// without constructing a WebView2-backed tab.
     /// </summary>
-    private static void ResetAdBlockSubframeState(BrowserTab tab) =>
-        tab.AdBlockSubframeUrls.Clear();
-
-    /// <summary>
-    /// Verifies that every place which advances or tears down a tab's top-level
-    /// document also resets its subframe identities. The subframe set lives on a
-    /// private nested tab type that cannot be constructed without a live WebView2
-    /// core, so this is checked against the source rather than at runtime. Returns
-    /// the source lines that advance a document generation without a reset.
-    /// </summary>
-    internal static IReadOnlyList<string> FindTopLevelTransitionsMissingSubframeReset(
-        string mainFormSource)
-    {
-        var missing = new List<string>();
-        var lines = mainFormSource.Split('\n');
-        for (var index = 0; index < lines.Length; index++)
-        {
-            var line = lines[index].Trim();
-            if (!line.StartsWith("tab.DocumentNavigationGeneration++", StringComparison.Ordinal))
-            {
-                continue;
-            }
-            // Look at a small window after each document-generation bump. A reset
-            // is expected within it, on its own line.
-            var resetFound = false;
-            for (var lookahead = index + 1; lookahead < Math.Min(index + 8, lines.Length); lookahead++)
-            {
-                var candidate = lines[lookahead].Trim();
-                if (candidate.StartsWith("tab.DocumentNavigationGeneration++", StringComparison.Ordinal))
-                {
-                    break;
-                }
-                if (candidate.StartsWith("ResetAdBlockSubframeState(tab)", StringComparison.Ordinal)
-                    || candidate.StartsWith("tab.AdBlockSubframeUrls.Clear()", StringComparison.Ordinal))
-                {
-                    resetFound = true;
-                    break;
-                }
-            }
-            if (!resetFound)
-            {
-                missing.Add($"{index + 1}: {line}");
-            }
-        }
-        return missing;
-    }
-
-    internal static AdBlockSubframeState CreateAdBlockSubframeStateForTesting()
+    internal static AdBlockSubframeState CreateAdBlockSubframeStateForTesting(long documentGeneration = 0)
     {
         var state = new AdBlockSubframeState();
         for (var index = 0; index < MaximumTrackedSubframeUrlsPerTab; index++)
         {
-            state.Record($"https://preloaded{index}.invalid/page");
+            state.Record($"https://preloaded{index}.invalid/page", documentGeneration);
         }
         return state;
     }
-
     internal static AdBlockResourceType MapResourceTypeForTesting(
         string? webViewContext,
         string? fetchDestination = null,
@@ -4208,7 +4179,7 @@ public sealed class MainForm : Form
             // labels identically. See MapResourceType.
             if (BrowserPolicy.IsHttpUrl(e.Uri))
             {
-                tab.AdBlockSubframeUrls.Record(e.Uri);
+                tab.AdBlockSubframeUrls.Record(e.Uri, frameDocumentGeneration);
             }
         };
         EventHandler<CoreWebView2DOMContentLoadedEventArgs> domContentLoadedHandler = (_, _) =>
@@ -5391,7 +5362,6 @@ public sealed class MainForm : Form
         tab.ReaderModeActive = false;
         tab.NavigationRequestId++;
         tab.DocumentNavigationGeneration++;
-        ResetAdBlockSubframeState(tab);
         tab.InitializationGeneration++;
         tab.MotionPolicyGeneration++;
         tab.AllowedPopupBootstrapUrl = null;
@@ -5495,7 +5465,6 @@ public sealed class MainForm : Form
         tab.MicrophoneAllowedOrigins.Clear();
         tab.CameraAllowedOrigins.Clear();
         tab.FrameOrigins.Clear();
-        tab.AdBlockSubframeUrls.Clear();
         tab.PendingMediaPermissionRequests = 0;
         tab.PendingMediaPermissionOrigin = null;
         tab.PendingMediaPermissionRefreshes = 0;
@@ -14553,7 +14522,6 @@ public sealed class MainForm : Form
             }
             frameSubscriptions.Clear();
             AdBlockFrames.Clear();
-            AdBlockSubframeUrls.Clear();
             FrameOrigins.Clear();
             FrameSetupInProgress.Clear();
         }

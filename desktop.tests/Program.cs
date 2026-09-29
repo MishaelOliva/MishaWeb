@@ -2917,34 +2917,42 @@ var subframeAfterOverflow = subframeSeam.Remaining;
 var subframePeak = subframeAfterOverflow;
 for (var index = 0; index < 512; index++)
 {
-    subframeSeam.Record($"https://frame{index}.invalid/page");
+    subframeSeam.Record($"https://frame{index}.invalid/page", 0);
     subframePeak = Math.Max(subframePeak, subframeSeam.Remaining);
 }
 Check(
     "subframe url set never exceeds its bound under sustained recording",
-    subframeAfterOverflow == 128 && subframePeak == 128);
-// The previous subframe-reset check built a state, called Clear() on it, and
-// asserted the count was zero, so it tested HashSet.Clear rather than MainForm's
-// wiring and passed even with every reset call deleted. The tab type is private
-// and needs a live WebView2 core, so the wiring is asserted against the source:
-// every top-level document transition must be followed by a reset.
-var mainFormSource = File.ReadAllText(Path.Combine(
-    AppContext.BaseDirectory, "..", "..", "..", "..", "desktop", "MainForm.cs"));
-var transitionsMissingReset = MainForm.FindTopLevelTransitionsMissingSubframeReset(mainFormSource);
+    subframeAfterOverflow == 128 && subframePeak == 128);// The subframe set is scoped to a document generation rather than cleared by
+// hand at four separate transition sites. Two of those four were missed by the
+// previous source-scanning guard, and ShowStartPage's no-view branch depends on
+// its reset being the only one on that path. Scoping the entries makes a stale
+// classification unreachable, so the invariant is checked behaviourally.
+var generationScoped = MainForm.CreateAdBlockSubframeStateForTesting(documentGeneration: 7);
 Check(
-    "every top-level document transition resets the subframe url set",
-    transitionsMissingReset.Count == 0,
-    string.Join(" | ", transitionsMissingReset));
+    "subframe urls recorded for the current document are recognised",
+    generationScoped.Contains("https://preloaded0.invalid/page", 7)
+    && generationScoped.Contains("https://preloaded127.invalid/page", 7));
+Check(
+    "subframe urls do not leak into the next top-level document",
+    !generationScoped.Contains("https://preloaded0.invalid/page", 8)
+    && !generationScoped.Contains("https://preloaded127.invalid/page", 8));
+var reusedAfterNavigation = MainForm.CreateAdBlockSubframeStateForTesting(documentGeneration: 7);
+reusedAfterNavigation.Record("https://late-frame.invalid/page", 8);
+Check(
+    "recording under a new generation discards the previous document's urls",
+    reusedAfterNavigation.Contains("https://late-frame.invalid/page", 8)
+    && !reusedAfterNavigation.Contains("https://preloaded0.invalid/page", 8)
+    && reusedAfterNavigation.Remaining == 1);
 var boundedSeam = MainForm.CreateAdBlockSubframeStateForTesting();
 Check(
     "subframe url set holds a bounded number of entries",
-    boundedSeam.Remaining == 128 && boundedSeam.Contains("https://preloaded0.invalid/page"));
+    boundedSeam.Remaining == 128 && boundedSeam.Contains("https://preloaded0.invalid/page", 0));
 Check(
     "subframe classification is driven by membership, not by arrival order",
     MainForm.MapResourceTypeForTesting(
         "Document",
         fetchDestination: null,
-        requestUrlIsKnownSubframe: boundedSeam.Contains("https://preloaded0.invalid/page"))
+        requestUrlIsKnownSubframe: boundedSeam.Contains("https://preloaded0.invalid/page", 0))
         == AdBlockResourceType.SubDocument);
 
 // $denyallow=a.com means "do not apply on a.com"; the ~ form negates that, so

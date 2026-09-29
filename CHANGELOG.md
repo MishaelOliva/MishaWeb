@@ -11,20 +11,24 @@
 - Classified subframes from URLs recorded by each frame's own navigation event. `RequestedSourceKind` cannot identify them: per the WebView2 SDK it reads `Document` for the main page, dedicated workers, iframes, and the shared-worker main script alike, so the previous fallback never fired for an iframe and instead mislabelled worker scripts as subdocuments.
 - Accept the comma form of `$denyallow`. Splitting the option text on commas truncated the value, left its tail looking like a separate option, and deleted the whole rule by failure rather than by error.
 - Restored the reordered-`$badfilter` regression test's second assertion, which had been an exact duplicate of the first and so proved nothing.
-- Kept the subframe URL set bounded at 128 entries and reset it through one named call on every top-level document transition, so a URL recorded as a subframe under one page cannot leak its classification into the next. A source-level guard fails if a transition is added without the reset, because the tab type cannot be constructed without a live WebView2 core.
+- Scoped the subframe URL set to the document generation it was recorded in, instead of clearing it by hand at four separate transition sites. Bounded at 128 entries. A URL recorded as a subframe under one document no longer classifies as one under the next, and the four explicit reset calls are gone, so there is no longer a call that can be forgotten. Two of the four sites were missed by the source-scanning guard that was meant to catch exactly that.
+
+- Fixed the toolbar status label wrapping to two lines. `MaximumSize` used a zero height, which means unlimited, so the 150 px width cap let a one-line status grow vertically and orphan words next to the download button. The height is now pinned to one line and the width cap raised, so a long status ellipsizes on one line instead.
 
 ### Known issue
 
-- The memory acceptance probe (`npm run desktop:memory-churn`) currently fails its private-bytes limits on this machine. The breach is dominated by the WebView2 GPU process, which holds roughly 90% of the private commit while its working set stays around 9 MiB, and it collapses back within two cooldown samples. The managed host process returns memory during cooldown and residual process count is flat. Runs before and after these changes land in the same band, so the failure predates them.
+- The memory acceptance probe (`npm run desktop:memory-churn`) currently fails four of its limits on this machine: final private 538.3 MiB against 450, peak private 538.7 against 525, churn-retained private 201.4 against 96, and a monotonic growth run of 5 against a limit of 4. The shape is healthy and the breach is not a managed leak: the MishaWeb host process grows 97.8 to 107.2 MiB across 12 cycles, about 0.8 MiB per cycle, settling at 100.7; the WebView2 renderer is flat at 24 MiB; working set falls to 63.5 MiB and retained working set is −476.8 MiB; the cooldown plateau range is 0.4 MiB; and residual process count is unchanged at 7. Memory is handed back, which a leak does not do.
 
-  The GPU rasterization flags were the obvious suspect and were measured rather than assumed. `MISHAWEB_DISABLE_GPU_RASTERIZATION=1` now disables them for a single run, because `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` can only append and the probe could not otherwise A/B them. A 12-cycle A/B on identical hardware:
+  The WebView2 GPU process accounts for 182.6 MiB of the 201.4 MiB retained, and its working set is about 9 MiB against roughly 330 MiB of private commit, so it is reserving rather than holding. That is 61% of the steady-state private total of 538.3 MiB, and 91% of the retained delta. Runs before and after these changes land in the same 159 to 211 MiB retained band, so the failure predates them.
+
+  The GPU rasterization flags were the obvious suspect and were measured rather than assumed. `MISHAWEB_DISABLE_GPU_RASTERIZATION=1` is a diagnostic switch that disables them for a single run; it exists in the app because `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` can only append flags, so there is no way to reach them from outside for an A/B. A 12-cycle A/B on identical hardware:
 
   | | GPU private | final private | churn retained | verdict |
   | --- | --- | --- | --- | --- |
   | flags on (default) | 329.0 MiB | 538.3 | 201.4 | FAIL |
   | flags off | 317.1 MiB | 530.2 | 190.7 | FAIL |
 
-  The flags account for about 12 MiB, under 4% of the breach, and all three limits still fail without them. The GPU process commits roughly 317 MiB either way on this machine, so the residue is a WebView2 baseline for the current environment rather than a MishaWeb managed leak or a consequence of these flags. The flags are retained, since they are worth far more for rendering than the 12 MiB they cost, and the acceptance limits are left unchanged: this is reported as a failing gate, not re-tuned to pass.
+  The flags account for about 12 MiB, under 4% of the breach, and the same three limits still fail without them. The GPU process commits 329.0 MiB with the flags and 317.1 MiB without, so it is not near zero either way and the residue is a WebView2 baseline for the current environment rather than a MishaWeb managed leak. The flags are retained, since they are worth far more for rendering than the 12 MiB they cost, and the acceptance limits are left unchanged: this is reported as a failing gate, not re-tuned to pass.
 
 ### Ad blocking correctness
 
