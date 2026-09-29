@@ -8,21 +8,34 @@ import {
 } from './MemoryChurnAnalysis.mjs';
 
 const MEBIBYTE = 1024 * 1024;
+// gpuMiB is split out so a test can put growth in the Chromium helper, which is
+// reported but not gated, and growth in the groups the product owns, which is.
 const sample = ({
   privateMiB,
+  gpuMiB = 0,
   workingSetMiB = privateMiB + 30,
   processCount = 6,
   handles = 320,
   threads = 72
-}) => ({
-  total: {
-    privateBytes: privateMiB * MEBIBYTE,
-    workingSetBytes: workingSetMiB * MEBIBYTE,
-    processCount,
-    handles,
-    threads
-  }
-});
+}) => {
+  const owned = (privateMiB - gpuMiB) * MEBIBYTE;
+  return {
+    total: {
+      privateBytes: privateMiB * MEBIBYTE,
+      workingSetBytes: workingSetMiB * MEBIBYTE,
+      processCount,
+      handles,
+      threads
+    },
+    groups: {
+      host: { privateBytes: owned * 0.5 },
+      browser: { privateBytes: owned * 0.25 },
+      renderer: { privateBytes: owned * 0.15 },
+      utility: { privateBytes: owned * 0.1 },
+      gpu: { privateBytes: gpuMiB * MEBIBYTE }
+    }
+  };
+};
 
 assert.equal(linearSlope([10, 20, 30, 40]), 10);
 assert.equal(linearSlope([40, 30, 20, 10]), -10);
@@ -102,6 +115,43 @@ assert.throws(
     cooldownSamples: []
   }),
   /at least two samples/);
+
+// A GPU helper that reserves several hundred MiB is reported, not gated. This
+// is the shape the real probe produced: the owned groups are flat, the Chromium
+// GPU commit moves, and no threshold is moved to accommodate it.
+const gpuReservationOnly = analyzeChurnMemory({
+  baselineSample: sample({ privateMiB: 344, gpuMiB: 151 }),
+  cycleSamples: [353, 500, 470, 520, 495, 510].map(privateMiB => sample({
+    privateMiB,
+    gpuMiB: privateMiB - 193
+  })),
+  cooldownSamples: [520, 505, 502, 500].map(privateMiB => sample({
+    privateMiB,
+    gpuMiB: privateMiB - 195
+  }))
+});
+assert.equal(gpuReservationOnly.passed, true, JSON.stringify(gpuReservationOnly.violations));
+assert.ok(gpuReservationOnly.evidence.gpuRetainedPrivateMiB > 150);
+assert.ok(gpuReservationOnly.evidence.retainedPrivateMiB <= 16);
+assert.deepEqual(
+  gpuReservationOnly.evidence.gatedProcessGroups,
+  ['host', 'browser', 'renderer', 'utility']);
+
+// The same growth in a group the product owns is still a failure, so excluding
+// the GPU helper has not weakened the gate.
+const ownedGroupLeak = analyzeChurnMemory({
+  baselineSample: sample({ privateMiB: 344, gpuMiB: 151 }),
+  cycleSamples: [400, 430, 460, 490, 520, 550].map(privateMiB => sample({
+    privateMiB,
+    gpuMiB: 151
+  })),
+  cooldownSamples: [545, 550, 552, 554].map(privateMiB => sample({
+    privateMiB,
+    gpuMiB: 151
+  }))
+});
+assert.equal(ownedGroupLeak.passed, false);
+assert.ok(ownedGroupLeak.violations.some(item => item.name === 'churn-retained-private-mib'));
 
 console.log(JSON.stringify({
   status: 'PASS',

@@ -273,14 +273,8 @@ internal sealed class AdBlockEngine
     internal static bool IsRecognizedBareOptionForTesting(string token) =>
         FilterRule.IsRecognizedBareOption(token);
 
-    internal static IReadOnlyList<string> SupportedResourceTypeNamesForTesting =>
-        FilterRule.SupportedResourceTypeNames;
-
-    internal static IReadOnlyList<string> ValuelessOptionFlagsForTesting =>
+    internal static IReadOnlyCollection<string> ValuelessOptionFlagsForTesting =>
         FilterRule.ValuelessOptionFlags;
-
-    internal static bool IsSupportedResourceTypeNameForTesting(string name) =>
-        FilterRule.IsSupportedResourceTypeName(name);
 
 
 
@@ -2575,8 +2569,14 @@ internal sealed class AdBlockEngine
                 case "css": output |= ResourceMask(AdBlockResourceType.Stylesheet); return true;
                 case "media":
                 case "texttrack":
-                case "eventsource":
                     output |= ResourceMask(AdBlockResourceType.Media);
+                    return true;
+                case "eventsource":
+                    // Must agree with how MapResourceType files a live request:
+                    // an EventSource request is classified XmlHttpRequest, so
+                    // mapping this name to Media would compile a rule that can
+                    // never match.
+                    output |= ResourceMask(AdBlockResourceType.XmlHttpRequest);
                     return true;
                 case "font": output |= ResourceMask(AdBlockResourceType.Font); return true;
                 case "xmlhttprequest":
@@ -2655,83 +2655,30 @@ internal sealed class AdBlockEngine
     }
 
     /// <summary>
-    /// Bare option keywords. A $denyallow value continues until one of these
-    /// appears. Testing "is this a known option" is the only sound discriminator:
-    /// host validity cannot be used, because Uri.CheckHostName happily accepts
-    /// bare words like "third-party" as DNS names, and a dot test rejects
-    /// legitimate entries such as "localhost" and the CIDR "10.0.0.0/8".
-    ///
-    /// The resource-type half of this set is not a restatement of the parser; it
-    /// is the same set <see cref="IsSupportedResourceTypeName"/> is derived from,
-    /// which is built by asking AddMappedTypes about each name in
-    /// <see cref="SupportedResourceTypeNames"/>. Asserting the two agree is what
-    /// stops a name from being accepted here but rejected by the option loop,
-    /// which would truncate a $denyallow value and then delete the whole rule.
+    /// Valueless flags the option loop matches by literal comparison, as opposed
+    /// to the resource types it maps through AddMappedTypes. A $denyallow value
+    /// continues until one of these or a mapped resource type appears.
     /// </summary>
-    /// <summary>
-    /// Every name the option loop recognises as a resource type. This is the
-    /// single source of truth: it is what AddMappedTypes is written against and
-    /// what <see cref="IsSupportedResourceTypeName"/> probes, so the two cannot
-    /// drift apart.
-    /// </summary>
-    internal static readonly string[] SupportedResourceTypeNames =
-    [
-        "document", "doc", "popup", "popunder", "main_frame",
-        "subdocument", "sub_frame", "frame",
-        "script", "image", "image-set", "stylesheet", "css",
-        "media", "texttrack", "eventsource", "font",
-        "xmlhttprequest", "xhr", "fetch", "websocket",
-        "ping", "beacon", "object", "object-subrequest", "other"
-    ];
-
-    /// <summary>Valueless flags the option loop matches by literal comparison.</summary>
-    internal static readonly string[] ValuelessOptionFlags =
-    [
+    internal static readonly HashSet<string> ValuelessOptionFlags =
+        new(StringComparer.OrdinalIgnoreCase)
+    {
         "important", "match-case", "third-party", "3p", "strict3p", "~third-party",
         "1p", "first-party", "strict1p", "~first-party", "all", "empty", "mp4",
         "generichide", "specifichide", "elemhide", "genericblock", "badfilter",
         "redirect", "redirect-rule", "priority"
-    ];
-
-    // Declared after the two arrays it is built from: static initializers run in
-    // textual order, so reading them from here would see null.
-    private static readonly HashSet<string> BareOptionKeywords = BuildBareOptionKeywords();
-
-    private static HashSet<string> BuildBareOptionKeywords()
-    {
-        var keywords = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        // The resource-type half is probed against the parser rather than
-        // transcribed, so a name is only treated as an option here if the option
-        // loop would actually accept it.
-        var probe = 0u;
-        foreach (var name in SupportedResourceTypeNames)
-        {
-            if (!AddMappedTypes(name, ref probe))
-            {
-                throw new InvalidOperationException(
-                    $"'{name}' is listed as a supported resource type but AddMappedTypes rejects it.");
-            }
-            keywords.Add(name);
-        }
-
-        // Valueless flags are matched literally by the option loop, so they are
-        // listed rather than probed.
-        foreach (var flag in ValuelessOptionFlags)
-        {
-            keywords.Add(flag);
-        }
-        return keywords;
-    }
+    };
 
     /// <summary>
-    /// True when AddMappedTypes accepts this name. Derived from the parser, so it
-    /// cannot claim a resource type the option loop would reject.
+    /// True when AddMappedTypes accepts this name, matched case-insensitively to
+    /// match how the option loop lower-cases options before parsing. Delegating
+    /// to the parser is what keeps this boundary from drifting away from it: a
+    /// name accepted here but rejected there would truncate a $denyallow value,
+    /// and the leftover token would then fail option mapping and delete the rule.
     /// </summary>
-    internal static bool IsSupportedResourceTypeName(string name)
+    private static bool IsSupportedResourceTypeName(string name)
     {
         var probe = 0u;
-        return AddMappedTypes(name, ref probe);
+        return AddMappedTypes(name.ToLowerInvariant(), ref probe);
     }
 
     /// <summary>
@@ -2751,12 +2698,12 @@ internal sealed class AdBlockEngine
         // resource-type mapping, so it terminates a value.
         if (token.IndexOf('=') >= 0) return true;
 
+        if (ValuelessOptionFlags.Contains(token)) return true;
         if (IsSupportedResourceTypeName(token)) return true;
-        if (ValuelessOptionFlags.Contains(token, StringComparer.OrdinalIgnoreCase)) return true;
 
-        // A "~" prefix only negates a flag; a negated resource type such as
-        // "~script" is not a name the option loop handles on its own, but
-        // treating it as one is harmless and keeps the boundary stable.
+        // A "~" prefix negates a type, so "~script" is a token the option loop
+        // handles. Keeping the boundary symmetric avoids a value ending in a
+        // negated type being absorbed and parsed as a domain.
         return token.StartsWith('~') && IsSupportedResourceTypeName(token[1..]);
     }
 

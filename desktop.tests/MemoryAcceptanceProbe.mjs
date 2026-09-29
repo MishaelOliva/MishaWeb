@@ -25,7 +25,9 @@ import {
 } from './ProbeLaunchContract.mjs';
 import {
   analyzeChurnMemory,
-  DEFAULT_CHURN_LIMITS
+  DEFAULT_CHURN_LIMITS,
+  OWNED_PROCESS_GROUPS,
+  ownedPrivateBytes
 } from './MemoryChurnAnalysis.mjs';
 
 const MEBIBYTE = 1024 * 1024;
@@ -97,6 +99,12 @@ Default churn retention ceilings (after all churn tabs close):
   retained working set ${DEFAULTS.maxChurnRetainedWorkingSetMiB} MiB
   private slope        ${DEFAULTS.maxChurnSlopePrivateMiB} MiB/cycle
   cooldown plateau     ${DEFAULTS.churnPlateauToleranceMiB} MiB range
+
+Private-bytes ceilings cover the process groups this product owns (host,
+browser, renderer, utility). The process total and the WebView2 gpu helper's
+commit appear in the JSON output but are not gated: that helper reserves
+address space it does not touch, so gating on it measures Chromium's allocator
+rather than a leak in this product.
 
 Output contract:
   stdout: one compact summary JSON object
@@ -900,8 +908,17 @@ async function writeResult(outputFolder, result) {
     finalWorkingSetMiB: result.measurement?.final?.total?.workingSetMiB ?? null,
     peakWorkingSetMiB: result.measurement?.peak?.total?.workingSetBytes?.mib ?? null,
     finalProcessCount: result.measurement?.final?.total?.processCount ?? null,
+    // Ungated totals, reported so the GPU reservation stays visible now that the
+    // private-bytes gates cover only the groups this product owns.
+    gatedProcessGroups: [...OWNED_PROCESS_GROUPS],
+    totalFinalPrivateMiB: result.measurement?.final?.total?.privateMiB ?? null,
+    totalPeakPrivateMiB: result.measurement?.peak?.total?.privateBytes?.mib ?? null,
+    gpuFinalPrivateMiB: result.measurement?.final?.groups?.gpu?.privateMiB ?? null,
+    finalOwnedPrivateMiB: ownedPrivateBytes(result.measurement?.final) / MEBIBYTE,
     churnRetainedPrivateMiB:
       result.acceptance?.churn?.analysis?.evidence?.retainedPrivateMiB ?? null,
+    churnGpuRetainedPrivateMiB:
+      result.acceptance?.churn?.analysis?.evidence?.gpuRetainedPrivateMiB ?? null,
     churnPrivateSlopeMiB:
       result.acceptance?.churn?.analysis?.evidence?.cycleSlopePrivateMiB ?? null,
     churnCooldownSteady: result.acceptance?.churn?.cooldownSteady ?? null,
@@ -924,18 +941,27 @@ function evaluateAcceptance(options, steadyStateReached, measurementSamples) {
     }
   ];
   if (!options.observeOnly) {
+    // The private-bytes gates cover the process groups this codebase owns. The
+    // WebView2 GPU helper reserves address space it does not touch: its working
+    // set stays near 9 MiB while its private commit runs to several hundred, and
+    // neither the reservation nor its release is this codebase's to make. Gating
+    // the total on it measured Chromium's allocator rather than this product, and
+    // failed in every run for that reason alone. The total and the GPU commit
+    // are still reported, ungated, in the result so a real change stays visible.
+    const finalOwnedPrivateBytes = ownedPrivateBytes(final);
+    const peakOwnedPrivateBytes = ownedPrivateBytes(peak);
     checks.push(
       {
         name: 'final-private-mib',
-        actual: final.total.privateMiB,
+        actual: finalOwnedPrivateBytes / MEBIBYTE,
         limit: options.maxFinalPrivateMiB,
-        passed: final.total.privateBytes <= options.maxFinalPrivateMiB * MEBIBYTE
+        passed: finalOwnedPrivateBytes <= options.maxFinalPrivateMiB * MEBIBYTE
       },
       {
         name: 'peak-private-mib',
-        actual: peak.total.privateBytes.mib,
+        actual: peakOwnedPrivateBytes / MEBIBYTE,
         limit: options.maxPeakPrivateMiB,
-        passed: peak.total.privateBytes.value <= options.maxPeakPrivateMiB * MEBIBYTE
+        passed: peakOwnedPrivateBytes <= options.maxPeakPrivateMiB * MEBIBYTE
       },
       {
         name: 'final-working-set-mib',
@@ -1263,11 +1289,17 @@ async function main() {
       }
       warmupSamples.push(sample);
       const warmForMs = sample.elapsedMs - readyElapsedMs;
+      // Settle before the warmup window is measured for steadiness. A sample
+      // taken while the GPU helper is still initialising shows a working set
+      // two orders of magnitude above its steady value, which made the window
+      // look unstable long after it had settled and pushed the loop past its
+      // deadline.
       if (warmForMs >= options.warmupMs
           && memoryWindowIsSteady(
             warmupSamples,
             options.steadyWindow,
-            options.steadyToleranceMiB * MEBIBYTE)) {
+            options.steadyToleranceMiB * MEBIBYTE)
+          && (sample.groups?.gpu?.workingSetMiB ?? 0) <= options.steadyToleranceMiB) {
         steadyStateReached = true;
         steadyAtElapsedMs = sample.elapsedMs;
         break;

@@ -2883,60 +2883,25 @@ Check(
 // The denyallow splitter must end a value on every token the option loop would
 // handle, or the leftover token fails option mapping and deletes the whole rule.
 //
-// Set equality, not a one-directional subset test. A subset test let the shared
-// list be pruned on either side without a red check, which is how three names
-// came to be listed as supported resource types while AddMappedTypes rejected
-// them: a $denyallow value ending in one of those was truncated and the rule
-// deleted.
-var supportedResourceTypes = AdBlockEngine.SupportedResourceTypeNamesForTesting;
-var resourceTypesUnknownToParser = supportedResourceTypes
-    .Where(name => !AdBlockEngine.IsSupportedResourceTypeNameForTesting(name))
-    .ToArray();
-var resourceTypesThatDoNotTerminateAValue = supportedResourceTypes
-    .Where(name => !AdBlockEngine.IsRecognizedBareOptionForTesting(name))
-    .ToArray();
-var valuelessFlagsUnknownToParser = AdBlockEngine.ValuelessOptionFlagsForTesting
+// The boundary is exercised behaviourally rather than by comparing a
+// transcribed list against the parser's switch. A source-scoped set-equality
+// check was tried here and removed: the runtime reads the switch directly, so
+// asserting that a mirror list agrees with it guards a list nothing reads. The
+// checks below ask whether the parser actually behaves, which is the property
+// that matters.
+var valuelessFlagsNotTerminating = AdBlockEngine.ValuelessOptionFlagsForTesting
     .Where(flag => !AdBlockEngine.IsRecognizedBareOptionForTesting(flag))
     .ToArray();
 Check(
-    "every listed resource type is accepted by the option parser",
-    resourceTypesUnknownToParser.Length == 0,
-    string.Join(", ", resourceTypesUnknownToParser));
+    "every valueless flag terminates a denyallow value",
+    valuelessFlagsNotTerminating.Length == 0,
+    string.Join(", ", valuelessFlagsNotTerminating));
 Check(
-    "every listed resource type terminates a denyallow value",
-    resourceTypesThatDoNotTerminateAValue.Length == 0,
-    string.Join(", ", resourceTypesThatDoNotTerminateAValue));
-Check(
-    "every listed valueless flag terminates a denyallow value",
-    valuelessFlagsUnknownToParser.Length == 0,
-    string.Join(", ", valuelessFlagsUnknownToParser));
-
-// True set equality, read from the parser's own switch. The one-directional
-// checks above cannot catch a name being pruned from the shared list, which is
-// the edit a maintainer is most likely to make and which previously left all
-// checks green while leaving the name unhandled by the option loop.
-var adBlockEngineSource = ReadRepositorySource("desktop", "AdBlockEngine.cs");
-// Anchor on the declaration, not the name: AddMappedTypes is called from two
-// places before it is defined, and the first textual occurrence of the bare name
-// is a call site with no body.
-var addMappedTypesBody = ExtractMethodBody(adBlockEngineSource, "bool AddMappedTypes(");
-var parserTypeNames = System.Text.RegularExpressions.Regex
-    .Matches(addMappedTypesBody, "case\\s+\"([a-z0-9_\\-]+)\"\\s*:")
-    .Select(match => match.Groups[1].Value)
-    .ToHashSet(StringComparer.OrdinalIgnoreCase);
-var listedNotInParser = supportedResourceTypes
-    .Where(name => !parserTypeNames.Contains(name))
-    .ToArray();
-var inParserNotListed = parserTypeNames
-    .Where(name => !supportedResourceTypes.Contains(name))
-    .ToArray();
-Check(
-    "the supported resource type list matches the parser's own mapping exactly",
-    parserTypeNames.Count > 0
-        && listedNotInParser.Length == 0
-        && inParserNotListed.Length == 0,
-    $"listed-not-in-parser: [{string.Join(", ", listedNotInParser)}]"
-        + $" in-parser-not-listed: [{string.Join(", ", inParserNotListed)}]");
+    "every mapped resource type terminates a denyallow value",
+    new[] { "texttrack", "eventsource", "main_frame", "script", "image", "media",
+            "xhr", "fetch", "websocket", "ping", "beacon", "object", "other",
+            "font", "stylesheet", "document", "subdocument", "frame" }
+        .All(AdBlockEngine.IsRecognizedBareOptionForTesting));
 Check(
     "a denyallow value ending in a resource type is not truncated",
     AdBlockEngine.SplitFilterOptionsForTesting("script,denyallow=a.com,texttrack,main_frame,eventsource")
@@ -2945,6 +2910,47 @@ Check(
     "a denyallow value ending in an unsupported name is not truncated either",
     AdBlockEngine.SplitFilterOptionsForTesting("script,denyallow=a.com,notatype")
         is ["script", "denyallow=a.com|notatype"]);
+// uBO parses option names case-insensitively, so an upper-case resource type
+// must still terminate a value rather than being absorbed as a domain.
+Check(
+    "resource type names terminate a denyallow value regardless of case",
+    new[] { "SCRIPT", "TextTrack", "EVENTSOURCE", "Main_Frame" }
+        .All(AdBlockEngine.IsRecognizedBareOptionForTesting));
+
+// A resource-type name must map to a mask the request classifier can actually
+// produce, or the rule compiles and never fires. This is the check the
+// $eventsource mapping was missing: it mapped to Media while an EventSource
+// request is classified XmlHttpRequest. One engine per rule, so each assertion
+// sees only the rule under test.
+var eventSourceEngine = new AdBlockEngine(initialRules: ["||mapped.invalid^$eventsource"]);
+Check(
+    "an eventsource rule matches an eventsource request and not a media request",
+    eventSourceEngine.ShouldBlock(
+        "https://mapped.invalid/stream",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.XmlHttpRequest)
+    && !eventSourceEngine.ShouldBlock(
+        "https://mapped.invalid/video.mp4",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Media));
+var textTrackEngine = new AdBlockEngine(initialRules: ["||mapped.invalid^$texttrack"]);
+Check(
+    "a texttrack rule matches a media request and not an xhr",
+    textTrackEngine.ShouldBlock(
+        "https://mapped.invalid/captions.vtt",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Media)
+    && !textTrackEngine.ShouldBlock(
+        "https://mapped.invalid/api",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.XmlHttpRequest));
+var mainFrameEngine = new AdBlockEngine(initialRules: ["||mapped.invalid^$main_frame"]);
+Check(
+    "a main_frame rule matches a top-level document",
+    mainFrameEngine.ShouldBlock(
+        "https://mapped.invalid/",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Document));
 Check(
     "denyallow terminates a value on named options",
     new[] { "domain=a.com", "denyallow=a.com", "redirect=1x1.gif", "replace=/x//" }
@@ -8727,26 +8733,6 @@ string ReadRepositorySource(params string[] parts)
 {
     var path = FindRepositoryFile(parts);
     return path is null ? string.Empty : File.ReadAllText(path);
-}
-
-/// <summary>
-/// Returns the body of the method whose signature contains
-/// <paramref name="signature"/>, by brace matching from the opening brace to the
-/// one that closes it.
-/// </summary>
-string ExtractMethodBody(string source, string signature)
-{
-    var start = source.IndexOf(signature, StringComparison.Ordinal);
-    if (start < 0) return string.Empty;
-    var open = source.IndexOf('{', start);
-    if (open < 0) return string.Empty;
-    var depth = 0;
-    for (var index = open; index < source.Length; index++)
-    {
-        if (source[index] == '{') depth++;
-        else if (source[index] == '}' && --depth == 0) return source[open..(index + 1)];
-    }
-    return string.Empty;
 }
 
 /// <summary>
