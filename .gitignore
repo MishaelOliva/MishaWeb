@@ -32,3 +32,4 @@ Microsoft.Web.WebView2.*.xml
 web/
 .vs/
 *.user
+*.zip
