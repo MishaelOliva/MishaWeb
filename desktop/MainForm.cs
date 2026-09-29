@@ -121,6 +121,11 @@ public sealed class MainForm : Form
         "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==");
     private static readonly byte[] YouTubeScriptStubBytes =
         "window.adsbygoogle = window.adsbygoogle || []; window.adsbygoogle.loaded = true; window.googletag = window.googletag || { cmd: [], apiReady: true };"u8.ToArray();
+    // Stub bodies handed back for every blocked request. Hoisted to statics so an
+    // ad-heavy page does not allocate a fresh array per blocked subresource.
+    private static readonly byte[] YouTubePageAdStubBytes =
+        ")]}'\n\n{\"id\":\"ANyPxKrAzkV5cLEVtGXqf11mX0EFDh00ASxA-CsrWnAIiEOXKju9lnsjfHFdvqf7wl5Er6SrJEF7\",\"type\":4}"u8.ToArray();
+    private static readonly byte[] EmptyJsonObjectBytes = "{}"u8.ToArray();
     private static readonly CoreWebView2WebResourceRequestSourceKinds DocumentRequestSources =
         CoreWebView2WebResourceRequestSourceKinds.Document;
     private static readonly CoreWebView2WebResourceRequestSourceKinds WorkerRequestSources =
@@ -3183,6 +3188,20 @@ public sealed class MainForm : Form
         };
         tab.ResourceRequestHandler = handler;
         core.WebResourceRequested += handler;
+        // Also register the detach with the tab's teardown list. This filter is
+        // installed separately from TrackCoreEvent so it can be deferred for
+        // popups, and without this the unsubscribe only ran when
+        // RemoveAdBlockFiltering happened to run first. A tab disposed by any
+        // other path kept the closure alive on a live core, holding the tab and
+        // the core together. Detaching twice is a no-op.
+        tab.TrackCoreEventHandler(() =>
+        {
+            if (tab.ResourceRequestHandler is null) return;
+            try { core.WebResourceRequested -= tab.ResourceRequestHandler; }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+            catch (COMException) { }
+        });
         tab.ResourceFilterInstalled = true;
         TryAssignWorkerAdBlockFilter(tab);
         adBlocker.AcquireConsumer();
@@ -3580,14 +3599,15 @@ public sealed class MainForm : Form
     {
         if (!adBlockEnabled || isClosing || tab.IsClosed) return;
 
+        var topLevelUrl = tab.Core?.Source ?? tab.Url;
+        var documentSource = (e.RequestedSourceKind & DocumentRequestSources) != 0;
+        var workerSource = (e.RequestedSourceKind & WorkerRequestSources) != 0;
         var sourceUrl = GetAdBlockSourceUrl(
             tab,
             e.Request.Headers,
             e.RequestedSourceKind,
+            topLevelUrl,
             out var requestSourceAttributed);
-        var topLevelUrl = tab.Core?.Source ?? tab.Url;
-        var documentSource = (e.RequestedSourceKind & DocumentRequestSources) != 0;
-        var workerSource = (e.RequestedSourceKind & WorkerRequestSources) != 0;
         if (adBlockExceptionHosts.Count > 0
             && (IsExceptionHost(HostFromUrl(e.Request.Uri))
                 || (documentSource && IsExceptionHost(HostFromUrl(topLevelUrl)))
@@ -3596,7 +3616,8 @@ public sealed class MainForm : Form
             e.ResourceContext,
             e.ResourceContext == CoreWebView2WebResourceContext.Document
                 ? GetRequestHeader(e.Request.Headers, "Sec-Fetch-Dest")
-                : null);
+                : null,
+            e.RequestedSourceKind);
         // A media stream is not an ad simply because it comes from one of
         // YouTube's rotating googlevideo hosts. Filter-list false positives
         // here produce the exact black/error player which a reload may hide.
@@ -3650,6 +3671,7 @@ public sealed class MainForm : Form
         BrowserTab tab,
         CoreWebView2HttpRequestHeaders headers,
         CoreWebView2WebResourceRequestSourceKinds sourceKind,
+        string topLevelUrl,
         out bool sourceWasAttributed)
     {
         sourceWasAttributed = false;
@@ -3675,7 +3697,10 @@ public sealed class MainForm : Form
             // request target is its own first-party source.
             return string.Empty;
         }
-        return tab.Core?.Source ?? tab.Url;
+        // Reuse the top-level URL the caller already resolved. Reading
+        // CoreWebView2.Source is a marshalled COM getter on the UI thread and
+        // this handler runs for every subresource of every page.
+        return topLevelUrl;
     }
 
     private static string? GetRequestHeader(
@@ -3693,15 +3718,32 @@ public sealed class MainForm : Form
 
     private static AdBlockResourceType MapResourceType(
         CoreWebView2WebResourceContext webViewContext,
-        string? fetchDestination = null)
+        string? fetchDestination = null,
+        CoreWebView2WebResourceRequestSourceKinds? requestedSourceKind = null)
     {
+        if (webViewContext == CoreWebView2WebResourceContext.Document)
+        {
+            if (fetchDestination is not null
+                && (fetchDestination.Equals("iframe", StringComparison.OrdinalIgnoreCase)
+                    || fetchDestination.Equals("frame", StringComparison.OrdinalIgnoreCase)))
+            {
+                return AdBlockResourceType.SubDocument;
+            }
+            // GetRequestHeader returns null when WebView2 refuses the COM call,
+            // which made every subframe look like a top-level document: $document
+            // rules blocked iframe loads and $subdocument rules never fired.
+            // RequestedSourceKind is already available on this event and does not
+            // depend on header access, so use it as the fallback.
+            if (fetchDestination is null
+                && requestedSourceKind is { } kind
+                && (kind & CoreWebView2WebResourceRequestSourceKinds.Document) == 0)
+            {
+                return AdBlockResourceType.SubDocument;
+            }
+            return AdBlockResourceType.Document;
+        }
         return webViewContext switch
         {
-            CoreWebView2WebResourceContext.Document when fetchDestination is not null
-                && (fetchDestination.Equals("iframe", StringComparison.OrdinalIgnoreCase)
-                    || fetchDestination.Equals("frame", StringComparison.OrdinalIgnoreCase)) =>
-                AdBlockResourceType.SubDocument,
-            CoreWebView2WebResourceContext.Document => AdBlockResourceType.Document,
             CoreWebView2WebResourceContext.Stylesheet => AdBlockResourceType.Stylesheet,
             CoreWebView2WebResourceContext.Image => AdBlockResourceType.Image,
             CoreWebView2WebResourceContext.Media => AdBlockResourceType.Media,
@@ -3918,7 +3960,7 @@ public sealed class MainForm : Form
 
             if (requestUrl is not null && requestUrl.Contains("/pagead/id", StringComparison.OrdinalIgnoreCase))
             {
-                var idPayload = ")]}'\n\n{\"id\":\"ANyPxKrAzkV5cLEVtGXqf11mX0EFDh00ASxA-CsrWnAIiEOXKju9lnsjfHFdvqf7wl5Er6SrJEF7\",\"type\":4}"u8.ToArray();
+                var idPayload = YouTubePageAdStubBytes;
                 return environment.CreateWebResourceResponse(
                     new MemoryStream(idPayload, writable: false),
                     200,
@@ -3929,7 +3971,7 @@ public sealed class MainForm : Form
             if (resourceType is AdBlockResourceType.XmlHttpRequest or AdBlockResourceType.Fetch)
             {
                 return environment.CreateWebResourceResponse(
-                    new MemoryStream("{}"u8.ToArray(), writable: false),
+                    new MemoryStream(EmptyJsonObjectBytes, writable: false),
                     200,
                     "OK",
                     $"Content-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: *\r\nVary: Origin");
@@ -4272,6 +4314,11 @@ public sealed class MainForm : Form
         Func<bool> isCurrentFrame)
     {
         var core = tab.Core;
+        // about:blank, about:srcdoc and data: frames inherit the parent's origin
+        // and are a standard container for injected ad markup. They carry no
+        // addressable host of their own, so resolve cosmetic rules against the
+        // top-level document instead of skipping element hiding for them.
+        var ruleHostUrl = BrowserPolicy.IsHttpUrl(frameUrl) ? frameUrl : core?.Source ?? string.Empty;
         if (core is null
             || !ReferenceEquals(core, originatingCore)
             || documentGeneration != tab.DocumentNavigationGeneration
@@ -4279,7 +4326,7 @@ public sealed class MainForm : Form
             || isClosing
             || !isCurrentFrame()
             || !adBlockEnabled
-            || !BrowserPolicy.IsHttpUrl(frameUrl)
+            || !BrowserPolicy.IsHttpUrl(ruleHostUrl)
             || IsExceptionHost(HostFromUrl(core.Source))
             || IsExceptionHost(HostFromUrl(frameUrl))) return;
 
@@ -4291,15 +4338,19 @@ public sealed class MainForm : Form
             || !isCurrentFrame()
             || IsExceptionHost(HostFromUrl(core.Source))) return;
 
-        var css = await adBlocker.GetCosmeticCssAsync(frameUrl, cacheEvaluation: !isPrivateMode);
-        if (css.Length == 0
-            || !adBlockEnabled
+        var css = await adBlocker.GetCosmeticCssAsync(ruleHostUrl, cacheEvaluation: !isPrivateMode);
+        if (!adBlockEnabled
             || tab.IsClosed
             || tab.Core != core
             || documentGeneration != tab.DocumentNavigationGeneration
             || !isCurrentFrame()
             || IsExceptionHost(HostFromUrl(core.Source))) return;
-        await frame.ExecuteScriptAsync(CreateCosmeticStyleScript(css, frameUrl));
+        await frame.ExecuteScriptAsync(css.Length == 0
+            ? CreateCosmeticStyleRemovalScript()
+            : CreateCosmeticStyleScript(
+                css,
+                ruleHostUrl,
+                requireMatchingHost: BrowserPolicy.IsHttpUrl(frameUrl)));
     }
 
     private async Task ApplyAdBlockCosmeticsAsync(BrowserTab tab)
@@ -4325,27 +4376,49 @@ public sealed class MainForm : Form
         }
 
         var css = await adBlocker.GetCosmeticCssAsync(pageUrl, cacheEvaluation: !isPrivateMode);
-        if (css.Length == 0
-            || !adBlockEnabled
+        if (!adBlockEnabled
             || tab.IsClosed
             || tab.Core != core
             || IsExceptionHost(HostFromUrl(core.Source))) return;
-        await core.ExecuteScriptAsync(CreateCosmeticStyleScript(css, pageUrl));
+        await core.ExecuteScriptAsync(css.Length == 0
+            ? CreateCosmeticStyleRemovalScript()
+            : CreateCosmeticStyleScript(css, pageUrl));
     }
 
-    private static string CreateCosmeticStyleScript(string css, string pageUrl)
+    private static string CreateCosmeticStyleScript(
+        string css,
+        string pageUrl,
+        bool requireMatchingHost = true)
     {
         var serializedCss = JsonSerializer.Serialize(css);
         var serializedPageUrl = JsonSerializer.Serialize(pageUrl);
+        // The guard used to compare the full URL, so a client-side redirect or a
+        // History API rewrite before DOMContentLoaded silently dropped the whole
+        // stylesheet. Cosmetic rules are host-scoped, so a same-host URL change
+        // cannot make them wrong; a host change still must not inherit them.
+        // Inherited-origin frames (about:blank, data:) have no hostname of their
+        // own to compare against, so the guard is skipped for them.
         return "(() => {"
             + "if (window.__mishaAdBlockEnabled === false || !document.documentElement) return;"
-            + $"if (new URL(location.href).href !== new URL({serializedPageUrl}).href) return;"
+            + (requireMatchingHost
+                ? "try {"
+                    + $"if (new URL(location.href).hostname !== new URL({serializedPageUrl}).hostname) return;"
+                    + "} catch (_) { return; }"
+                : string.Empty)
             + "const id='__misha_adblock_remote_style';"
             + "let style=document.getElementById(id);"
             + "if (!style) { style=document.createElement('style'); style.id=id; document.documentElement.appendChild(style); }"
             + $"style.textContent={serializedCss};"
             + "})();";
     }
+
+    /// <summary>
+    /// Drops the remote cosmetic stylesheet. Applied when a page now has no
+    /// cosmetic rules at all, which otherwise left the previous page's sheet in
+    /// place for the lifetime of the document after a client-side navigation.
+    /// </summary>
+    private static string CreateCosmeticStyleRemovalScript() =>
+        "(() => { try { document.getElementById('__misha_adblock_remote_style')?.remove(); } catch (_) { } })();";
 
     private async Task OnNavigationCompletedAsync(
         BrowserTab tab,
@@ -6696,7 +6769,8 @@ public sealed class MainForm : Form
         {
             foreach (var tab in tabs.Where(item => item.Core is not null))
             {
-                tab.AdBlockControlChannel = null;
+                // The control channel stays stable across the toggle for the same
+                // reason as ToggleSiteShield: it is baked into the live document.
                 RunUiTask(
                     async () =>
                     {
@@ -6866,6 +6940,15 @@ public sealed class MainForm : Form
                 catch (InvalidOperationException) { }
             }
             UpdateTabHeader(tab);
+        }
+        // The site shield exception list was just emptied, so every live document
+        // still carrying window.__mishaAdBlockEnabled === false disagrees with
+        // the UI until it reloads. Reinstall the page policy so the exception list
+        // is empty for future navigations and state the reload requirement.
+        if (adBlockExceptionHosts.Count == 0 && adBlockEnabled)
+        {
+            RefreshAdBlockPagePolicies();
+            ShowTransientStatus("Site shield exceptions cleared; reload open pages to re-enable");
         }
         permissionManager?.Hide();
         InvalidateStartPageLinks();
@@ -7743,12 +7826,12 @@ public sealed class MainForm : Form
             var existing = state.AdBlockExceptionHosts.FindIndex(item =>
                 item.Equals(normalized, StringComparison.OrdinalIgnoreCase));
             if (existing >= 0) state.AdBlockExceptionHosts.RemoveAt(existing);
-            foreach (var tab in tabs.Where(item =>
-                item.Core is not null
-                && BrowserPolicy.IsExactHost(HostFromUrl(item.Core.Source), normalized)))
-            {
-                tab.AdBlockControlChannel = null;
-            }
+            // The control channel is deliberately left alone. It is baked into the
+            // already-loaded document at injection time, so minting a new name
+            // here would leave that document listening on a name nothing
+            // dispatches, and a later "disable on this page" would silently do
+            // nothing. InstallAdBlockPageScriptsAsync reuses the existing name
+            // for future navigations, which is what the listener needs.
             ShowTransientStatus($"Shield restored for {normalized}; reload required");
         }
         else

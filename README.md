@@ -1,5 +1,9 @@
 # MishaWeb
 
+> [!WARNING]
+> **Windows only. There is no macOS or Linux build, and one is not planned for the 2.x line.**
+> MishaWeb is built on Windows Forms and the Microsoft Edge WebView2 Evergreen Runtime. Windows Forms has no macOS runtime, and WebView2 does not ship for macOS at all, so this project cannot be compiled or run on a Mac. A macOS edition would have to replace both the UI framework and the rendering engine, and would need a separate ad-blocking implementation built on WebKit's content-rule format rather than the ABP/uBO syntax this engine compiles.
+
 A lightweight Windows desktop browser shell in C# (.NET 10 LTS WinForms) hosting Microsoft Edge WebView2 Evergreen, featuring custom ad blocking, tab memory management, CRX extension loading, and local address suggestions.
 
 [![Windows Release Verification](https://github.com/MishaelOliva/MishaWeb/actions/workflows/windows.yml/badge.svg)](https://github.com/MishaelOliva/MishaWeb/actions/workflows/windows.yml)
@@ -54,7 +58,7 @@ Instead of packaging Chromium and Node.js binaries (like Electron), MishaWeb rel
 
 ### Prerequisites
 
-- Windows 10 or Windows 11 (x64)
+- Windows 10 or Windows 11 (x64). There is no other supported operating system.
 - [.NET 10.0 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (10.0.103+ pinned in `global.json`)
 - [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) (pre-installed on modern Windows)
 
@@ -92,9 +96,10 @@ Release builds are verified with `-warnaserror` across all projects.
 
 ## Known limitations
 
-- **Windows only**: Built on Windows Forms and Microsoft Edge WebView2; cannot run on macOS or Linux.
+- **Windows only**: Built on Windows Forms and Microsoft Edge WebView2; cannot run on macOS or Linux. See the warning at the top of this file for what a macOS edition would require.
 - **Runtime dependency**: Requires Microsoft Edge WebView2 Evergreen Runtime present on the system.
 - **Ad blocker scope**: Network filtering intercepts requests exposed through WebView2 APIs, and cosmetic filtering injects CSS rules at document start. It does not execute arbitrary procedural scriptlet injection.
+- **Ad blocker response rewrites**: Rules carrying `$redirect=`, `$redirect-rule=`, `$empty`, `$mp4`, `$all` and `$priority=` are dropped rather than applied. A rewrite has no meaning in an engine that cancels requests, and honouring one as a block would turn a pixel swap into a broken image. Those requests are therefore *not* blocked, and the rule's protection is lost.
 
 ## License
 

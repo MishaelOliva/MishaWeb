@@ -78,7 +78,10 @@ internal sealed class AdBlockEngine
     // policy hooks. Small thread-local caches avoid reparsing them without
     // introducing cross-thread locks or allowing unbounded URL retention.
     private const int MaximumCachedRequestUrisPerThread = 64;
-    private const int MaximumCachedSourceUrisPerThread = 16;
+    // The source URL is re-derived per policy hook and varies with the active
+    // tab, so a 16-entry cache was exhausted by a handful of requests and threw
+    // the whole dictionary away on the next miss.
+    private const int MaximumCachedSourceUrisPerThread = 64;
     private const int MaximumCachedHostSuffixSetsPerThread = 64;
     private const int MaximumCachedSiteKeysPerThread = 64;
     [ThreadStatic] private static Dictionary<string, Uri?>? cachedRequestUris;
@@ -247,7 +250,9 @@ internal sealed class AdBlockEngine
             controlChannel,
             StringComparison.Ordinal);
 
-    public bool IsReady { get; private set; }
+    private volatile bool isReady;
+
+    public bool IsReady => isReady;
 
     internal AdBlockCompileDiagnostics LastCompileDiagnostics => ruleSet.Diagnostics;
 
@@ -302,22 +307,26 @@ internal sealed class AdBlockEngine
 
     private void UnloadRulesIfIdle()
     {
+        CancellationTokenSource? cancellation;
         lock (loadSync)
         {
             if (Volatile.Read(ref liveConsumers) != 0) return;
             unloadTimer?.Dispose();
             unloadTimer = null;
             loadGeneration++;
-            loadCancellation?.Cancel();
+            cancellation = loadCancellation;
             loadCancellation = null;
             loadTask = null;
             ruleSet = baselineRuleSet;
-            IsReady = false;
+            isReady = false;
         }
+        CancelAndDispose(cancellation);
     }
 
     public Task LoadAsync()
     {
+        CancellationTokenSource? superseded = null;
+        Task task;
         lock (loadSync)
         {
             unloadTimer?.Dispose();
@@ -334,13 +343,35 @@ internal sealed class AdBlockEngine
             if (loadTask is null || shouldRefresh)
             {
                 lastRefreshCheckUtc = nowUtc;
-                loadCancellation?.Cancel();
+                superseded = loadCancellation;
                 var cancellation = new CancellationTokenSource();
                 loadCancellation = cancellation;
                 loadTask = LoadListsAsync(++loadGeneration, cancellation);
             }
-            return loadTask;
+            task = loadTask;
         }
+        CancelAndDispose(superseded);
+        return task;
+    }
+
+    /// <summary>
+    /// Cancels and disposes a superseded generation. Must be called outside
+    /// <c>loadSync</c>: <see cref="CancellationTokenSource.Cancel"/> runs its
+    /// registered callbacks inline, so calling it under the lock let task
+    /// continuations resume on the locked thread, and let the loader's own
+    /// <c>finally</c> dispose a source that was still mid-cancel.
+    /// </summary>
+    private static void CancelAndDispose(CancellationTokenSource? cancellation)
+    {
+        if (cancellation is null) return;
+        try
+        {
+            cancellation.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        cancellation.Dispose();
     }
 
     public bool ShouldBlock(
@@ -402,6 +433,12 @@ internal sealed class AdBlockEngine
         return ShouldBlockNavigation(targetUrl, sourceUrl, cacheEvaluation: cacheEvaluation);
     }
 
+    /// <summary>
+    /// Name-based resource classification. <see cref="MainForm"/> owns the enum
+    /// overload that the live <c>WebResourceRequested</c> path uses; this mirror
+    /// exists for string-context callers and tests, so it must stay in step with
+    /// that switch rather than drifting.
+    /// </summary>
     internal static AdBlockResourceType MapResourceType(
         string? webViewContext,
         string? fetchDestination = null)
@@ -473,14 +510,18 @@ internal sealed class AdBlockEngine
             {
                 if (generation == loadGeneration)
                 {
-                    IsReady = !cancellationToken.IsCancellationRequested;
+                    isReady = !cancellationToken.IsCancellationRequested;
                     if (ReferenceEquals(loadCancellation, generationCancellation))
                     {
                         loadCancellation = null;
                     }
                 }
             }
-            generationCancellation.Dispose();
+            // A cancelled source can still be unwinding its callback list on the
+            // thread that called Cancel(), and this method may be running inline
+            // on that same stack. The replacing caller owns disposal in that
+            // case; only a source that finished on its own is disposed here.
+            if (!cancellationToken.IsCancellationRequested) generationCancellation.Dispose();
         }
     }
 
@@ -494,6 +535,7 @@ internal sealed class AdBlockEngine
 
     private List<string> GetCachedListFiles()
     {
+        SweepAbandonedTemporaryFiles();
         var files = new List<string>(FilterListSources.Length);
         long aggregateBytes = 0;
         foreach (var source in FilterListSources)
@@ -514,6 +556,31 @@ internal sealed class AdBlockEngine
             catch (UnauthorizedAccessException) { }
         }
         return files;
+    }
+
+    /// <summary>
+    /// Removes download leftovers from a previous process. List payloads and
+    /// cache metadata are staged under GUID-suffixed ".tmp" names, which the
+    /// in-process cleanup only handles for its own files; a hard kill or power
+    /// loss leaves them behind and they accumulate across restarts.
+    /// </summary>
+    private void SweepAbandonedTemporaryFiles()
+    {
+        try
+        {
+            var cutoff = DateTime.UtcNow - FilterCacheLifetime;
+            foreach (var path in Directory.EnumerateFiles(cacheFolder, "*.tmp"))
+            {
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(path) < cutoff) File.Delete(path);
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 
     internal IReadOnlyList<string> GetCachedFilterFilesForTesting() =>
@@ -894,7 +961,11 @@ internal sealed class AdBlockEngine
         FilterHttpCacheValidators validators)
     {
         var metadataPath = GetHttpCacheMetadataPath(filterPath);
-        var temporary = metadataPath + ".tmp";
+        // A per-list fixed name collided whenever two generations of the engine
+        // refreshed the same list at once: one task's finally block deleted the
+        // other's in-flight temp file. Match the GUID scheme used for list
+        // payloads.
+        var temporary = metadataPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
             if (validators.EntityTag is null && validators.LastModified is null)
@@ -1060,9 +1131,22 @@ internal sealed class AdBlockEngine
         }
 
         var valid = TryGetHttpUri(value, out uri);
-        if (cache.Count >= maximumEntries) cache.Clear();
+        TrimCache(cache, maximumEntries);
         cache[cacheKey] = uri;
         return valid;
+    }
+
+    /// <summary>
+    /// Drops a fraction of a bounded per-thread cache rather than clearing it
+    /// wholesale. Which entries go is deliberately unspecified; only the bound
+    /// matters for correctness, and retaining most of the cache stops hot
+    /// entries from being reparsed on every WebView2 policy hook.
+    /// </summary>
+    private static void TrimCache<TValue>(Dictionary<string, TValue> cache, int maximumEntries)
+    {
+        if (cache.Count < maximumEntries) return;
+        var toRemove = Math.Max(1, maximumEntries / 4);
+        foreach (var key in cache.Keys.Take(toRemove).ToArray()) cache.Remove(key);
     }
 
     private static bool AreSameSite(string leftHost, string rightHost)
@@ -1120,7 +1204,7 @@ internal sealed class AdBlockEngine
         }
 
         if (suffixIndex != suffixes.Length) Array.Resize(ref suffixes, suffixIndex);
-        if (cache.Count >= MaximumCachedHostSuffixSetsPerThread) cache.Clear();
+        TrimCache(cache, MaximumCachedHostSuffixSetsPerThread);
         cache[host] = suffixes;
         return suffixes;
     }
@@ -1141,7 +1225,7 @@ internal sealed class AdBlockEngine
             StringComparer.OrdinalIgnoreCase);
         if (cache.TryGetValue(host, out var siteKey)) return siteKey;
         siteKey = PublicSuffixRules.GetSiteKey(host);
-        if (cache.Count >= MaximumCachedSiteKeysPerThread) cache.Clear();
+        TrimCache(cache, MaximumCachedSiteKeysPerThread);
         cache[host] = siteKey;
         return siteKey;
     }
@@ -1231,7 +1315,7 @@ internal sealed class AdBlockEngine
                     cancellationToken.ThrowIfCancellationRequested();
                 }
                 var disabled = GetBadFilterTarget(line);
-                if (disabled is not null) disabledRules.Add(disabled);
+                if (disabled is not null) disabledRules.Add(GetRuleIdentity(disabled));
             }
             var blocks = new RuleIndex();
             var exceptions = new RuleIndex();
@@ -1258,6 +1342,19 @@ internal sealed class AdBlockEngine
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                 }
+
+                // $badfilter has to be resolved before the cosmetic and
+                // hide-disable parsers run. Those parsers treat everything after
+                // "##" as a selector, so "example.com##.ad$badfilter" used to be
+                // installed as a live rule hiding ".ad$badfilter" while the real
+                // "example.com##.ad" rule stayed active.
+                if (GetBadFilterTarget(line) is not null
+                    || disabledRules.Contains(GetRuleIdentity(line)))
+                {
+                    disabledRuleCount++;
+                    continue;
+                }
+
                 var hideDisable = HideDisableRule.Parse(line);
                 if (hideDisable is not null)
                 {
@@ -1288,11 +1385,6 @@ internal sealed class AdBlockEngine
                     continue;
                 }
 
-                if (GetBadFilterTarget(line) is not null || disabledRules.Contains(line))
-                {
-                    disabledRuleCount++;
-                    continue;
-                }
                 var regexCandidate = FilterRule.TryGetRegexPattern(line, out var regexPattern);
                 if (regexCandidate
                     && (regexPattern.Length > MaximumRegexPatternCharacters
@@ -1517,6 +1609,32 @@ internal sealed class AdBlockEngine
 
         public string GetCosmeticCss(Uri pageUri, bool cacheEvaluation) =>
             cosmetics.GetCss(pageUri, cacheEvaluation);
+
+        /// <summary>
+        /// Builds a comparison key for a filter line: the pattern plus its
+        /// options in a canonical, order-insensitive form. Filter lists routinely
+        /// reorder options between a rule and its $badfilter counterpart
+        /// (<c>||x^$domain=a.com,script</c> vs <c>@@||x^$script,domain=a.com</c>).
+        /// Comparing raw text silently failed to disable the block in that case,
+        /// so both sides are normalized here.
+        /// </summary>
+        private static string GetRuleIdentity(string line)
+        {
+            var optionIndex = FindOptionIndex(line);
+            if (optionIndex < 0) return line.Trim();
+            var pattern = line.AsSpan(0, optionIndex).Trim();
+            var options = line[(optionIndex + 1)..]
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(option => option.ToLowerInvariant())
+                .Order(StringComparer.Ordinal);
+            var builder = new StringBuilder(pattern.Length + 16);
+            builder.Append(pattern);
+            foreach (var option in options)
+            {
+                builder.Append('|').Append(option);
+            }
+            return builder.ToString();
+        }
 
         private static string? GetBadFilterTarget(string line)
         {
@@ -2026,6 +2144,7 @@ internal sealed class AdBlockEngine
         {
             if (selector.Length is 0 or > 2_048
                 || selector[0] == '^'
+                || selector.Contains('$')
                 || selector.StartsWith("+js(", StringComparison.OrdinalIgnoreCase)
                 || selector.Contains('{')
                 || selector.Contains('}')
@@ -2062,6 +2181,7 @@ internal sealed class AdBlockEngine
         private FilterRule(
             string pattern,
             string? host,
+            int patternHostEnd,
             bool exception,
             bool important,
             Regex? regex,
@@ -2105,9 +2225,13 @@ internal sealed class AdBlockEngine
 
             if (host is not null)
             {
-                var remainder = normalizedPattern.Length > host.Length
-                    ? normalizedPattern[host.Length..]
-                    : string.Empty;
+                // normalizedPattern is pattern with the leading "||" removed, so
+                // the host offset shifts by two. Slicing by host.Length instead
+                // was off by the number of dots ExtractHost trimmed.
+                var hostSpanEnd = Math.Min(patternHostEnd - 2, normalizedPattern.Length);
+                var remainder = hostSpanEnd < 0
+                    ? string.Empty
+                    : normalizedPattern[hostSpanEnd..];
                 if (remainder.Length == 0 || remainder == "^") return;
 
                 var endAnchored = remainder.EndsWith('|');
@@ -2243,23 +2367,35 @@ internal sealed class AdBlockEngine
                 }
                 if (option.StartsWith("denyallow=", StringComparison.Ordinal))
                 {
-                    var ignoredIncluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    var ignoredExcluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    if (!ParseDomainList(rawOption[10..], '|', ignoredIncluded, ignoredExcluded)) return null;
-                    if (ignoredIncluded.Count > 0 || ignoredExcluded.Count > 0)
+                    var denyIncluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    var denyExcluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    if (!ParseDomainList(rawOption[10..], '|', denyIncluded, denyExcluded)) return null;
+                    // $denyallow scopes the rule by the document it appears in, so
+                    // it belongs with the $domain=~ exclusions and must be tested
+                    // against the source host. It used to be merged into
+                    // excludedTargetDomains, which Matches checks against the
+                    // request host, so the rule was filtered by the wrong URL.
+                    // "$denyallow=a.com" means the rule does not apply on a.com;
+                    // "$denyallow=~b.com" negates that, so the rule does apply on
+                    // b.com and b.com must not be excluded.
+                    if (denyIncluded.Count > 0)
                     {
-                        excludedTargetDomains ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                        foreach (var domain in ignoredIncluded) excludedTargetDomains.Add(domain);
-                        foreach (var domain in ignoredExcluded) excludedTargetDomains.Add(domain);
+                        excludedDomains ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var domain in denyIncluded) excludedDomains.Add(domain);
                     }
                     continue;
                 }
-                if (option.StartsWith("redirect-rule=", StringComparison.Ordinal)) return null;
-                if (option.StartsWith("redirect=", StringComparison.Ordinal)
+                // Response-rewrite directives. This engine cancels requests; it
+                // never rewrites responses. Treating a rewrite as a block is the
+                // one thing that must never happen, because a pixel swap
+                // becomes a broken image and a noop script becomes a thrown
+                // exception. Drop the rule and count it as unsupported instead.
+                if (option.StartsWith("redirect-rule=", StringComparison.Ordinal)
+                    || option.StartsWith("redirect=", StringComparison.Ordinal)
                     || option.StartsWith("priority=", StringComparison.Ordinal)
                     || option is "empty" or "mp4" or "all")
                 {
-                    continue;
+                    return null;
                 }
 
                 var excluded = option.StartsWith('~');
@@ -2275,7 +2411,7 @@ internal sealed class AdBlockEngine
             }
 
             uint? includedTypes = includedTypeMask == 0 ? null : includedTypeMask;
-            var host = ExtractHost(pattern);
+            var host = ExtractHost(pattern, out var patternHostEnd);
             Regex? regex = null;
             long? regexIndexKey = null;
             if (pattern.Length > 2 && pattern[0] == '/' && pattern[^1] == '/')
@@ -2300,6 +2436,7 @@ internal sealed class AdBlockEngine
             return new FilterRule(
                 pattern,
                 host,
+                patternHostEnd,
                 exception,
                 important,
                 regex,
@@ -2420,12 +2557,29 @@ internal sealed class AdBlockEngine
             return true;
         }
 
-        private static string? ExtractHost(string pattern)
+        /// <summary>
+        /// Extracts the host of a "||host" rule. <paramref name="hostEnd"/> is the
+        /// offset just past the raw host text in <paramref name="pattern"/>, which
+        /// keeps any dot padding, so callers can slice the path remainder without
+        /// re-deriving the length. Slicing with <c>host.Length</c> instead is off by
+        /// the number of trimmed dots and produced garbage patterns such as
+        /// "m/banner" for "||.ads.example.com/banner".
+        /// </summary>
+        private static string? ExtractHost(string pattern, out int hostEnd)
         {
+            hostEnd = 0;
             if (!pattern.StartsWith("||", StringComparison.Ordinal)) return null;
-            var end = pattern.IndexOfAny(['/','^','*','|','?','$'], 2);
+            var end = pattern.IndexOfAny(['/', '^', '*', '|', '?', '$'], 2);
             var host = (end < 0 ? pattern[2..] : pattern[2..end]).Trim('.');
-            return host.Contains('.') && Uri.CheckHostName(host) == UriHostNameType.Dns ? host : null;
+            // Single-label hosts such as "localhost" or "intranet" are valid ||host
+            // anchors. Rejecting them pushed the rule onto the generic "host^*"
+            // path, where '.' is not a separator, so the rule matched neither the
+            // host nor any of its subdomains.
+            if (host.Length == 0) return null;
+            var hostNameType = Uri.CheckHostName(host);
+            if (hostNameType is not (UriHostNameType.Dns or UriHostNameType.Basic)) return null;
+            hostEnd = end < 0 ? pattern.Length : end;
+            return host;
         }
 
         private static long? ExtractIndexKey(string pattern)

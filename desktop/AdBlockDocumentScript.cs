@@ -32,14 +32,6 @@ internal static class AdBlockDocumentScript
                 bootstrapObservers.length = 0;
             };
             const isEnabled = () => enabledForDocument;
-            try {
-                Object.defineProperty(window, '__mishaAdBlockEnabled', {
-                    configurable: false,
-                    enumerable: false,
-                    get: () => enabledForDocument,
-                    set: () => {}
-                });
-            } catch (_) { }
             const disableForDocument = () => {
                 enabledForDocument = false;
                 stopBootstrapObservers();
@@ -49,6 +41,20 @@ internal static class AdBlockDocumentScript
                 document.getElementById(styleId)?.remove();
                 document.getElementById(remoteStyleId)?.remove();
             };
+            try {
+                // The setter is deliberately inert: this property is writable from
+                // page script, and a live setter would let any site turn the
+                // shield off for itself. The host reaches the runtime through the
+                // private control channel instead, and the site-exception policy
+                // script is registered before this one so its assignment to false
+                // is observed by the enabledForDocument initializer above.
+                Object.defineProperty(window, '__mishaAdBlockEnabled', {
+                    configurable: false,
+                    enumerable: false,
+                    get: () => enabledForDocument,
+                    set: () => {}
+                });
+            } catch (_) { }
             window.addEventListener(controlChannel, disableForDocument);
 
             const isYouTubeHost = value => value === 'youtube.com'
@@ -343,6 +349,7 @@ internal static class AdBlockDocumentScript
             const patchedYtcfgObjects = new WeakSet();
             const patchedYtcfgData = new WeakSet();
             const forceFalseFlag = (flags, name) => {
+                if (!isEnabled()) return;
                 if (!flags || typeof flags !== 'object') return;
                 try {
                     const descriptor = Object.getOwnPropertyDescriptor(flags, name);
@@ -361,6 +368,7 @@ internal static class AdBlockDocumentScript
                 }
             };
             const forceTrueFlag = (flags, name) => {
+                if (!isEnabled()) return;
                 if (!flags || typeof flags !== 'object') return;
                 try {
                     const descriptor = Object.getOwnPropertyDescriptor(flags, name);
@@ -379,6 +387,10 @@ internal static class AdBlockDocumentScript
                 }
             };
             const patchExperimentFlags = flags => {
+                // These were the only mutations in this file that ignored
+                // isEnabled(), so "disable for this site" left the network
+                // experiment flags permanently forced off in the document.
+                if (!isEnabled()) return;
                 forceFalseFlag(flags, 'all_web_enable_network_machine');
                 forceFalseFlag(flags, 'all_web_network_machine_raw_request');
             };
@@ -1442,6 +1454,31 @@ internal static class AdBlockDocumentScript
             let adWasActive = false;
             let userPlaybackRate = 1.0;
             let userWasMuted = false;
+            let muteAppliedByBlocker = false;
+            // Undoes the mute and 16x speed-up applied while an ad was showing.
+            // This has to run on every exit from the ad state, not only when the
+            // ad finishes on its own: yt-navigate-start fires when the user picks
+            // a suggested video mid-ad, which used to leave the next video
+            // playing silently at 16x for the rest of the session.
+            const restoreAfterAd = () => {
+                if (!adWasActive) return;
+                adWasActive = false;
+                clickedSkipButtons.clear();
+                muteAppliedByBlocker = false;
+                const videos = document.querySelectorAll('video.html5-main-video, video');
+                for (const video of videos) {
+                    if (!(video instanceof HTMLVideoElement)) continue;
+                    try {
+                        if (video.playbackRate > 2) video.playbackRate = userPlaybackRate || 1.0;
+                    } catch (_) { }
+                    try { video.muted = userWasMuted; } catch (_) { }
+                }
+                const player = observedPlayer || document.getElementById('movie_player');
+                try {
+                    if (!userWasMuted) player?.unMute?.();
+                } catch (_) { }
+                try { player?.playVideo?.(); } catch (_) { }
+            };
             let userManuallyPaused = false;
             let activeWatchVideoId = '';
             let autoplayAttempts = 0;
@@ -1598,6 +1635,13 @@ internal static class AdBlockDocumentScript
                                 adWasActive = true;
                                 userWasMuted = video.muted;
                             }
+                            // Suppress the volumechange handler below. Assigning
+                            // video.muted fires volumechange asynchronously; by the
+                            // time it is delivered the ad-showing class is often
+                            // already gone, so the handler recorded our own mute as
+                            // a user preference and the video stayed silent after
+                            // the ad for the rest of the session.
+                            muteAppliedByBlocker = true;
                             try { video.muted = true; } catch (_) { }
                             try {
                                 if (video.playbackRate < 16) {
@@ -1615,21 +1659,8 @@ internal static class AdBlockDocumentScript
                             try { button.click(); } catch (_) { }
                         }
                         try { player?.skipAd?.(); } catch (_) { }
-                    } else if (adWasActive) {
-                        adWasActive = false;
-                        clickedSkipButtons.clear();
-                        const videos = document.querySelectorAll('video.html5-main-video, video');
-                        for (const video of videos) {
-                            if (!(video instanceof HTMLVideoElement)) continue;
-                            try {
-                                if (video.playbackRate > 2) video.playbackRate = userPlaybackRate || 1.0;
-                            } catch (_) { }
-                            try { video.muted = userWasMuted; } catch (_) { }
-                        }
-                        try {
-                            if (!userWasMuted) player?.unMute?.();
-                        } catch (_) { }
-                        try { player?.playVideo?.(); } catch (_) { }
+                    } else {
+                        restoreAfterAd();
                     }
 
                     // Query the cheap tag/id selectors. The paper-dialog owner is
@@ -1716,6 +1747,7 @@ internal static class AdBlockDocumentScript
                     }
                 };
                 const onVolumeChange = () => {
+                    if (muteAppliedByBlocker || adWasActive) return;
                     const player = observedPlayer || document.getElementById('movie_player');
                     if (!player?.classList?.contains('ad-showing')
                         && !player?.classList?.contains('ad-interrupting')) {
@@ -1911,8 +1943,9 @@ internal static class AdBlockDocumentScript
                 scheduleFallback(false);
             };
             const onNavigationStart = () => {
-                adWasActive = false;
-                clickedSkipButtons.clear();
+                // Revert the ad-time mute and speed-up before dropping the flag,
+                // otherwise the next video inherits them.
+                restoreAfterAd();
                 userManuallyPaused = false;
                 activeWatchVideoId = '';
                 autoplayAttempts = 0;

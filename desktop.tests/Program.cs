@@ -2641,6 +2641,111 @@ Check(
         youtubeWatchUrl,
         AdBlockResourceType.Script));
 
+// A response-rewrite directive has no meaning in a request-cancellation engine.
+// Falling through to a plain block is the one outcome that must not happen: a
+// pixel swap becomes a broken image and a noop script becomes a thrown error.
+var rewriteAliasEngine = new AdBlockEngine(initialRules:
+[
+    "||plain-redirect.invalid^$image,redirect=1x1-transparent.gif",
+    "||alias-redirect.invalid^$script,empty",
+    "||alias-mp4.invalid^$media,mp4",
+    "||alias-priority.invalid^$priority=200",
+    "||kept-block.invalid^"
+]);
+Check(
+    "plain redirect options do not become standalone blocks",
+    !rewriteAliasEngine.ShouldBlock(
+        "https://plain-redirect.invalid/pixel.gif",
+        youtubeWatchUrl,
+        AdBlockResourceType.Image)
+    && !rewriteAliasEngine.ShouldBlock(
+        "https://alias-redirect.invalid/ad.js",
+        youtubeWatchUrl,
+        AdBlockResourceType.Script)
+    && !rewriteAliasEngine.ShouldBlock(
+        "https://alias-mp4.invalid/ad.mp4",
+        youtubeWatchUrl,
+        AdBlockResourceType.Media)
+    && !rewriteAliasEngine.ShouldBlock(
+        "https://alias-priority.invalid/ad.js",
+        youtubeWatchUrl,
+        AdBlockResourceType.Script));
+Check(
+    "dropping a redirect rule leaves neighbouring rules intact",
+    rewriteAliasEngine.ShouldBlock(
+        "https://kept-block.invalid/ad.js",
+        youtubeWatchUrl,
+        AdBlockResourceType.Script));
+
+// Filter lists routinely reorder options between a rule and its $badfilter, so
+// the comparison cannot be a raw text match.
+var reorderedBadFilterEngine = new AdBlockEngine(initialRules:
+[
+    "||reordered.invalid^$script,image",
+    "||reordered.invalid^$image,script,badfilter"
+]);
+Check(
+    "badfilter disables its rule regardless of option order",
+    !reorderedBadFilterEngine.ShouldBlock(
+        "https://reordered.invalid/ad.js",
+        new Uri("https://reordered.invalid/page").AbsoluteUri,
+        AdBlockResourceType.Script));
+Check(
+    "badfilter disables its rule regardless of option order",
+    !reorderedBadFilterEngine.ShouldBlock(
+        "https://reordered.invalid/ad.js",
+        new Uri("https://reordered.invalid/page").AbsoluteUri,
+        AdBlockResourceType.Script));
+
+// $denyallow=a.com means "do not apply on a.com"; the ~ form negates that, so
+// the rule must apply on b.com.
+var denyAllowEngine = new AdBlockEngine(initialRules:
+[
+    "||denyallow.invalid^$denyallow=skipped.invalid|~kept.invalid"
+]);
+Check(
+    "denyallow excludes listed hosts and keeps tilde-negated hosts",
+    !denyAllowEngine.ShouldBlock(
+        "https://denyallow.invalid/ad.js",
+        new Uri("https://skipped.invalid/page").AbsoluteUri,
+        AdBlockResourceType.Script)
+    && denyAllowEngine.ShouldBlock(
+        "https://denyallow.invalid/ad.js",
+        new Uri("https://kept.invalid/page").AbsoluteUri,
+        AdBlockResourceType.Script)
+    && denyAllowEngine.ShouldBlock(
+        "https://denyallow.invalid/ad.js",
+        youtubeWatchUrl,
+        AdBlockResourceType.Script));
+
+// The host text is trimmed of dot padding but the path remainder is sliced from
+// the untrimmed pattern, which used to shift by the number of trimmed dots.
+var dottedHostEngine = new AdBlockEngine(initialRules:
+[
+    "||.padded-host.invalid/ad/banner.js",
+    "||localhost^$script"
+]);
+Check(
+    "dot-padded ||host rules keep their exact path remainder",
+    dottedHostEngine.ShouldBlock(
+        "https://padded-host.invalid/ad/banner.js",
+        youtubeWatchUrl,
+        AdBlockResourceType.Script)
+    && !dottedHostEngine.ShouldBlock(
+        "https://padded-host.invalid/m/banner.js",
+        youtubeWatchUrl,
+        AdBlockResourceType.Script));
+Check(
+    "single-label ||host rules cover the host and its subdomains",
+    dottedHostEngine.ShouldBlock(
+        "http://localhost/app.js",
+        youtubeWatchUrl,
+        AdBlockResourceType.Script)
+    && dottedHostEngine.ShouldBlock(
+        "http://cache.localhost/app.js",
+        youtubeWatchUrl,
+        AdBlockResourceType.Script));
+
 var importantExceptionEngine = new AdBlockEngine(initialRules:
 [
     "||important-exception.invalid^$script,important",
@@ -2806,6 +2911,23 @@ Check(
 Check(
     "site-specific cosmetic rules do not leak onto other sites",
     !otherSiteCosmeticCss.Contains(".smoke-youtube-ad", StringComparison.Ordinal));
+
+// The cosmetic parser takes everything after "##" as the selector, so a
+// $badfilter suffix used to become part of the selector and leave the real rule
+// active.
+var cosmeticBadFilterEngine = new AdBlockEngine(initialRules:
+[
+    "cosmetic-badfilter.invalid##.smoke-badfiltered-ad",
+    "cosmetic-badfilter.invalid##.smoke-badfiltered-ad$badfilter",
+    "cosmetic-badfilter.invalid##.smoke-kept-ad"
+]);
+var cosmeticBadFilterCss = cosmeticBadFilterEngine.GetCosmeticCss(
+    "https://cosmetic-badfilter.invalid/page");
+Check(
+    "cosmetic badfilter disables its rule and leaves selectors intact",
+    !cosmeticBadFilterCss.Contains(".smoke-badfiltered-ad", StringComparison.Ordinal)
+        && !cosmeticBadFilterCss.Contains("$badfilter", StringComparison.Ordinal)
+        && cosmeticBadFilterCss.Contains(".smoke-kept-ad", StringComparison.Ordinal));
 Check(
     "remote scriptlet syntax is never emitted as cosmetic CSS",
     !youtubeCosmeticCss.Contains("+js", StringComparison.Ordinal));

@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Ad blocking correctness
+
+- Stopped `$redirect=`, `$empty`, `$mp4`, `$all` and `$priority=` rules from silently becoming hard blocks. A request-cancellation engine cannot honour a response rewrite, and compiling one as a block turned a 1x1 pixel swap into a broken image and a `noopjs` redirect into a thrown error. These rules are now dropped and counted as unsupported, matching the existing `$redirect-rule=` behaviour.
+- Fixed `$badfilter` so it disables its rule even when the list reorders options between the two (`||x^$domain=a.com,script` vs `@@||x^$script,domain=a.com`). Comparison is now on a canonical pattern-plus-sorted-options key instead of raw text.
+- Fixed cosmetic `$badfilter`. `example.com##.ad$badfilter` was parsed as a live rule hiding a selector literally named `.ad$badfilter`, and the real `example.com##.ad` rule stayed active. Badfilters are now resolved before the cosmetic and hide-disable parsers run, and a `$` is rejected in cosmetic selectors.
+- Fixed `$denyallow`, which was evaluated backwards *and* against the wrong URL. It is a source-document condition, but it was merged into the exclusion list matched against the request host, and the `~`-negated entries were treated as further exclusions. Every `$denyallow` rule from the configured lists was mis-evaluated.
+- Fixed an off-by-N in `||host` rules with dot padding: `||.ads.example.com/banner` sliced its path remainder from the untrimmed pattern and matched `/m/banner`.
+- `||host` rules now accept single-label hosts, so `||localhost^` and `||intranet^` cover the host and its subdomains instead of never matching.
+- Classified subframes correctly when WebView2 refuses the `Sec-Fetch-Dest` header read. Previously every subframe was reported as a top-level document, so `$document` rules blocked iframe loads and `$subdocument` rules never fired. `RequestedSourceKind` is used as the fallback.
+- Cosmetic element hiding now covers `about:blank`, `about:srcdoc` and `data:` frames, which inherit the parent origin and are a standard container for injected ad markup.
+- Cosmetic CSS no longer silently disappears when a client-side redirect or a History API rewrite changes the URL before `DOMContentLoaded`, and it is removed when a page ends up with no cosmetic rules instead of leaving the previous page's stylesheet applied.
+- "Disable shield for this site" now also reverts YouTube's network experiment flag overrides, and the per-tab control channel survives a shield toggle so a later "disable on this page" still reaches the live document.
+
+### Ad blocking stability and performance
+
+- Fixed a lock-safety defect in the filter loader: `CancellationTokenSource.Cancel()` ran while `loadSync` was held, so task continuations could resume on the locked thread and the loader's `finally` could dispose a source that was still mid-cancel.
+- Gave the HTTP cache-validator metadata a GUID-suffixed temp name, matching the list payloads. Overlapping generations shared one fixed `.tmp` path and deleted each other's file.
+- Swept abandoned `*.tmp` download leftovers older than the cache lifetime, which previously accumulated across restarts after a hard kill.
+- Replaced wholesale `Clear()` on the bounded per-thread request/source/host/suffix caches with partial eviction, and raised the source-URL cache from 16 to 64 entries. The 16-entry cache was exhausted by a handful of requests, forcing a `Uri` reparse on every WebView2 policy hook.
+- Registered the `WebResourceRequested` filter with the tab's teardown list, so it no longer depends on `RemoveAdBlockFiltering` running before disposal.
+- Read the top-level `CoreWebView2.Source` COM property once per request instead of twice, and hoisted the blocked-response stub bodies out of the per-request path.
+- Aligned the two divergent copies of `MapResourceType` and documented that they must stay in step.
+- YouTube player: the ad-time mute and 16x speed-up are now reverted on client-side navigation as well as on ad completion, and the blocker's own `volumechange` no longer gets recorded as a user mute preference. Previously navigating away mid-ad left YouTube playing silently at 16x for the rest of the session.
+
+### Documentation
+
+- Added a prominent Windows-only warning to the readme, with an explanation of what a macOS edition would require. MishaWeb is built on Windows Forms and WebView2; neither has a macOS implementation, and a Mac port would need both a new UI framework and a WebKit-based ad blocker using content-rule syntax rather than the ABP/uBO rules compiled here.
+
 - YouTube ad blocker: stopped cosmetic `:has()` rules from hiding an entire Shorts shelf or search row when only one promoted item inside it was an ad, and extended coverage to the current desktop, mobile, Shorts, and player ad renderers.
 - YouTube ad blocker: matched network-layer and document-layer YouTube domains from one audited list (`youtube.com`, `youtube-nocookie.com`, `youtubekids.com`) by DNS suffix instead of URL substring, so nocookie embeds keep their player bootstrap and lookalike hosts such as `myyoutube.com` no longer receive YouTube-shaped ad stubs or a reflected request `Origin`.
 - YouTube ad blocker: cut per-poll main-thread work — the watch query string is parsed once per navigation, `getStatsForNerds`/`getPlayerStateObject` are called at most once per pass, the skip-button lookup is a single combined selector that clicks each control once per ad, the per-poll enforcement probe no longer runs document-wide `:has()` compounds, and ad-class churn no longer drives an unbounded pass per mutation.
