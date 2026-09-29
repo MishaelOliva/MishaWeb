@@ -95,6 +95,22 @@ export function gpuPrivateBytes(sample) {
 }
 
 /**
+ * The owned groups this sample does not carry a readable private-bytes metric
+ * for.
+ *
+ * This is the direct check for the failure a ratio cannot see. Gating on a
+ * share of the total missed three of the four renames it was written for,
+ * because renaming `browser` or `renderer` still leaves a large owned total
+ * against a large total. Naming the missing group detects all four, costs no
+ * constant, and reports which one broke.
+ */
+export function missingOwnedGroups(sample) {
+  return OWNED_PROCESS_GROUPS.filter(
+    group => privateBytesOf(sample?.groups?.[group]?.privateBytes) === null
+  );
+}
+
+/**
  * Owned private bytes for a sample that a gate depends on, rejecting a sample
  * whose owned groups cannot be read. Aborting is the point: a null here means a
  * group name or metric shape changed, and every ceiling downstream would

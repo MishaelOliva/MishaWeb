@@ -24,6 +24,9 @@
       Command="node &quot;$(MSBuildProjectDirectory)\MemoryChurnAnalysis.test.mjs&quot;"
       WorkingDirectory="$(MSBuildProjectDirectory)\.." />
     <Exec
+      Command="node &quot;$(MSBuildProjectDirectory)\MemoryAcceptanceProbe.test.mjs&quot;"
+      WorkingDirectory="$(MSBuildProjectDirectory)\.." />
+    <Exec
       Command="node &quot;$(MSBuildProjectDirectory)\ReaderModeScript.test.mjs&quot;"
       WorkingDirectory="$(MSBuildProjectDirectory)\.." />
   </Target>

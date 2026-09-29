@@ -25,17 +25,25 @@ function extractToggle(text) {
 
 const toggle = extractToggle(source);
 
-// Each element counts its own descendant walks. Scoring is expected to walk a
-// candidate exactly four times, once per selector it consults.
+// Each element counts how many times it is scored and how many descendant walks
+// that costs. The assertion is on scorings, not walks: consolidating the four
+// selector queries inside score() into one would be a strict improvement to the
+// function this test exists to protect, and a walk count would forbid it.
 function makeElement(spec) {
   const element = {
     name: spec.name,
+    scorings: 0,
     walks: 0,
     children: [],
     innerText: spec.innerText ?? '',
     querySelectorAll(selector) {
       element.walks += 1;
-      if (selector === 'a') return spec.anchors ?? [];
+      if (selector === 'a') {
+        // score() always issues the anchor query first, so this counter sees one
+        // event per scoring and nothing else.
+        element.scorings += 1;
+        return spec.anchors ?? [];
+      }
       if (selector === 'p') return spec.paragraphs ?? [];
       if (selector === 'h1,h2,h3') return spec.headings ?? [];
       if (selector.includes('nav')) return spec.bad ?? [];
@@ -133,19 +141,17 @@ const shown = content.children.at(-1);
 assert.ok(shown, 'the winning candidate clone must be inserted into the content wrapper');
 assert.equal(shown.name, 'article-clone');
 
-// The scoring must walk each candidate's subtree exactly once. Recomputing the
-// incumbent's score inside the comparison loop doubled that, which is the
-// regression this guards: reader mode runs only on user request, so nothing else
-// in the product would notice the wasted work.
+// Each candidate must be scored exactly once. Recomputing the incumbent's score
+// inside the comparison loop scored the winner on every iteration instead,
+// which doubled the work: each score is four descendant walks plus innerText on
+// every anchor, and innerText forces a synchronous layout.
 for (const element of candidates) {
   assert.equal(
-    element.walks,
-    4,
-    `${element.name} was walked ${element.walks} times, expected exactly 4 (one per selector)`
+    element.scorings,
+    1,
+    `${element.name} was scored ${element.scorings} times, expected exactly 1`
   );
 }
-const totalWalks = candidates.reduce((sum, element) => sum + element.walks, 0);
-assert.equal(totalWalks, 4 * candidates.length);
 
 // A page with no substantial content block must be left alone rather than being
 // replaced by an overlay holding a navigation menu. The script falls back to
@@ -154,7 +160,7 @@ const stub = makeElement({ name: 'nav', innerText: 'B'.repeat(60), bad: filler(3
 const thin = runToggle([stub], { '#main': [stub] }, 'B'.repeat(60));
 assert.equal(thin.applied, false, 'a page without a substantial content block must not activate');
 assert.equal(thin.appended.length, 0, 'nothing may be appended when reader mode declines to run');
-assert.equal(stub.walks, 4, 'the declined path must still score its candidate exactly once');
+assert.equal(stub.scorings, 1, 'the declined path must still score its candidate exactly once');
 
 console.log(JSON.stringify({
   status: 'PASS',

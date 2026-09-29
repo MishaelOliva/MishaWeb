@@ -4234,14 +4234,6 @@ Check(
         && configureWebViewSource.Contains("tab.HoverStatus = string.Empty;", StringComparison.Ordinal));
 // The status label's paint fixes two defects: a two-line wrap, and an 11 px
 // vertical misalignment caused by pinning MaximumSize.Height, which caps the
-// control rather than the text. An ink-measurement probe was tried here and
-// removed: TextRenderer clips rather than wraps, so dropping either SingleLine
-// or VerticalCenter from the flags still produced a single centred band and
-// the probe passed against the defect it was meant to catch. The paint flags
-// and the absence of a size cap are asserted directly instead, which is what
-// actually determines both behaviours.
-// The status label's paint fixes two defects: a two-line wrap, and an 11 px
-// vertical misalignment caused by pinning MaximumSize.Height, which caps the
 // control rather than the text.
 //
 // An ink-measurement probe was tried here and removed: TextRenderer clips

@@ -27,7 +27,8 @@ import {
   analyzeChurnMemory,
   DEFAULT_CHURN_LIMITS,
   OWNED_PROCESS_GROUPS,
-  ownedPrivateBytes
+  ownedPrivateBytes,
+  missingOwnedGroups
 } from './MemoryChurnAnalysis.mjs';
 
 const MEBIBYTE = 1024 * 1024;
@@ -44,11 +45,6 @@ const DEFAULTS = Object.freeze({
   maxFinalWorkingSetMiB: 650,
   maxPeakWorkingSetMiB: 725,
   maxFinalProcesses: 12,
-  // Fraction of the total private bytes the owned groups must account for. The
-  // managed host alone sits near 100 MiB of a ~530 MiB total, so a real run is
-  // around 0.35. A group renamed on the emitting side would drop this toward
-  // zero and quietly remove its terms from every private-bytes ceiling.
-  minOwnedPrivateShare: 0.2,
   churnCycles: 0,
   churnBatchSize: 3,
   churnDwellMs: 750,
@@ -110,8 +106,12 @@ browser, renderer, utility). The crashpad handler and the WebView2 gpu helper
 are excluded: crashpad is a crash reporter, and gpu reserves address space it
 does not touch, so gating on either measures something this product does not
 own. The process total and the gpu helper's commit appear in the JSON output
-but are not gated. owned-private-share is the floor that catches a group being
-renamed on the emitting side and silently dropped from the gated total.
+but are not gated.
+
+"Peak private" is the sum of each owned group's highest reading across the run,
+not the highest total the process set ever reached. A group's peak usually
+occurs on a different sample from the next group's, so the sum exceeds any real
+total; totalPeakPrivateMiB in the output carries the same caveat.
 
 Output contract:
   stdout: one compact summary JSON object
@@ -153,7 +153,6 @@ function parseArgs(argv) {
     steadyToleranceMiB: DEFAULTS.steadyToleranceMiB,
     maxFinalPrivateMiB: DEFAULTS.maxFinalPrivateMiB,
     maxPeakPrivateMiB: DEFAULTS.maxPeakPrivateMiB,
-    minOwnedPrivateShare: DEFAULTS.minOwnedPrivateShare,
     maxFinalWorkingSetMiB: DEFAULTS.maxFinalWorkingSetMiB,
     maxPeakWorkingSetMiB: DEFAULTS.maxPeakWorkingSetMiB,
     maxFinalProcesses: DEFAULTS.maxFinalProcesses,
@@ -903,11 +902,11 @@ async function writeResult(outputFolder, result) {
   const resultPath = path.join(outputFolder, 'memory-result.json');
   await writeFile(resultPath, `${JSON.stringify(result, null, 2)}\n`, 'utf8');
   // Gated figures. Read back from the checks rather than recomputed, so the
-// summary cannot disagree with the ceiling it documents. In observe-only mode
-// those gates never run and the fields are null, which is the honest answer.
-const gatedActual = name =>
-  result.acceptance?.checks?.find(item => item.name === name)?.actual ?? null;
-console.log(JSON.stringify({
+  // summary cannot disagree with the ceiling it documents. In observe-only mode
+  // those gates never run and the fields are null, which is the honest answer.
+  const gatedActual = name =>
+    result.acceptance?.checks?.find(item => item.name === name)?.actual ?? null;
+  console.log(JSON.stringify({
     status: result.status,
     reason: result.reason,
     resultPath,
@@ -925,7 +924,7 @@ console.log(JSON.stringify({
     gatedProcessGroups: [...OWNED_PROCESS_GROUPS],
     finalOwnedPrivateMiB: gatedActual('final-private-mib'),
     peakOwnedPrivateMiB: gatedActual('peak-private-mib'),
-    ownedPrivateShare: gatedActual('owned-private-share'),
+    ownedGroupsReadable: gatedActual('owned-groups-readable'),
     // Ungated totals, reported so the GPU reservation stays visible. The peak
     // total is a sum taken across samples, so it exceeds any single sample and
     // is not a real peak for the process set.
@@ -946,7 +945,7 @@ console.log(JSON.stringify({
   }));
 }
 
-function evaluateAcceptance(options, steadyStateReached, measurementSamples) {
+export function evaluateAcceptance(options, steadyStateReached, measurementSamples) {
   const final = measurementSamples.at(-1);
   const peak = peakForSamples(measurementSamples);
   const checks = [
@@ -970,36 +969,48 @@ function evaluateAcceptance(options, steadyStateReached, measurementSamples) {
     // A ceiling compared against null or zero is not a measurement, it is a
     // pass. The peak summary wraps each group metric in { value, atElapsedMs },
     // which an earlier version of this read as "no data" and reported 0 MiB
-    // against a 525 MiB limit. Fail the run loudly instead.
-    if (finalOwnedPrivateBytes === null || peakOwnedPrivateBytes === null) {
-      throw new Error(
-        'Owned process groups carry no readable private bytes. Checked groups: '
-        + `${OWNED_PROCESS_GROUPS.join(', ')}`);
-    }
+    // against a 525 MiB limit.
+    const finalMissing = missingOwnedGroups(final);
+    const peakMissing = missingOwnedGroups(peak);
+    const unreadable = finalMissing.length > 0 || peakMissing.length > 0;
+    // A ceiling compared against zero is not a measurement, it is a pass. The
+    // gated figures stay null so no check silently gates on them, and the run
+    // is FAIL naming the group rather than SKIP with the other 15 checks
+    // discarded: a caller distinguishing exit 1 from exit 2 must not see a green
+    // build on a run where every measurement was thrown away.
     checks.push(
       {
-        name: 'final-private-mib',
-        actual: finalOwnedPrivateBytes / MEBIBYTE,
-        limit: options.maxFinalPrivateMiB,
-        passed: finalOwnedPrivateBytes <= options.maxFinalPrivateMiB * MEBIBYTE
-      },
-      {
-        name: 'peak-private-mib',
-        actual: peakOwnedPrivateBytes / MEBIBYTE,
-        limit: options.maxPeakPrivateMiB,
-        passed: peakOwnedPrivateBytes <= options.maxPeakPrivateMiB * MEBIBYTE
-      },
-      {
-        // Ties the gated total back to the ungated one, so a group renamed on
-        // the emitting side cannot quietly remove ~100 MiB from every ceiling
-        // above while the run still reports PASS.
-        name: 'owned-private-share',
-        actual: Number(
-          (finalOwnedPrivateBytes / Math.max(1, final.total.privateBytes)).toFixed(3)
-        ),
-        limit: options.minOwnedPrivateShare,
-        passed: finalOwnedPrivateBytes >= options.minOwnedPrivateShare * final.total.privateBytes
-      },
+        name: 'owned-groups-readable',
+        actual: unreadable
+          ? [...new Set([...finalMissing, ...peakMissing])].join(',')
+          : OWNED_PROCESS_GROUPS.join(','),
+        limit: OWNED_PROCESS_GROUPS.length,
+        passed: !unreadable
+      }
+    );
+    // Only the private-bytes gates depend on the group breakdown. The
+    // working-set and process gates read the sample total, so they run whatever
+    // the groups look like: an unreadable group must cost those measurements,
+    // not the whole run.
+    if (!unreadable) {
+      const finalOwnedPrivateBytes = ownedPrivateBytes(final);
+      const peakOwnedPrivateBytes = ownedPrivateBytes(peak);
+      checks.push(
+        {
+          name: 'final-private-mib',
+          actual: finalOwnedPrivateBytes / MEBIBYTE,
+          limit: options.maxFinalPrivateMiB,
+          passed: finalOwnedPrivateBytes <= options.maxFinalPrivateMiB * MEBIBYTE
+        },
+        {
+          name: 'peak-private-mib',
+          actual: peakOwnedPrivateBytes / MEBIBYTE,
+          limit: options.maxPeakPrivateMiB,
+          passed: peakOwnedPrivateBytes <= options.maxPeakPrivateMiB * MEBIBYTE
+        }
+      );
+    }
+    checks.push(
       {
         name: 'final-working-set-mib',
         actual: final.total.workingSetMiB,
@@ -1017,7 +1028,8 @@ function evaluateAcceptance(options, steadyStateReached, measurementSamples) {
         actual: final.total.processCount,
         limit: options.maxFinalProcesses,
         passed: final.total.processCount <= options.maxFinalProcesses
-      });
+      }
+    );
   }
   return {
     evaluated: !options.observeOnly,
@@ -1513,4 +1525,11 @@ async function main() {
   return exitCode;
 }
 
-process.exitCode = await main();
+// Guarded so the module can be imported by MemoryAcceptanceProbe.test.mjs
+// without launching a run. An ungated `await main()` made this file untestable,
+// which is how the owned-groups gate shipped with two defects that only a
+// five-minute browser run surfaced.
+if (process.argv[1]
+  && import.meta.url === new URL(`file:///${process.argv[1].replace(/\\/g, '/')}`).href) {
+  process.exitCode = await main();
+}
