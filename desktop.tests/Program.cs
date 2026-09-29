@@ -2936,13 +2936,38 @@ Check(
     "subframe urls do not leak into the next top-level document",
     !generationScoped.Contains("https://preloaded0.invalid/page", 8)
     && !generationScoped.Contains("https://preloaded127.invalid/page", 8));
-var reusedAfterNavigation = MainForm.CreateAdBlockSubframeStateForTesting(documentGeneration: 7);
+// Seeded well below the bound on purpose. Seeding to the full bound made the
+// eviction path fire on the next insert, so this check passed even with the
+// generation reset deleted.
+var reusedAfterNavigation = MainForm.CreateAdBlockSubframeStateForTesting(
+    documentGeneration: 7,
+    seedCount: 2);
 reusedAfterNavigation.Record("https://late-frame.invalid/page", 8);
 Check(
     "recording under a new generation discards the previous document's urls",
     reusedAfterNavigation.Contains("https://late-frame.invalid/page", 8)
     && !reusedAfterNavigation.Contains("https://preloaded0.invalid/page", 8)
     && reusedAfterNavigation.Remaining == 1);
+
+// Reaching the bound must evict the oldest entry, not clear the whole set.
+// Clearing dropped every known subframe at once, so a document with more than
+// the bound worth of distinct frames lost all of its classifications at the
+// moment it crossed the line.
+var evicting = MainForm.CreateAdBlockSubframeStateForTesting(seedCount: 4);
+for (var index = 0; index < 128; index++)
+{
+    evicting.Record($"https://extra{index}.invalid/page", 0);
+}
+Check(
+    "reaching the subframe bound evicts oldest rather than dropping everything",
+    // 132 entries were recorded against a bound of 128, so the four seeded
+    // entries are the ones evicted. Everything recorded afterwards survives,
+    // which is the property the wholesale clear destroyed.
+    evicting.Remaining == 128
+    && !evicting.Contains("https://preloaded0.invalid/page", 0)
+    && !evicting.Contains("https://preloaded3.invalid/page", 0)
+    && evicting.Contains("https://extra0.invalid/page", 0)
+    && evicting.Contains("https://extra127.invalid/page", 0));
 var boundedSeam = MainForm.CreateAdBlockSubframeStateForTesting();
 Check(
     "subframe url set holds a bounded number of entries",

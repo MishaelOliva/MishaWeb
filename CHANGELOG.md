@@ -17,9 +17,9 @@
 
 ### Known issue
 
-- The memory acceptance probe (`npm run desktop:memory-churn`) currently fails four of its limits on this machine: final private 538.3 MiB against 450, peak private 538.7 against 525, churn-retained private 201.4 against 96, and a monotonic growth run of 5 against a limit of 4. The shape is healthy and the breach is not a managed leak: the MishaWeb host process grows 97.8 to 107.2 MiB across 12 cycles, about 0.8 MiB per cycle, settling at 100.7; the WebView2 renderer is flat at 24 MiB; working set falls to 63.5 MiB and retained working set is −476.8 MiB; the cooldown plateau range is 0.4 MiB; and residual process count is unchanged at 7. Memory is handed back, which a leak does not do.
+- The memory acceptance probe (`npm run desktop:memory-churn`) fails on this machine. The count of failing gates varies between runs because the monotonic-growth gate is close to its limit: one run failed four (final private 538.3 MiB against 450, peak private 538.7 against 525, churn-retained private 201.4 against 96, monotonic run 5 against a limit of 4) and a later run of the same tree failed three, with the monotonic run at 1. The three private-bytes gates fail consistently. The shape is healthy and the breach is not a managed leak: the MishaWeb host process grows 97.8 to 107.2 MiB across 12 cycles, about 0.8 MiB per cycle, settling at 100.7; the WebView2 renderer is flat at 24 MiB; working set falls to 63.5 MiB and retained working set is −476.8 MiB; the cooldown plateau range is 0.4 MiB; and residual process count is unchanged at 7. Memory is handed back, which a leak does not do.
 
-  The WebView2 GPU process accounts for 182.6 MiB of the 201.4 MiB retained, and its working set is about 9 MiB against roughly 330 MiB of private commit, so it is reserving rather than holding. That is 61% of the steady-state private total of 538.3 MiB, and 91% of the retained delta. Runs before and after these changes land in the same 159 to 211 MiB retained band, so the failure predates them.
+  The GPU process is the dominant term. Its 329.0 MiB private commit is 61% of the 538.3 MiB steady-state total, and its 182.6 MiB growth is 91% of the 201.4 MiB retained. Its working set is about 9 MiB against that commit, so it is reserving rather than holding. Runs before and after these changes land in the same 159 to 211 MiB retained band, so the failure predates them.
 
   The GPU rasterization flags were the obvious suspect and were measured rather than assumed. `MISHAWEB_DISABLE_GPU_RASTERIZATION=1` is a diagnostic switch that disables them for a single run; it exists in the app because `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` can only append flags, so there is no way to reach them from outside for an A/B. A 12-cycle A/B on identical hardware:
 
@@ -28,7 +28,11 @@
   | flags on (default) | 329.0 MiB | 538.3 | 201.4 | FAIL |
   | flags off | 317.1 MiB | 530.2 | 190.7 | FAIL |
 
-  The flags account for about 12 MiB, under 4% of the breach, and the same three limits still fail without them. The GPU process commits 329.0 MiB with the flags and 317.1 MiB without, so it is not near zero either way and the residue is a WebView2 baseline for the current environment rather than a MishaWeb managed leak. The flags are retained, since they are worth far more for rendering than the 12 MiB they cost, and the acceptance limits are left unchanged: this is reported as a failing gate, not re-tuned to pass.
+  The flags account for about 12 MiB, under 4% of the breach, and the same three private-bytes gates still fail without them. The GPU process commits 329.0 MiB with the flags and 317.1 MiB without, so it is not near zero either way and the residue is a WebView2 baseline for the current environment rather than a MishaWeb managed leak. The flags are retained, since they are worth far more for rendering than the 12 MiB they cost, and the acceptance limits are left unchanged: this is reported as a failing gate, not re-tuned to pass.
+
+- Reaching the subframe URL bound now evicts the oldest entry instead of clearing the whole set. Clearing dropped every known subframe at once, so a document with more distinct frame URLs than the bound lost all of its classifications at the moment it crossed the line and those iframes were treated as top-level documents, which is the failure the feature exists to prevent.
+
+- Gave the toolbar status label its own single-line, vertically centred paint using `TextRenderer` with an end ellipsis. Capping `MaximumSize.Height` capped the control rather than the text and pushed the status out of line with the surrounding buttons by 11 px, while removing the cap let a long status wrap onto a second line. The toolbar column already bounds the width, so no size cap is needed.
 
 ### Ad blocking correctness
 

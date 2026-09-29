@@ -1469,13 +1469,12 @@ public sealed class MainForm : Form
         statusLabel.ForeColor = MutedTextColor;
         statusLabel.Font = new Font("Segoe UI", 8.25f);
         statusLabel.AutoEllipsis = true;
-        statusLabel.AutoSize = true;
-        // Cap the width only. A zero height means "unlimited", so the previous
-        // 150x0 cap let a single-line status grow vertically and wrap to two
-        // lines inside a one-row toolbar, orphaning words next to the download
-        // button. Pinning the height to one line keeps it on one line and lets
-        // AutoEllipsis truncate instead.
-        statusLabel.MaximumSize = new Size(320, statusLabel.PreferredHeight);
+        // AnnouncingStatusLabel paints itself single-line and vertically
+        // centred, so it needs no size cap: the toolbar column already bounds it
+        // to MaximumToolbarStatusWidth and GDI truncates with an ellipsis. A
+        // MaximumSize here would cap the control rather than the text, which put
+        // the status out of line with the surrounding buttons.
+        statusLabel.MaximumSize = Size.Empty;
         statusLabel.AccessibleName = "Browser status";
         statusLabel.AccessibleRole = AccessibleRole.StatusBar;
 
@@ -3589,11 +3588,11 @@ public sealed class MainForm : Form
         // their closures rooted for the rest of the browser session.
         AbandonPendingFrameSetups(tab);
         tab.ReleaseTrackedFrames();
+        // Bumping the generation is also what retires the tab's subframe
+        // identities: they are recorded against a generation, so a URL seen as a
+        // subframe under the outgoing document stops matching here without any
+        // explicit reset to forget. See AdBlockSubframeState.
         tab.DocumentNavigationGeneration++;
-        // Subframe identities belong to the document that is being replaced. A URL
-        // recorded as a subframe under the outgoing page must not stay classified
-        // as SubDocument once a new top-level document is committed, or $document
-        // rules would be skipped and $subdocument rules would fire on it.
         tab.IsLoading = true;
         tab.ConsecutiveSuspendFailures = 0;
         tab.StatusText = "Loading\u2026";
@@ -3755,11 +3754,6 @@ public sealed class MainForm : Form
     }
 
     /// <summary>
-    /// Test seam for subframe classification. Takes the WebView2 enum as its own
-    /// parameter type so callers outside the assembly, which do not reference
-    /// the WebView2 SDK, can still drive the decision table.
-    /// </summary>
-    /// <summary>
     /// Per-tab record of which document URLs belong to a subframe.
     ///
     /// The set is scoped to a document generation rather than cleared by hand at
@@ -3773,21 +3767,31 @@ public sealed class MainForm : Form
     internal sealed class AdBlockSubframeState
     {
         private readonly HashSet<string> urls = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Queue<string> insertionOrder = new();
         private long recordedGeneration = -1;
 
         public int Remaining => urls.Count;
-
-        public long RecordedGeneration => recordedGeneration;
 
         public void Record(string url, long documentGeneration)
         {
             if (recordedGeneration != documentGeneration)
             {
                 urls.Clear();
+                insertionOrder.Clear();
                 recordedGeneration = documentGeneration;
             }
-            if (urls.Count >= MaximumTrackedSubframeUrlsPerTab) urls.Clear();
-            urls.Add(url);
+            if (urls.Add(url)) insertionOrder.Enqueue(url);
+            // Evict the oldest entry rather than clearing the whole set. Clearing
+            // at the bound dropped every known subframe at once, so a document
+            // with more than MaximumTrackedSubframeUrlsPerTab distinct frames lost
+            // all of its classifications and those iframes fell back to being
+            // treated as top-level documents, which is the exact failure this
+            // exists to prevent.
+            while (urls.Count > MaximumTrackedSubframeUrlsPerTab)
+            {
+                var oldest = insertionOrder.Dequeue();
+                urls.Remove(oldest);
+            }
         }
 
         /// <summary>
@@ -3797,20 +3801,31 @@ public sealed class MainForm : Form
         public bool Contains(string url, long documentGeneration) =>
             recordedGeneration == documentGeneration && urls.Contains(url);
     }
+
     /// <summary>
-    /// Creates a subframe state pre-loaded with one generation's worth of
-    /// entries, so tests can exercise the bound and the generation scoping
-    /// without constructing a WebView2-backed tab.
+    /// Creates a subframe state pre-loaded with <paramref name="seedCount"/>
+    /// entries for one generation, so tests can exercise the bound, the eviction
+    /// order and the generation scoping without constructing a WebView2-backed
+    /// tab. The seed count is a parameter because seeding to the full bound made
+    /// the eviction path fire on the next insert, which masked a missing
+    /// generation reset in the tests that were meant to cover it.
     /// </summary>
-    internal static AdBlockSubframeState CreateAdBlockSubframeStateForTesting(long documentGeneration = 0)
+    internal static AdBlockSubframeState CreateAdBlockSubframeStateForTesting(
+        long documentGeneration = 0,
+        int seedCount = MaximumTrackedSubframeUrlsPerTab)
     {
         var state = new AdBlockSubframeState();
-        for (var index = 0; index < MaximumTrackedSubframeUrlsPerTab; index++)
+        for (var index = 0; index < seedCount; index++)
         {
             state.Record($"https://preloaded{index}.invalid/page", documentGeneration);
         }
         return state;
     }
+    /// <summary>
+    /// Test seam for the resource-type decision. The WebView2 enum is taken by
+    /// name so callers outside this assembly, which do not reference the WebView2
+    /// SDK, can still drive the table that the live request path uses.
+    /// </summary>
     internal static AdBlockResourceType MapResourceTypeForTesting(
         string? webViewContext,
         string? fetchDestination = null,
@@ -14268,13 +14283,50 @@ public sealed class MainForm : Form
         }
     }
 
+    /// <summary>
+    /// Toolbar status text. Draws itself with GDI so the text is always a single
+    /// line, vertically centred in the toolbar row, and truncated with an
+    /// ellipsis. A plain autosizing <see cref="Label"/> cannot do this: capping
+    /// MaximumSize.Height caps the control and pushes the text to the top of the
+    /// row, while removing the cap lets a long status wrap onto a second line.
+    /// AutoEllipsis does not prevent that wrap.
+    /// </summary>
     private sealed class AnnouncingStatusLabel : Label
     {
+        public AnnouncingStatusLabel()
+        {
+            AutoSize = false;
+        }
+
         public void Announce(string message)
         {
             AccessibleName = $"Browser status: {message}";
             AccessibilityNotifyClients(AccessibleEvents.NameChange, -1);
             AccessibilityObject.RaiseLiveRegionChanged();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            if (string.IsNullOrEmpty(Text))
+            {
+                base.OnPaint(e);
+                return;
+            }
+
+            using var background = new SolidBrush(BackColor);
+            e.Graphics.FillRectangle(background, ClientRectangle);
+            TextRenderer.DrawText(
+                e.Graphics,
+                Text,
+                Font,
+                ClientRectangle,
+                ForeColor,
+                TextFormatFlags.EndEllipsis
+                    | TextFormatFlags.SingleLine
+                    | TextFormatFlags.VerticalCenter
+                    | TextFormatFlags.Right
+                    | TextFormatFlags.NoPrefix
+                    | TextFormatFlags.NoPadding);
         }
     }
 
