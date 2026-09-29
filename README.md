@@ -28,7 +28,7 @@ MishaWeb separates the desktop user interface and background subsystems from the
 ```
 +-------------------------------------------------------------+
 |                     MISHAWEB DESKTOP HOST                   |
-|                 (C# 13 / .NET 10 LTS WinForms)              |
+|                 (C# 14 / .NET 10 LTS WinForms)              |
 +-------------------------------------------------------------+
        |                                     |
        v                                     v
