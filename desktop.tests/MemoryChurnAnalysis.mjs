@@ -98,16 +98,28 @@ export function gpuPrivateBytes(sample) {
  * The owned groups this sample does not carry a readable private-bytes metric
  * for.
  *
- * This is the direct check for the failure a ratio cannot see. Gating on a
- * share of the total missed three of the four renames it was written for,
- * because renaming `browser` or `renderer` still leaves a large owned total
- * against a large total. Naming the missing group detects all four, costs no
- * constant, and reports which one broke.
+ * Note this cannot be used on its own as an acceptance gate. A gated group can
+ * be legitimately absent because no such process was running in this sample:
+ * WebView2 spawns utility and renderer processes on demand, so requiring all of
+ * them fails a healthy run. Use `presentGroups` for vocabulary drift instead.
  */
 export function missingOwnedGroups(sample) {
   return OWNED_PROCESS_GROUPS.filter(
     group => privateBytesOf(sample?.groups?.[group]?.privateBytes) === null
   );
+}
+
+/**
+ * Group names the sample actually carries, so a caller can compare them against
+ * the vocabulary it expects. This is the direction that detects a rename:
+ * a group that used to be emitted under a known name now appears under an
+ * unknown one, and that is observable whether or not the process is always
+ * present.
+ */
+export function presentGroups(sample) {
+  return sample && typeof sample === 'object' && sample.groups
+    ? Object.keys(sample.groups).sort()
+    : [];
 }
 
 /**

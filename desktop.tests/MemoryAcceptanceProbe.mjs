@@ -16,6 +16,7 @@ import { stat, mkdir, rm, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import process from 'node:process';
 import {
   createProbeChildEnvironment,
@@ -28,8 +29,16 @@ import {
   DEFAULT_CHURN_LIMITS,
   OWNED_PROCESS_GROUPS,
   ownedPrivateBytes,
-  missingOwnedGroups
+  presentGroups
 } from './MemoryChurnAnalysis.mjs';
+
+/**
+ * Every group name classifyProcess can emit. `other` is its catch-all, and
+ * classifyProcess also returns an unrecognised `--type` verbatim, so a new
+ * Chromium process type surfaces here as an unknown group rather than silently
+ * joining the gated total.
+ */
+const KNOWN_PROCESS_GROUPS = [...OWNED_PROCESS_GROUPS, 'gpu', 'crashpad', 'other'];
 
 const MEBIBYTE = 1024 * 1024;
 const SKIP_EXIT_CODE = 2;
@@ -924,7 +933,7 @@ async function writeResult(outputFolder, result) {
     gatedProcessGroups: [...OWNED_PROCESS_GROUPS],
     finalOwnedPrivateMiB: gatedActual('final-private-mib'),
     peakOwnedPrivateMiB: gatedActual('peak-private-mib'),
-    ownedGroupsReadable: gatedActual('owned-groups-readable'),
+    knownProcessGroups: gatedActual('known-process-groups'),
     // Ungated totals, reported so the GPU reservation stays visible. The peak
     // total is a sum taken across samples, so it exceeds any single sample and
     // is not a real peak for the process set.
@@ -970,31 +979,34 @@ export function evaluateAcceptance(options, steadyStateReached, measurementSampl
     // pass. The peak summary wraps each group metric in { value, atElapsedMs },
     // which an earlier version of this read as "no data" and reported 0 MiB
     // against a 525 MiB limit.
-    const finalMissing = missingOwnedGroups(final);
-    const peakMissing = missingOwnedGroups(peak);
-    const unreadable = finalMissing.length > 0 || peakMissing.length > 0;
-    // A ceiling compared against zero is not a measurement, it is a pass. The
-    // gated figures stay null so no check silently gates on them, and the run
-    // is FAIL naming the group rather than SKIP with the other 15 checks
-    // discarded: a caller distinguishing exit 1 from exit 2 must not see a green
-    // build on a run where every measurement was thrown away.
+    const unknownGroups = [...new Set(
+      [...presentGroups(final), ...presentGroups(peak)]
+    )].filter(name => !KNOWN_PROCESS_GROUPS.includes(name));
+    const ownedReadable = finalOwnedPrivateBytes !== null && peakOwnedPrivateBytes !== null;
+    // Detects vocabulary drift in the direction that is actually observable: a
+    // group that used to be emitted under a known name now arrives under an
+    // unknown one. The opposite test, "every gated group must be present", is
+    // wrong, because WebView2 spawns utility and renderer processes on demand
+    // and requiring all four fails a healthy run. An unreadable owned total is a
+    // separate condition and also fails: a run whose gated figures cannot be
+    // read has not been gated. Both are reported by name, and the run is FAIL
+    // rather than SKIP so the remaining checks survive and the violation says
+    // what broke.
     checks.push(
       {
-        name: 'owned-groups-readable',
-        actual: unreadable
-          ? [...new Set([...finalMissing, ...peakMissing])].join(',')
-          : OWNED_PROCESS_GROUPS.join(','),
-        limit: OWNED_PROCESS_GROUPS.length,
-        passed: !unreadable
+        name: 'known-process-groups',
+        actual: unknownGroups.length > 0
+          ? unknownGroups.join(',')
+          : KNOWN_PROCESS_GROUPS.join(','),
+        limit: KNOWN_PROCESS_GROUPS.length,
+        passed: unknownGroups.length === 0 && ownedReadable
       }
     );
     // Only the private-bytes gates depend on the group breakdown. The
     // working-set and process gates read the sample total, so they run whatever
     // the groups look like: an unreadable group must cost those measurements,
     // not the whole run.
-    if (!unreadable) {
-      const finalOwnedPrivateBytes = ownedPrivateBytes(final);
-      const peakOwnedPrivateBytes = ownedPrivateBytes(peak);
+    if (ownedReadable) {
       checks.push(
         {
           name: 'final-private-mib',
@@ -1529,7 +1541,11 @@ async function main() {
 // without launching a run. An ungated `await main()` made this file untestable,
 // which is how the owned-groups gate shipped with two defects that only a
 // five-minute browser run surfaced.
-if (process.argv[1]
-  && import.meta.url === new URL(`file:///${process.argv[1].replace(/\\/g, '/')}`).href) {
+//
+// The comparison uses pathToFileURL rather than string concatenation: building
+// a file: URL by hand mis-escapes a path containing a space, '#' or '?', and a
+// mis-escaped URL does not match import.meta.url, so the guard would silently
+// become false and the probe would exit 0 having done nothing.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   process.exitCode = await main();
 }

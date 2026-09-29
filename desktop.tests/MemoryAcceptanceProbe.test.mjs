@@ -6,7 +6,6 @@
 // because of that.
 
 import assert from 'node:assert/strict';
-import { pathToFileURL } from 'node:url';
 import { OWNED_PROCESS_GROUPS } from './MemoryChurnAnalysis.mjs';
 
 const MEBIBYTE = 1024 * 1024;
@@ -78,8 +77,12 @@ const checkNamed = (result, name) => result.checks.find(item => item.name === na
 
 // A real run: every owned group readable, every ceiling inside its limit.
 const healthy = evaluateAcceptance(OPTIONS, true, [realSample()]);
-assert.ok(checkNamed(healthy, 'owned-groups-readable').passed);
-assert.equal(checkNamed(healthy, 'owned-groups-readable').actual, OWNED_PROCESS_GROUPS.join(','));
+assert.ok(checkNamed(healthy, 'known-process-groups').passed);
+assert.ok(
+  OWNED_PROCESS_GROUPS.every(name =>
+    checkNamed(healthy, 'known-process-groups').actual.split(',').includes(name)),
+  'the healthy run must list every known group'
+);
 assert.ok(checkNamed(healthy, 'final-private-mib').passed);
 assert.equal(
   Math.round(checkNamed(healthy, 'final-private-mib').actual),
@@ -95,27 +98,60 @@ assert.ok(healthyPeak.passed);
 
 // The case a ratio could not see. Renaming browser removes 59.9 MiB from every
 // gated ceiling while still leaving a large owned total, so a share-of-total
-// floor passed it. Naming the missing group catches all four renames.
+// floor passed it. The renamed name now shows up as an unknown group, which is
+// observable whether or not the process is running.
 for (const renamed of OWNED_PROCESS_GROUPS) {
-  const broken = evaluateAcceptance(OPTIONS, true, [realSample({ [renamed]: undefined })]);
-  const readable = checkNamed(broken, 'owned-groups-readable');
-  assert.equal(readable.passed, false, `renaming ${renamed} must fail the presence check`);
+  const broken = evaluateAcceptance(OPTIONS, true, [realSample({ [`${renamed}X`]: 59.9 })]);
+  const known = checkNamed(broken, 'known-process-groups');
+  assert.equal(known.passed, false, `renaming ${renamed} to ${renamed}X must fail`);
   assert.ok(
-    readable.actual.split(',').includes(renamed),
-    `the check must name ${renamed}, reported "${readable.actual}"`
+    known.actual.split(',').includes(`${renamed}X`),
+    `the check must name ${renamed}X, reported "${known.actual}"`
   );
   assert.ok(
-    broken.violations.some(item => item.name === 'owned-groups-readable'),
+    broken.violations.some(item => item.name === 'known-process-groups'),
     `renaming ${renamed} must fail the run`
   );
   // The evidence that still exists has to survive: a SKIP with every check
   // discarded is the failure mode this replaced.
   assert.ok(
     broken.checks.some(item => item.name === 'final-working-set-mib'),
-    'an unreadable group must not discard the other checks'
+    'an unknown group must not discard the other checks'
   );
-  assert.ok(broken.checks.length > 1, 'the other gates must still be reported');
 }
+
+// A gated group that simply is not running must NOT fail. WebView2 spawns
+// utility and renderer processes on demand, so a healthy sample can be missing
+// one, and requiring every group to be present produced a gate that failed
+// healthy runs.
+const noUtility = evaluateAcceptance(OPTIONS, true, [realSample({ utility: undefined })]);
+assert.ok(
+  checkNamed(noUtility, 'known-process-groups').passed,
+  'a legitimately absent group must pass'
+);
+assert.ok(checkNamed(noUtility, 'final-private-mib').passed);
+
+// An unreadable owned total is a different condition and must still fail: the
+// run has not been gated, and a green result would claim otherwise.
+const noOwnedAtAll = evaluateAcceptance(OPTIONS, true, [
+  realSample({ host: undefined, browser: undefined, renderer: undefined, utility: undefined })
+]);
+assert.equal(checkNamed(noOwnedAtAll, 'known-process-groups').passed, false);
+assert.ok(
+  noOwnedAtAll.violations.some(item => item.name === 'known-process-groups'),
+  'an ungated run must fail rather than pass with the ceilings absent'
+);
+assert.equal(
+  noOwnedAtAll.checks.some(item => item.name === 'final-private-mib'),
+  false,
+  'the private gates must be absent rather than compared against zero'
+);
+
+// A new Chromium process type is reported verbatim by classifyProcess, so it
+// must surface instead of silently joining the gated total.
+const newProcessType = evaluateAcceptance(OPTIONS, true, [realSample({ 'unknown-type': 12 })]);
+assert.equal(checkNamed(newProcessType, 'known-process-groups').passed, false);
+assert.ok(checkNamed(newProcessType, 'known-process-groups').actual.includes('unknown-type'));
 
 // Observe-only runs no ceilings, so the presence check must not claim to gate.
 const observing = evaluateAcceptance({ ...OPTIONS, observeOnly: true }, true, [realSample()]);
@@ -124,5 +160,5 @@ assert.equal(observing.checks.some(item => item.name === 'final-private-mib'), f
 
 console.log(JSON.stringify({
   status: 'PASS',
-  contract: 'acceptance gates sum owned groups, read peak wrappers, and name a missing group'
+  contract: 'acceptance gates sum owned groups, read peak wrappers, and detect unknown process groups'
 }));
