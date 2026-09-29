@@ -1465,16 +1465,15 @@ public sealed class MainForm : Form
         statusLabel.Dock = DockStyle.Fill;
         statusLabel.Margin = new Padding(3, 0, 5, 0);
         statusLabel.Text = "Starting\u2026";
-        statusLabel.TextAlign = ContentAlignment.MiddleRight;
         statusLabel.ForeColor = MutedTextColor;
         statusLabel.Font = new Font("Segoe UI", 8.25f);
-        statusLabel.AutoEllipsis = true;
-        // AnnouncingStatusLabel paints itself single-line and vertically
-        // centred, so it needs no size cap: the toolbar column already bounds it
-        // to MaximumToolbarStatusWidth and GDI truncates with an ellipsis. A
-        // MaximumSize here would cap the control rather than the text, which put
-        // the status out of line with the surrounding buttons.
-        statusLabel.MaximumSize = Size.Empty;
+        // AnnouncingStatusLabel paints itself: right-aligned, single line,
+        // vertically centred, truncated with an ellipsis. It therefore ignores
+        // TextAlign, AutoEllipsis and MaximumSize, and none of those are set, so
+        // the paint stays the single source of truth for how the text is drawn.
+        // The toolbar column already bounds the width, so no size cap is needed;
+        // setting one would cap the control rather than the text, which put the
+        // status out of line with the surrounding buttons.
         statusLabel.AccessibleName = "Browser status";
         statusLabel.AccessibleRole = AccessibleRole.StatusBar;
 
@@ -3787,7 +3786,7 @@ public sealed class MainForm : Form
             // all of its classifications and those iframes fell back to being
             // treated as top-level documents, which is the exact failure this
             // exists to prevent.
-            while (urls.Count > MaximumTrackedSubframeUrlsPerTab)
+            while (urls.Count > MaximumTrackedSubframeUrlsPerTab && insertionOrder.Count > 0)
             {
                 var oldest = insertionOrder.Dequeue();
                 urls.Remove(oldest);
@@ -14313,8 +14312,9 @@ public sealed class MainForm : Form
                 return;
             }
 
-            using var background = new SolidBrush(BackColor);
-            e.Graphics.FillRectangle(background, ClientRectangle);
+            // Clear rather than filling with a brush, so a repaint allocates
+            // nothing. This control repaints on every status change.
+            e.Graphics.Clear(BackColor);
             TextRenderer.DrawText(
                 e.Graphics,
                 Text,

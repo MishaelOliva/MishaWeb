@@ -270,6 +270,22 @@ internal sealed class AdBlockEngine
     internal static string? GetBadFilterTargetForTesting(string line) =>
         CompiledRuleSet.GetBadFilterTarget(line);
 
+    internal static bool IsRecognizedBareOptionForTesting(string token) =>
+        FilterRule.IsRecognizedBareOption(token);
+
+    /// <summary>
+    /// Resource-type names AddMappedTypes accepts. The denyallow splitter has to
+    /// terminate a value on all of them, so this list is asserted against the
+    /// parser rather than trusted.
+    /// </summary>
+    internal static IReadOnlyList<string> SupportedResourceTypeNamesForTesting =>
+    [
+        "document", "doc", "subdocument", "sub_frame", "frame", "popup", "popunder",
+        "script", "image", "image-set", "stylesheet", "css", "media", "font",
+        "object", "object-subrequest", "xmlhttprequest", "xhr", "fetch", "websocket",
+        "ping", "beacon", "other", "texttrack", "eventsource", "main_frame"
+    ];
+
 
 
     internal static bool TryExtractMandatoryRegexLiteralForTesting(
@@ -2645,36 +2661,50 @@ internal sealed class AdBlockEngine
     /// bare words like "third-party" as DNS names, and a dot test rejects
     /// legitimate entries such as "localhost" and the CIDR "10.0.0.0/8".
     /// </summary>
-    private static readonly HashSet<string> BareOptionKeywords = new(StringComparer.OrdinalIgnoreCase)
-    {
-        // Resource types and their aliases.
+    private static readonly HashSet<string> BareOptionKeywords =
+    [
         "document", "doc", "subdocument", "sub_frame", "frame", "popup", "popunder",
         "script", "image", "image-set", "stylesheet", "css", "media", "font",
         "object", "object-subrequest", "xmlhttprequest", "xhr", "fetch", "websocket",
         "ping", "beacon", "other", "texttrack", "eventsource", "main_frame",
-        // Valueless flags.
         "important", "match-case", "third-party", "3p", "strict3p", "~third-party",
-        "1p", "first-party", "strict1p", "~first-party", "popup", "all",
+        "1p", "first-party", "strict1p", "~first-party", "all", "empty", "mp4",
         "generichide", "specifichide", "elemhide", "genericblock", "badfilter",
-        "csp", "replace", "removeparam", "redirect", "redirect-rule", "priority",
-        "empty", "mp4", "generichide", "specifichide", "remove", "header"
-    };
+        "redirect", "redirect-rule", "priority"
+    ];
+
+    /// <summary>
+    /// True when the option loop would handle this token, which is what makes it
+    /// the end of a $denyallow value. This asks the parser rather than consulting
+    /// a hand-maintained list of names, so a token the loop accepts always
+    /// terminates a value and a token it does not accept never does. A previous
+    /// hand-written mirror had drifted to list options the loop rejects, which
+    /// meant a value ending in one of them was cut short and the leftover token
+    /// failed option mapping and deleted the whole rule.
+    /// </summary>
+    internal static bool IsRecognizedBareOption(string token)
+    {
+        if (token.Length == 0) return false;
+        if (BareOptionKeywords.Contains(token)) return true;
+        if (token.StartsWith('~') && BareOptionKeywords.Contains(token[1..])) return true;
+
+        // Anything carrying a value is a named option, handled before the
+        // resource-type mapping, so it also terminates a value.
+        if (token.IndexOf('=') >= 0) return true;
+
+        var probe = 0u;
+        return AddMappedTypes(token, ref probe);
+    }
 
     /// <summary>
     /// True when a token continues a $denyallow value rather than starting a new
-    /// option. Anything that is not a recognized option keyword continues the
-    /// value, which keeps single-label hosts, CIDR blocks and plain domains in
-    /// the list instead of letting them fall through as separate options, fail
-    /// option mapping, and delete the whole rule.
+    /// option. Anything the parser does not recognize continues the value, which
+    /// keeps single-label hosts, CIDR blocks and plain domains in the list
+    /// instead of letting them fall through as separate options and delete the
+    /// rule by parse failure.
     /// </summary>
-    private static bool IsDenyAllowValueContinuation(string token)
-    {
-        if (token.Length == 0) return false;
-        if (token.IndexOf('=') >= 0) return false;
-        if (BareOptionKeywords.Contains(token)) return false;
-        if (BareOptionKeywords.Contains(token.TrimStart('~'))) return false;
-        return true;
-    }
+    private static bool IsDenyAllowValueContinuation(string token) =>
+        token.Length > 0 && !IsRecognizedBareOption(token);
 
     /// <summary>
     /// Extracts the host of a "||host" rule. <paramref name="hostEnd"/> is the

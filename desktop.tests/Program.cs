@@ -2880,6 +2880,29 @@ Check(
 // A single-label host or a CIDR block is a valid $denyallow entry. Requiring a
 // dot in a continuation made these fall through as separate options, fail option
 // mapping, and delete the entire rule.
+// The denyallow splitter must end a value on every token the option loop would
+// handle, or the leftover token fails option mapping and deletes the whole rule.
+// Asserted against the parser rather than a hand-maintained list.
+var unrecognizedResourceTypes = AdBlockEngine.SupportedResourceTypeNamesForTesting
+    .Where(name => !AdBlockEngine.IsRecognizedBareOptionForTesting(name))
+    .ToArray();
+Check(
+    "denyallow terminates a value on every supported resource type",
+    unrecognizedResourceTypes.Length == 0,
+    string.Join(", ", unrecognizedResourceTypes));
+Check(
+    "denyallow terminates a value on valueless flags and named options",
+    new[] { "third-party", "~third-party", "important", "match-case", "badfilter",
+            "generichide", "genericblock", "elemhide", "redirect", "mp4", "empty",
+            "all", "domain=a.com", "denyallow=a.com", "redirect=1x1.gif" }
+        .All(AdBlockEngine.IsRecognizedBareOptionForTesting));
+Check(
+    "denyallow continues a value for host-shaped tokens",
+    !AdBlockEngine.IsRecognizedBareOptionForTesting("localhost")
+    && !AdBlockEngine.IsRecognizedBareOptionForTesting("a.com")
+    && !AdBlockEngine.IsRecognizedBareOptionForTesting("10.0.0.0/8")
+    && !AdBlockEngine.IsRecognizedBareOptionForTesting("intranet"));
+
 Check(
     "denyallow absorbs single-label and cidr continuations",
     AdBlockEngine.SplitFilterOptionsForTesting("script,denyallow=a.com,localhost,10.0.0.0/8,third-party")
@@ -2968,6 +2991,28 @@ Check(
     && !evicting.Contains("https://preloaded3.invalid/page", 0)
     && evicting.Contains("https://extra0.invalid/page", 0)
     && evicting.Contains("https://extra127.invalid/page", 0));
+
+// A URL evicted at the bound must be re-recordable, and re-recording a URL that
+// is already present must not corrupt the queue's pairing with the set.
+var reRecorded = MainForm.CreateAdBlockSubframeStateForTesting(seedCount: 2);
+reRecorded.Record("https://frame0.invalid/page", 0);
+reRecorded.Record("https://frame0.invalid/page", 0);
+Check(
+    "re-recording a url is idempotent and keeps the set bounded",
+    reRecorded.Remaining == 3
+    && reRecorded.Contains("https://frame0.invalid/page", 0)
+    && reRecorded.Contains("https://preloaded0.invalid/page", 0));
+var reRecordedAfterEviction = MainForm.CreateAdBlockSubframeStateForTesting(seedCount: 1);
+for (var index = 0; index < 128; index++)
+{
+    reRecordedAfterEviction.Record($"https://churn{index}.invalid/page", 0);
+}
+reRecordedAfterEviction.Record("https://preloaded0.invalid/page", 0);
+Check(
+    "a url evicted at the bound can be recorded again",
+    reRecordedAfterEviction.Contains("https://preloaded0.invalid/page", 0)
+    && reRecordedAfterEviction.Remaining == 128
+    && !reRecordedAfterEviction.Contains("https://churn0.invalid/page", 0));
 var boundedSeam = MainForm.CreateAdBlockSubframeStateForTesting();
 Check(
     "subframe url set holds a bounded number of entries",
@@ -4128,6 +4173,47 @@ Check(
         && updateStatusSource.Contains("FormatHoverStatusForDisplay(pendingStatus)", StringComparison.Ordinal)
         && configureWebViewSource.Contains("error is InvalidOperationException or COMException", StringComparison.Ordinal)
         && configureWebViewSource.Contains("tab.HoverStatus = string.Empty;", StringComparison.Ordinal));
+// The status label's paint fixes two defects: a two-line wrap, and an 11 px
+// vertical misalignment caused by pinning MaximumSize.Height, which caps the
+// control rather than the text. An ink-measurement probe was tried here and
+// removed: TextRenderer clips rather than wraps, so dropping either SingleLine
+// or VerticalCenter from the flags still produced a single centred band and
+// the probe passed against the defect it was meant to catch. The paint flags
+// and the absence of a size cap are asserted directly instead, which is what
+// actually determines both behaviours.
+// The status label's paint fixes two defects: a two-line wrap, and an 11 px
+// vertical misalignment caused by pinning MaximumSize.Height, which caps the
+// control rather than the text. An ink-measurement probe was tried here and
+// removed: TextRenderer clips rather than wraps, so dropping either SingleLine
+// or VerticalCenter still produced a single centred band and the probe passed
+// against the defect it was meant to catch.
+//
+// The flags are asserted against the label's own body rather than the whole
+// file, because other chrome controls also call TextRenderer and a file-wide
+// match stays green when the label's flags are removed.
+var statusLabelSource = ExtractTypeBody(mainFormThemeSource, "class AnnouncingStatusLabel");
+Check(
+    "the status label paints single-line, vertically centred, right-aligned text",
+    statusLabelSource.Length > 0
+        && statusLabelSource.Contains("TextFormatFlags.EndEllipsis", StringComparison.Ordinal)
+        && statusLabelSource.Contains("TextFormatFlags.SingleLine", StringComparison.Ordinal)
+        && statusLabelSource.Contains("TextFormatFlags.VerticalCenter", StringComparison.Ordinal)
+        && statusLabelSource.Contains("TextFormatFlags.Right", StringComparison.Ordinal)
+        && statusLabelSource.Contains("e.Graphics.Clear(BackColor)", StringComparison.Ordinal),
+    $"AnnouncingStatusLabel body {statusLabelSource.Length} chars");
+Check(
+    "the status label owns its own paint and carries no size cap",
+    !mainFormThemeSource.Contains("statusLabel.MaximumSize", StringComparison.Ordinal)
+        && !mainFormThemeSource.Contains("statusLabel.TextAlign", StringComparison.Ordinal)
+        && !mainFormThemeSource.Contains("statusLabel.AutoEllipsis", StringComparison.Ordinal)
+        && !statusLabelSource.Contains("new SolidBrush(BackColor)", StringComparison.Ordinal));
+Check(
+    "the status label owns its own paint and carries no size cap",
+    !mainFormThemeSource.Contains("statusLabel.MaximumSize", StringComparison.Ordinal)
+        && !mainFormThemeSource.Contains("statusLabel.TextAlign", StringComparison.Ordinal)
+        && !mainFormThemeSource.Contains("statusLabel.AutoEllipsis", StringComparison.Ordinal)
+        && !mainFormThemeSource.Contains("new SolidBrush(BackColor)", StringComparison.Ordinal));
+
 Check(
     "hover updates use stable status geometry without repeated text measurement or relayout",
     !mainFormThemeSource.Contains("statusLabel.GetPreferredSize", StringComparison.Ordinal)
@@ -8585,6 +8671,30 @@ string ReadRepositorySource(params string[] parts)
 {
     var path = FindRepositoryFile(parts);
     return path is null ? string.Empty : File.ReadAllText(path);
+}
+
+/// <summary>
+/// Returns the body of the type declaration whose signature contains
+/// <paramref name="signature"/>, by brace matching from the opening brace to the
+/// one that closes it. Scoping an assertion to a single type keeps a file-wide
+/// match from staying green when an unrelated declaration satisfies it.
+/// </summary>
+string ExtractTypeBody(string source, string signature)
+{
+    var start = source.IndexOf(signature, StringComparison.Ordinal);
+    if (start < 0) return string.Empty;
+    var open = source.IndexOf('{', start);
+    if (open < 0) return string.Empty;
+    var depth = 0;
+    for (var index = open; index < source.Length; index++)
+    {
+        if (source[index] == '{') depth++;
+        else if (source[index] == '}' && --depth == 0)
+        {
+            return source[open..(index + 1)];
+        }
+    }
+    return string.Empty;
 }
 
 string? FindRepositoryFile(params string[] parts)
