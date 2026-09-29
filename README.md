@@ -86,7 +86,7 @@ dotnet run --project desktop/MishaWeb.csproj --configuration Release
 
 ## Testing
 
-The automated test suite runs via a custom console test runner in `desktop.tests/Program.cs` and executes 572 automated checks covering filter rule compilation, YouTube ad-player runtime behavior, tab suspension logic, COM detachment safety, and suggestion index bounds:
+The automated test suite runs via a custom console test runner in `desktop.tests/Program.cs`. It reports its own check count on completion, so run it for the current number. It covers filter rule compilation, YouTube ad-player runtime behavior, tab suspension logic, COM detachment safety, and suggestion index bounds:
 
 ```powershell
 dotnet run --project desktop.tests/MishaWeb.SmokeTests.csproj --configuration Release

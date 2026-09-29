@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Ad blocking correctness follow-up
+
+- Restored 302 wildcard `||host` rules that a single-label-host relaxation had silently disabled. `*` and `?` are host terminators, so `||cacheserve.*/promodisplay/` was being read as the host `cacheserve`, yielding a path pattern of `*/promodisplay/*` that can never match. A wildcard host is now a glob and falls back to the generic matching path.
+- Classified subframes from URLs recorded by each frame's own navigation event. `RequestedSourceKind` cannot identify them: per the WebView2 SDK it reads `Document` for the main page, dedicated workers, iframes, and the shared-worker main script alike, so the previous fallback never fired for an iframe and instead mislabelled worker scripts as subdocuments.
+- Accept the comma form of `$denyallow`. Splitting the option text on commas truncated the value, left its tail looking like a separate option, and deleted the whole rule by failure rather than by error.
+- Restored the reordered-`$badfilter` regression test's second assertion, which had been an exact duplicate of the first and so proved nothing.
+- Rebuilt the `$badfilter` identity key without the `Split`/`Select`/`Order` pipeline and skipped it entirely when a list contains no badfilter, removing a measured ~20% compile slowdown and ~17 MiB of allocation on filter load.
+- Kept the subframe URL set bounded and cleared it on top-level navigation and teardown, so it cannot grow with session length.
+
 ### Ad blocking correctness
 
 - Stopped `$redirect=`, `$empty`, `$mp4`, `$all` and `$priority=` rules from silently becoming hard blocks. A request-cancellation engine cannot honour a response rewrite, and compiling one as a block turned a 1x1 pixel swap into a broken image and a `noopjs` redirect into a thrown error. These rules are now dropped and counted as unsupported, matching the existing `$redirect-rule=` behaviour.

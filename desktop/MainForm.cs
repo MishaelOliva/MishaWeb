@@ -82,6 +82,11 @@ public sealed class MainForm : Form
     private const int MaximumPendingExternalNavigations = 16;
     private const int MaximumPendingPermissionRequests = 16;
     private const int MaximumTrackedFramesPerTab = 256;
+/// <summary>
+/// Cap on remembered subframe document URLs per tab. Bounded and cleared on
+/// overflow and on top-level navigation, so it cannot grow with session length.
+/// </summary>
+private const int MaximumTrackedSubframeUrlsPerTab = 128;
     private const int MaximumConcurrentFrameSetups = 2;
     private const int MaximumPendingFrameSetups = 64;
     private const int MaximumHoverStatusCharacters = 2_048;
@@ -3617,7 +3622,8 @@ public sealed class MainForm : Form
             e.ResourceContext == CoreWebView2WebResourceContext.Document
                 ? GetRequestHeader(e.Request.Headers, "Sec-Fetch-Dest")
                 : null,
-            e.RequestedSourceKind);
+            e.ResourceContext == CoreWebView2WebResourceContext.Document
+                && tab.AdBlockSubframeUrls.Contains(e.Request.Uri));
         // A media stream is not an ad simply because it comes from one of
         // YouTube's rotating googlevideo hosts. Filter-list false positives
         // here produce the exact black/error player which a reload may hide.
@@ -3716,10 +3722,39 @@ public sealed class MainForm : Form
         catch (COMException) { return null; }
     }
 
+    /// <summary>
+    /// Test seam for subframe classification. Takes the WebView2 enum as its own
+    /// parameter type so callers outside the assembly, which do not reference
+    /// the WebView2 SDK, can still drive the decision table.
+    /// </summary>
+    internal static AdBlockResourceType MapResourceTypeForTesting(
+        string? webViewContext,
+        string? fetchDestination = null,
+        bool requestUrlIsKnownSubframe = false) =>
+        MapResourceType(
+            webViewContext switch
+            {
+                "Document" => CoreWebView2WebResourceContext.Document,
+                "Stylesheet" => CoreWebView2WebResourceContext.Stylesheet,
+                "Image" => CoreWebView2WebResourceContext.Image,
+                "Media" => CoreWebView2WebResourceContext.Media,
+                "Font" => CoreWebView2WebResourceContext.Font,
+                "Script" => CoreWebView2WebResourceContext.Script,
+                "XmlHttpRequest" => CoreWebView2WebResourceContext.XmlHttpRequest,
+                "Fetch" => CoreWebView2WebResourceContext.Fetch,
+                "Websocket" => CoreWebView2WebResourceContext.Websocket,
+                "Ping" => CoreWebView2WebResourceContext.Ping,
+                "EventSource" => CoreWebView2WebResourceContext.EventSource,
+                "TextTrack" => CoreWebView2WebResourceContext.TextTrack,
+                _ => CoreWebView2WebResourceContext.Other
+            },
+            fetchDestination,
+            requestUrlIsKnownSubframe);
+
     private static AdBlockResourceType MapResourceType(
         CoreWebView2WebResourceContext webViewContext,
         string? fetchDestination = null,
-        CoreWebView2WebResourceRequestSourceKinds? requestedSourceKind = null)
+        bool requestUrlIsKnownSubframe = false)
     {
         if (webViewContext == CoreWebView2WebResourceContext.Document)
         {
@@ -3729,14 +3764,13 @@ public sealed class MainForm : Form
             {
                 return AdBlockResourceType.SubDocument;
             }
-            // GetRequestHeader returns null when WebView2 refuses the COM call,
-            // which made every subframe look like a top-level document: $document
-            // rules blocked iframe loads and $subdocument rules never fired.
-            // RequestedSourceKind is already available on this event and does not
-            // depend on header access, so use it as the fallback.
-            if (fetchDestination is null
-                && requestedSourceKind is { } kind
-                && (kind & CoreWebView2WebResourceRequestSourceKinds.Document) == 0)
+            // GetRequestHeader returns null when WebView2 refuses the COM call, and
+            // RequestedSourceKind cannot fill the gap: per the WebView2 SDK that
+            // flag reads "Document" for requests from the main page, dedicated
+            // workers, iframes, and the shared-worker main script alike, so every
+            // subframe arrives labelled Document. The only reliable local signal
+            // is whether this URL is one we already saw a subframe navigate to.
+            if (fetchDestination is null && requestUrlIsKnownSubframe)
             {
                 return AdBlockResourceType.SubDocument;
             }
@@ -4056,6 +4090,17 @@ public sealed class MainForm : Form
             AbandonPendingFrameSetup(frame);
             tab.FrameOrigins.Remove(frame);
             frameUrl = e.Uri;
+            // Record the destination so a later request for this same document
+            // can be told apart from a top-level navigation, which WebView2
+            // labels identically. See MapResourceType.
+            if (BrowserPolicy.IsHttpUrl(e.Uri))
+            {
+                if (tab.AdBlockSubframeUrls.Count >= MaximumTrackedSubframeUrlsPerTab)
+                {
+                    tab.AdBlockSubframeUrls.Clear();
+                }
+                tab.AdBlockSubframeUrls.Add(e.Uri);
+            }
         };
         EventHandler<CoreWebView2DOMContentLoadedEventArgs> domContentLoadedHandler = (_, _) =>
         {
@@ -5340,6 +5385,7 @@ public sealed class MainForm : Form
         tab.MicrophoneAllowedOrigins.Clear();
         tab.CameraAllowedOrigins.Clear();
         tab.FrameOrigins.Clear();
+        tab.AdBlockSubframeUrls.Clear();
         tab.PendingMediaPermissionRequests = 0;
         tab.PendingMediaPermissionOrigin = null;
         tab.PendingMediaPermissionRefreshes = 0;
@@ -14320,6 +14366,15 @@ public sealed class MainForm : Form
         public string? ContextLinkTarget { get; set; }
         public int AdBlockScriptGeneration { get; set; }
         public List<CoreWebView2Frame> AdBlockFrames { get; } = [];
+        /// <summary>
+        /// Document URLs known to belong to a subframe of the current document.
+        /// WebView2 reports an iframe navigation with
+        /// <c>RequestedSourceKind.Document</c>, the same value as the top-level
+        /// page, so that flag cannot identify a subframe. These are recorded from
+        /// each frame's own NavigationStarting event instead. Cleared on every
+        /// top-level navigation and bounded, so it cannot grow with session length.
+        /// </summary>
+        public HashSet<string> AdBlockSubframeUrls { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<CoreWebView2Frame, string> FrameOrigins { get; } = [];
         public HashSet<CoreWebView2Frame> FrameSetupInProgress { get; } = [];
         public bool ResourceFilterInstalled { get; set; }
@@ -14388,6 +14443,7 @@ public sealed class MainForm : Form
             }
             frameSubscriptions.Clear();
             AdBlockFrames.Clear();
+            AdBlockSubframeUrls.Clear();
             FrameOrigins.Clear();
             FrameSetupInProgress.Clear();
         }

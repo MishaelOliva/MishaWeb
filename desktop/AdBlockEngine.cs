@@ -261,6 +261,8 @@ internal sealed class AdBlockEngine
     internal static bool TryGetRegexPatternForTesting(string line, out string pattern) =>
         FilterRule.TryGetRegexPattern(line, out pattern);
 
+
+
     internal static bool TryExtractMandatoryRegexLiteralForTesting(
         string pattern,
         out string literal) =>
@@ -1348,8 +1350,14 @@ internal sealed class AdBlockEngine
                 // "##" as a selector, so "example.com##.ad$badfilter" used to be
                 // installed as a live rule hiding ".ad$badfilter" while the real
                 // "example.com##.ad" rule stayed active.
-                if (GetBadFilterTarget(line) is not null
-                    || disabledRules.Contains(GetRuleIdentity(line)))
+                //
+                // Building the identity key allocates a split array, a LINQ chain
+                // and a StringBuilder. Most lists contain no badfilter at all, and
+                // the full input is ~200k rules, so skip the whole thing when
+                // there is nothing to match against.
+                if (disabledRules.Count > 0
+                    && (GetBadFilterTarget(line) is not null
+                        || disabledRules.Contains(GetRuleIdentity(line))))
                 {
                     disabledRuleCount++;
                     continue;
@@ -1623,15 +1631,73 @@ internal sealed class AdBlockEngine
             var optionIndex = FindOptionIndex(line);
             if (optionIndex < 0) return line.Trim();
             var pattern = line.AsSpan(0, optionIndex).Trim();
-            var options = line[(optionIndex + 1)..]
-                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Select(option => option.ToLowerInvariant())
-                .Order(StringComparer.Ordinal);
-            var builder = new StringBuilder(pattern.Length + 16);
-            builder.Append(pattern);
-            foreach (var option in options)
+            var options = line.AsSpan(optionIndex + 1);
+
+            // Collect the option spans in one pass, then insertion-sort them. Filter
+            // rules carry a handful of options at most, so this avoids the array,
+            // the LINQ chain and the sort allocations a Split/Select/Order pipeline
+            // performs for every rule in a ~200k line list. Callers skip this
+            // entirely when no badfilter is present.
+            Span<int> starts = stackalloc int[16];
+            Span<int> lengths = stackalloc int[16];
+            int[]? heapStarts = null;
+            int[]? heapLengths = null;
+            var count = 0;
+            var start = 0;
+            for (var index = 0; index <= options.Length; index++)
             {
-                builder.Append('|').Append(option);
+                if (index != options.Length && options[index] != ',') continue;
+                var segmentStart = start;
+                var raw = options[segmentStart..index];
+                start = index + 1;
+                var leading = 0;
+                while (leading < raw.Length && char.IsWhiteSpace(raw[leading])) leading++;
+                var length = raw.Length - leading;
+                while (length > 0 && char.IsWhiteSpace(raw[length - 1])) length--;
+                if (length == 0) continue;
+                if (count == starts.Length)
+                {
+                    heapStarts = new int[count * 2];
+                    heapLengths = new int[count * 2];
+                    starts[..count].CopyTo(heapStarts);
+                    lengths[..count].CopyTo(heapLengths);
+                }
+                var targetStarts = heapStarts ?? starts;
+                var targetLengths = heapLengths ?? lengths;
+                targetStarts[count] = segmentStart + leading;
+                targetLengths[count] = length;
+                count++;
+            }
+
+            var builder = new StringBuilder(pattern.Length + (count * 12) + 8);
+            builder.Append(pattern);
+            if (count == 0) return builder.ToString();
+
+            var sortStarts = heapStarts ?? starts;
+            var sortLengths = heapLengths ?? lengths;
+            for (var i = 1; i < count; i++)
+            {
+                var keyStart = sortStarts[i];
+                var keyLength = sortLengths[i];
+                var position = i - 1;
+                while (position >= 0
+                    && options[sortStarts[position]..].Slice(0, sortLengths[position])
+                        .CompareTo(
+                            options.Slice(keyStart, keyLength),
+                            StringComparison.Ordinal) > 0)
+                {
+                    sortStarts[position + 1] = sortStarts[position];
+                    sortLengths[position + 1] = sortLengths[position];
+                    position--;
+                }
+                sortStarts[position + 1] = keyStart;
+                sortLengths[position + 1] = keyLength;
+            }
+
+            for (var i = 0; i < count; i++)
+            {
+                builder.Append('|').Append(
+                    options.Slice(sortStarts[i], sortLengths[i]).ToString().ToLowerInvariant());
             }
             return builder.ToString();
         }
@@ -2301,7 +2367,7 @@ internal sealed class AdBlockEngine
             var important = false;
             var matchCase = false;
 
-            foreach (var rawOption in optionText.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            foreach (var rawOption in SplitFilterOptions(optionText))
             {
                 var option = rawOption.ToLowerInvariant();
                 if (option is "badfilter" or "generichide" or "specifichide" or "elemhide" or "genericblock")
@@ -2369,7 +2435,12 @@ internal sealed class AdBlockEngine
                 {
                     var denyIncluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                     var denyExcluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    if (!ParseDomainList(rawOption[10..], '|', denyIncluded, denyExcluded)) return null;
+                    // Both separators are valid in the value; normalize commas to
+                    // the one ParseDomainList splits on.
+                    var denyAllowValue = rawOption[10..].Contains('|', StringComparison.Ordinal)
+                        ? rawOption[10..]
+                        : rawOption[10..].Replace(',', '|');
+                    if (!ParseDomainList(denyAllowValue, '|', denyIncluded, denyExcluded)) return null;
                     // $denyallow scopes the rule by the document it appears in, so
                     // it belongs with the $domain=~ exclusions and must be tested
                     // against the source host. It used to be merged into
@@ -2565,11 +2636,48 @@ internal sealed class AdBlockEngine
         /// the number of trimmed dots and produced garbage patterns such as
         /// "m/banner" for "||.ads.example.com/banner".
         /// </summary>
-        private static string? ExtractHost(string pattern, out int hostEnd)
+        /// <summary>
+    /// Splits a rule's option text on commas, except inside a $denyallow value.
+    /// uBO accepts both "|" and "," there, but a plain comma split truncates the
+    /// value and leaves its tail looking like a separate option, which then fails
+    /// option mapping and silently deletes the whole rule. Keeping the value
+    /// intact lets ParseDomainList handle both separators.
+    /// </summary>
+    private static List<string> SplitFilterOptions(string optionText)
+    {
+        var options = new List<string>(4);
+        // $denyallow is the one option whose value legitimately contains commas,
+        // so it claims the whole remainder of the option text. Everything before
+        // it splits normally; the value itself is passed through untouched for
+        // ParseDomainList to handle.
+        var denyAllowIndex = optionText.IndexOf("denyallow=", StringComparison.OrdinalIgnoreCase);
+        var head = denyAllowIndex < 0 ? optionText : optionText[..denyAllowIndex];
+        foreach (var option in head.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            options.Add(option);
+        }
+        if (denyAllowIndex < 0) return options;
+
+        var denyAllowOption = optionText[denyAllowIndex..].Trim();
+        // Trim a trailing separator so "script,denyallow=a.com," does not produce
+        // an empty final entry.
+        denyAllowOption = denyAllowOption.TrimEnd(',', ' ');
+        if (denyAllowOption.Length > 0) options.Add(denyAllowOption);
+        return options;
+    }
+
+    private static string? ExtractHost(string pattern, out int hostEnd)
         {
             hostEnd = 0;
             if (!pattern.StartsWith("||", StringComparison.Ordinal)) return null;
             var end = pattern.IndexOfAny(['/', '^', '*', '|', '?', '$'], 2);
+            // A terminator of '*' or '?' means the host text is a glob, not a host
+            // anchor: "||cacheserve.*/promodisplay/" is not the host "cacheserve".
+            // Treating it as one produced a hostPathPattern of "*/promodisplay/*",
+            // which can never match a path, so the rule silently became a no-op
+            // while still occupying an index slot. Return null so the rule falls
+            // back to the generic glob path that matches it correctly.
+            if (end >= 0 && pattern[end] is '*' or '?') return null;
             var host = (end < 0 ? pattern[2..] : pattern[2..end]).Trim('.');
             // Single-label hosts such as "localhost" or "intranet" are valid ||host
             // anchors. Rejecting them pushed the rule onto the generic "host^*"

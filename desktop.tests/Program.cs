@@ -2689,13 +2689,97 @@ Check(
     !reorderedBadFilterEngine.ShouldBlock(
         "https://reordered.invalid/ad.js",
         new Uri("https://reordered.invalid/page").AbsoluteUri,
+        AdBlockResourceType.Script)
+    // The rule declares both types, so the badfilter must apply to each of them
+    // rather than only to whichever one was asserted first.
+    && !reorderedBadFilterEngine.ShouldBlock(
+        "https://reordered.invalid/pixel.gif",
+        new Uri("https://reordered.invalid/page").AbsoluteUri,
+        AdBlockResourceType.Image));
+
+// A '*' or '?' terminating the host text makes it a glob, not a host anchor.
+// Treating "||cacheserve.*/promodisplay/" as host "cacheserve" produced a path
+// pattern of "*/promodisplay/*" that can never match, silently disabling the
+// rule while it still held an index slot.
+var wildcardHostEngine = new AdBlockEngine(initialRules:
+[
+    "||cacheserve.*/promodisplay/",
+    "||filemoon.*/js/baf.js",
+    "||google.*/pagead/lvz?"
+]);
+Check(
+    "wildcard ||host rules match through the glob path",
+    wildcardHostEngine.ShouldBlock(
+        "https://cacheserve.cdn.com/promodisplay/x.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script)
+    && wildcardHostEngine.ShouldBlock(
+        "https://filemoon.to/js/baf.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script)
+    && wildcardHostEngine.ShouldBlock(
+        "https://google.co.uk/pagead/lvz?x=1",
+        "https://publisher.invalid/page",
         AdBlockResourceType.Script));
 Check(
-    "badfilter disables its rule regardless of option order",
-    !reorderedBadFilterEngine.ShouldBlock(
-        "https://reordered.invalid/ad.js",
-        new Uri("https://reordered.invalid/page").AbsoluteUri,
+    "wildcard ||host rules do not block unrelated hosts",
+    // The glob is deliberately broad: "cacheserve.*" does match
+    // cacheserve.example, so the negative case has to be a different label
+    // entirely rather than a different TLD.
+    !wildcardHostEngine.ShouldBlock(
+        "https://ads.cdn.com/promodisplay/x.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script)
+    && !wildcardHostEngine.ShouldBlock(
+        "https://cacheserve.cdn.com/other/x.js",
+        "https://publisher.invalid/page",
         AdBlockResourceType.Script));
+
+// uBO accepts both "|" and "," inside $denyallow. The comma form used to be
+// truncated by the enclosing option split, leaving an orphan option that failed
+// option mapping and deleted the whole rule.
+var denyAllowCommaEngine = new AdBlockEngine(initialRules:
+[
+    "||denyallow-comma.invalid^$denyallow=skipped.invalid,alsoskipped.invalid"
+]);
+Check(
+    "denyallow accepts a comma-separated list",
+    !denyAllowCommaEngine.ShouldBlock(
+        "https://denyallow-comma.invalid/ad.js",
+        "https://skipped.invalid/page",
+        AdBlockResourceType.Script)
+    && !denyAllowCommaEngine.ShouldBlock(
+        "https://denyallow-comma.invalid/ad.js",
+        "https://alsoskipped.invalid/page",
+        AdBlockResourceType.Script)
+    && denyAllowCommaEngine.ShouldBlock(
+        "https://denyallow-comma.invalid/ad.js",
+        "https://allowed.invalid/page",
+        AdBlockResourceType.Script));
+
+// The live WebView2 path resolves subframes from URLs recorded by each frame's
+// own NavigationStarting event, because RequestedSourceKind reports "Document"
+// for both the top-level page and iframes. Cover the decision itself.
+Check(
+    "subframe classification honours the recorded subframe URL set",
+    MainForm.MapResourceTypeForTesting(
+        "Document",
+        fetchDestination: null,
+        requestUrlIsKnownSubframe: true) == AdBlockResourceType.SubDocument
+    && MainForm.MapResourceTypeForTesting(
+        "Document",
+        fetchDestination: null,
+        requestUrlIsKnownSubframe: false) == AdBlockResourceType.Document
+    && MainForm.MapResourceTypeForTesting(
+        "Document",
+        fetchDestination: "iframe",
+        requestUrlIsKnownSubframe: false) == AdBlockResourceType.SubDocument);
+Check(
+    "worker sources are not misclassified as subdocuments",
+    MainForm.MapResourceTypeForTesting(
+        "Script",
+        fetchDestination: null,
+        requestUrlIsKnownSubframe: false) == AdBlockResourceType.Script);
 
 // $denyallow=a.com means "do not apply on a.com"; the ~ form negates that, so
 // the rule must apply on b.com.
