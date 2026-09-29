@@ -33,3 +33,6 @@ web/
 .vs/
 *.user
 *.zip
+
+# Agent/editor tooling and nested git worktrees must never be committed.
+.kilo/

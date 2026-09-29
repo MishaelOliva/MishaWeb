@@ -5051,8 +5051,8 @@ var chromeGradeState = new BrowserState
     History =
     [
         new HistoryEntry(
-            "Your application for the Junior Digital Developer role was not selected. - mishael.oliva2002@gmail.com - Gmail",
-            "https://mail.google.com/mail/u/0/#inbox/FMfcgzQhWLNrQMkkbBfvRXwrVZXWdhpl",
+            "Your application for the Junior Developer role was not selected. - candidate@example.com - Mail",
+            "https://mail.example.com/mail/u/0/#inbox/example-thread-id",
             DateTime.UtcNow),
         new HistoryEntry(
             "gdrive - Google Search",
