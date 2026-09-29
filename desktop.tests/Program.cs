@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.Json;
 using MishaWeb;
 
+
 if (args.Length == 2
     && args[0].Equals("--audit-adblock-regex", StringComparison.Ordinal))
 {
@@ -2780,6 +2781,134 @@ Check(
         "Script",
         fetchDestination: null,
         requestUrlIsKnownSubframe: false) == AdBlockResourceType.Script);
+
+// A rule with more options than the fixed buffer used to overflow it and abort
+// the whole compile, leaving the shipped 20-list catalog reduced to the built-in
+// fallbacks. The real catalog hits this through cosmetic +js() bodies with many
+// comma-separated segments, so exercise a wide option list directly.
+var wideOptions = string.Join(',', Enumerable.Range(0, 200).Select(i => $"x{i}=v{i}"));
+// "x0" < "x1" < "x10" < "x100" < ... under an ordinal sort, so the expected key is
+// built by sorting the same strings rather than by range order.
+Check(
+    "rule identity handles option lists wider than any fixed buffer",
+    AdBlockEngine.GetRuleIdentityForTesting($"||wide.invalid^${wideOptions}")
+        == "||wide.invalid^" + string.Concat(
+            Enumerable.Range(0, 200).Select(i => $"x{i}=v{i}").Order(StringComparer.Ordinal).Select(option => $"|{option}"))
+    && AdBlockEngine.GetRuleIdentityForTesting($"||wide.invalid^${wideOptions},badfilter")
+        == "||wide.invalid^" + string.Concat(
+            Enumerable.Range(0, 200)
+                .Select(i => $"x{i}=v{i}")
+                .Append("badfilter")
+                .Order(StringComparer.Ordinal)
+                .Select(option => $"|{option}")));
+
+// The compile must survive a list that contains a badfilter, since that is the
+// only condition under which the identity key was built at all.
+var wideBadFilterEngine = new AdBlockEngine(initialRules:
+[
+    "||wide.invalid^$script,image,third-party",
+    "||wide.invalid^$image,script,third-party,badfilter",
+    "||wide2.invalid^$script"
+]);
+Check(
+    "a wide-option list still compiles alongside a badfilter",
+    !wideBadFilterEngine.ShouldBlock(
+        "https://wide.invalid/ad.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script)
+    && wideBadFilterEngine.ShouldBlock(
+        "https://wide2.invalid/ad.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script));
+
+// The identity key is compared between a rule and its badfilter, so both sides
+// must trim the same way or a padded rule never matches its own badfilter.
+Check(
+    "rule identity trims each option on both sides",
+    AdBlockEngine.GetRuleIdentityForTesting("||x.invalid^$script , image ,  third-party ")
+        == "||x.invalid^|image|script|third-party"
+    && AdBlockEngine.GetRuleIdentityForTesting("||x.invalid^$image,script,third-party")
+        == AdBlockEngine.GetRuleIdentityForTesting("||x.invalid^$third-party , script ,image"));
+
+var paddedBadFilterEngine = new AdBlockEngine(initialRules:
+[
+    "||padded.invalid^$script , image ",
+    "||padded.invalid^$script,image,badfilter",
+    "||padded2.invalid^$script, image",
+    "||padded2.invalid^$script , image,badfilter"
+]);
+Check(
+    "badfilter matches a rule whose options are space padded",
+    !paddedBadFilterEngine.ShouldBlock(
+        "https://padded.invalid/ad.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script)
+    && !paddedBadFilterEngine.ShouldBlock(
+        "https://padded2.invalid/ad.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script));
+
+// $denyallow must stop at the end of its value. Absorbing the rest of the option
+// text turned a trailing $third-party into a denyallow domain and dropped the
+// rule's third-party scoping, so it started firing on first-party requests.
+var denyAllowTrailingOptionEngine = new AdBlockEngine(initialRules:
+[
+    "||denyallow-trailing.invalid^$script,denyallow=skip.example.com,third-party"
+]);
+Check(
+    "denyallow stops at the next named option",
+    !denyAllowTrailingOptionEngine.ShouldBlock(
+        "https://denyallow-trailing.invalid/ad.js",
+        "https://skip.example.com/page",
+        AdBlockResourceType.Script)
+    && !denyAllowTrailingOptionEngine.ShouldBlock(
+        "https://denyallow-trailing.invalid/ad.js",
+        "https://denyallow-trailing.invalid/page",
+        AdBlockResourceType.Script)
+    && denyAllowTrailingOptionEngine.ShouldBlock(
+        "https://denyallow-trailing.invalid/ad.js",
+        "https://other.invalid/page",
+        AdBlockResourceType.Script));
+var splitDenyAllow = AdBlockEngine.SplitFilterOptionsForTesting("script,denyallow=a.com,b.com,third-party");
+Check(
+    "denyallow value absorbs only its own comma continuation",
+    splitDenyAllow.Count == 3
+    && splitDenyAllow[0] == "script"
+    && splitDenyAllow[1] == "denyallow=a.com|b.com"
+    && splitDenyAllow[2] == "third-party");
+
+// The subframe URL set is per-tab session state. It has to be bounded, and it has
+// to be emptied whenever the top-level document is replaced, otherwise a URL seen
+// as a subframe under one page keeps its SubDocument classification under the next.
+// BrowserTab is a private nested type, so its per-tab session state is verified
+// through the same seam the live request path uses.
+var subframeSeam = MainForm.CreateAdBlockSubframeStateForTesting();
+var subframeAfterOverflow = subframeSeam.Remaining;
+var subframePeak = subframeAfterOverflow;
+for (var index = 0; index < 512; index++)
+{
+    subframeSeam.Record($"https://frame{index}.invalid/page");
+    subframePeak = Math.Max(subframePeak, subframeSeam.Remaining);
+}
+Check(
+    "subframe url set never exceeds its bound under sustained recording",
+    subframeAfterOverflow == 128 && subframePeak == 128);
+var releasableSeam = MainForm.CreateAdBlockSubframeStateForTesting();
+releasableSeam.Clear();
+Check(
+    "subframe url set empties when the top-level document is replaced",
+    releasableSeam.Remaining == 0);
+var boundedSeam = MainForm.CreateAdBlockSubframeStateForTesting();
+Check(
+    "subframe url set holds a bounded number of entries",
+    boundedSeam.Remaining == 128 && boundedSeam.Contains("https://preloaded0.invalid/page"));
+Check(
+    "subframe classification is driven by membership, not by arrival order",
+    MainForm.MapResourceTypeForTesting(
+        "Document",
+        fetchDestination: null,
+        requestUrlIsKnownSubframe: boundedSeam.Contains("https://preloaded0.invalid/page"))
+        == AdBlockResourceType.SubDocument);
 
 // $denyallow=a.com means "do not apply on a.com"; the ~ form negates that, so
 // the rule must apply on b.com.

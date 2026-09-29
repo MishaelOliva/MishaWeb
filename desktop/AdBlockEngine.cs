@@ -261,6 +261,15 @@ internal sealed class AdBlockEngine
     internal static bool TryGetRegexPatternForTesting(string line, out string pattern) =>
         FilterRule.TryGetRegexPattern(line, out pattern);
 
+    internal static string GetRuleIdentityForTesting(string line) =>
+        CompiledRuleSet.GetRuleIdentity(line);
+
+    internal static IReadOnlyList<string> SplitFilterOptionsForTesting(string optionText) =>
+        FilterRule.SplitFilterOptions(optionText);
+
+    internal static string? GetBadFilterTargetForTesting(string line) =>
+        CompiledRuleSet.GetBadFilterTarget(line);
+
 
 
     internal static bool TryExtractMandatoryRegexLiteralForTesting(
@@ -1626,83 +1635,33 @@ internal sealed class AdBlockEngine
         /// Comparing raw text silently failed to disable the block in that case,
         /// so both sides are normalized here.
         /// </summary>
-        private static string GetRuleIdentity(string line)
+        internal static string GetRuleIdentity(string line)
         {
             var optionIndex = FindOptionIndex(line);
             if (optionIndex < 0) return line.Trim();
             var pattern = line.AsSpan(0, optionIndex).Trim();
-            var options = line.AsSpan(optionIndex + 1);
 
-            // Collect the option spans in one pass, then insertion-sort them. Filter
-            // rules carry a handful of options at most, so this avoids the array,
-            // the LINQ chain and the sort allocations a Split/Select/Order pipeline
-            // performs for every rule in a ~200k line list. Callers skip this
-            // entirely when no badfilter is present.
-            Span<int> starts = stackalloc int[16];
-            Span<int> lengths = stackalloc int[16];
-            int[]? heapStarts = null;
-            int[]? heapLengths = null;
-            var count = 0;
-            var start = 0;
-            for (var index = 0; index <= options.Length; index++)
-            {
-                if (index != options.Length && options[index] != ',') continue;
-                var segmentStart = start;
-                var raw = options[segmentStart..index];
-                start = index + 1;
-                var leading = 0;
-                while (leading < raw.Length && char.IsWhiteSpace(raw[leading])) leading++;
-                var length = raw.Length - leading;
-                while (length > 0 && char.IsWhiteSpace(raw[length - 1])) length--;
-                if (length == 0) continue;
-                if (count == starts.Length)
-                {
-                    heapStarts = new int[count * 2];
-                    heapLengths = new int[count * 2];
-                    starts[..count].CopyTo(heapStarts);
-                    lengths[..count].CopyTo(heapLengths);
-                }
-                var targetStarts = heapStarts ?? starts;
-                var targetLengths = heapLengths ?? lengths;
-                targetStarts[count] = segmentStart + leading;
-                targetLengths[count] = length;
-                count++;
-            }
+            // Callers skip this entirely when no badfilter is present, so the cost
+            // here is only paid by lists that actually need identity comparison. A
+            // hand-rolled span sort was tried here and removed: it was measurably
+            // faster but its growth path was wrong, and it silently aborted the
+            // whole compile on the real 20-list catalog. Correctness wins.
+            var options = line[(optionIndex + 1)..]
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (options.Length == 0) return pattern.ToString();
+            if (options.Length == 1) return string.Concat(pattern, "|", options[0].ToLowerInvariant());
 
-            var builder = new StringBuilder(pattern.Length + (count * 12) + 8);
+            Array.Sort(options, StringComparer.Ordinal);
+            var builder = new StringBuilder(pattern.Length + (options.Length * 12) + 8);
             builder.Append(pattern);
-            if (count == 0) return builder.ToString();
-
-            var sortStarts = heapStarts ?? starts;
-            var sortLengths = heapLengths ?? lengths;
-            for (var i = 1; i < count; i++)
+            foreach (var option in options)
             {
-                var keyStart = sortStarts[i];
-                var keyLength = sortLengths[i];
-                var position = i - 1;
-                while (position >= 0
-                    && options[sortStarts[position]..].Slice(0, sortLengths[position])
-                        .CompareTo(
-                            options.Slice(keyStart, keyLength),
-                            StringComparison.Ordinal) > 0)
-                {
-                    sortStarts[position + 1] = sortStarts[position];
-                    sortLengths[position + 1] = sortLengths[position];
-                    position--;
-                }
-                sortStarts[position + 1] = keyStart;
-                sortLengths[position + 1] = keyLength;
-            }
-
-            for (var i = 0; i < count; i++)
-            {
-                builder.Append('|').Append(
-                    options.Slice(sortStarts[i], sortLengths[i]).ToString().ToLowerInvariant());
+                builder.Append('|').Append(option.ToLowerInvariant());
             }
             return builder.ToString();
         }
 
-        private static string? GetBadFilterTarget(string line)
+        internal static string? GetBadFilterTarget(string line)
         {
             if (line.IndexOf("badfilter", StringComparison.OrdinalIgnoreCase) < 0) return null;
             var optionIndex = FindOptionIndex(line);
@@ -2628,64 +2587,90 @@ internal sealed class AdBlockEngine
             return true;
         }
 
-        /// <summary>
-        /// Extracts the host of a "||host" rule. <paramref name="hostEnd"/> is the
-        /// offset just past the raw host text in <paramref name="pattern"/>, which
-        /// keeps any dot padding, so callers can slice the path remainder without
-        /// re-deriving the length. Slicing with <c>host.Length</c> instead is off by
-        /// the number of trimmed dots and produced garbage patterns such as
-        /// "m/banner" for "||.ads.example.com/banner".
-        /// </summary>
-        /// <summary>
+    /// <summary>
     /// Splits a rule's option text on commas, except inside a $denyallow value.
     /// uBO accepts both "|" and "," there, but a plain comma split truncates the
     /// value and leaves its tail looking like a separate option, which then fails
     /// option mapping and silently deletes the whole rule. Keeping the value
     /// intact lets ParseDomainList handle both separators.
     /// </summary>
-    private static List<string> SplitFilterOptions(string optionText)
+    internal static List<string> SplitFilterOptions(string optionText)
     {
         var options = new List<string>(4);
-        // $denyallow is the one option whose value legitimately contains commas,
-        // so it claims the whole remainder of the option text. Everything before
-        // it splits normally; the value itself is passed through untouched for
-        // ParseDomainList to handle.
-        var denyAllowIndex = optionText.IndexOf("denyallow=", StringComparison.OrdinalIgnoreCase);
-        var head = denyAllowIndex < 0 ? optionText : optionText[..denyAllowIndex];
-        foreach (var option in head.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        // $denyallow is the one option whose value legitimately contains commas.
+        // Its value absorbs the following tokens until a token that is itself a
+        // "name=" option appears, so a trailing $third-party or type mask is not
+        // swallowed and does not become a denyallow domain.
+        var tokens = optionText.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        for (var index = 0; index < tokens.Length; index++)
         {
-            options.Add(option);
+            var token = tokens[index];
+            if (!token.StartsWith("denyallow=", StringComparison.OrdinalIgnoreCase))
+            {
+                options.Add(token);
+                continue;
+            }
+            // Absorb the following tokens as value continuations. They belong to
+            // this list until a token that is itself a "name=" option appears, so a
+            // trailing $third-party or type mask is not swallowed. Advance the
+            // cursor past what was consumed so it is not also emitted on its own.
+            var value = new StringBuilder(token[10..]);
+            var consumed = index;
+            for (var next = index + 1; next < tokens.Length; next++)
+            {
+                if (!IsDenyAllowValueContinuation(tokens[next])) break;
+                value.Append('|').Append(tokens[next]);
+                consumed = next;
+            }
+            options.Add("denyallow=" + value);
+            index = consumed;
         }
-        if (denyAllowIndex < 0) return options;
-
-        var denyAllowOption = optionText[denyAllowIndex..].Trim();
-        // Trim a trailing separator so "script,denyallow=a.com," does not produce
-        // an empty final entry.
-        denyAllowOption = denyAllowOption.TrimEnd(',', ' ');
-        if (denyAllowOption.Length > 0) options.Add(denyAllowOption);
         return options;
     }
 
+    /// <summary>
+    /// True when a token continues a $denyallow value rather than starting a new
+    /// option. A $denyallow value is a domain list, so a continuation is a bare
+    /// token containing a dot, such as "ads.example.com" or "~ads.example.com".
+    /// Option keywords never contain a dot, so this distinguishes them without
+    /// maintaining a list of keywords that would need updating as support grows.
+    /// </summary>
+    private static bool IsDenyAllowValueContinuation(string token)
+    {
+        if (token.IndexOf('=') >= 0) return false;
+        var candidate = token.StartsWith('~') ? token[1..] : token;
+        return candidate.Contains('.', StringComparison.Ordinal)
+            && candidate.IndexOf('/') < 0;
+    }
+
+    /// <summary>
+    /// Extracts the host of a "||host" rule. <paramref name="hostEnd"/> is the
+    /// offset just past the raw host text in <paramref name="pattern"/>, which
+    /// keeps any dot padding, so callers can slice the path remainder without
+    /// re-deriving the length. Slicing with <c>host.Length</c> instead is off by
+    /// the number of trimmed dots and produced garbage patterns such as
+    /// "m/banner" for "||.ads.example.com/banner".
+    /// </summary>
     private static string? ExtractHost(string pattern, out int hostEnd)
-        {
-            hostEnd = 0;
-            if (!pattern.StartsWith("||", StringComparison.Ordinal)) return null;
+    {
+        hostEnd = 0;
+        if (!pattern.StartsWith("||", StringComparison.Ordinal)) return null;
             var end = pattern.IndexOfAny(['/', '^', '*', '|', '?', '$'], 2);
-            // A terminator of '*' or '?' means the host text is a glob, not a host
-            // anchor: "||cacheserve.*/promodisplay/" is not the host "cacheserve".
-            // Treating it as one produced a hostPathPattern of "*/promodisplay/*",
-            // which can never match a path, so the rule silently became a no-op
-            // while still occupying an index slot. Return null so the rule falls
-            // back to the generic glob path that matches it correctly.
-            if (end >= 0 && pattern[end] is '*' or '?') return null;
-            var host = (end < 0 ? pattern[2..] : pattern[2..end]).Trim('.');
-            // Single-label hosts such as "localhost" or "intranet" are valid ||host
-            // anchors. Rejecting them pushed the rule onto the generic "host^*"
-            // path, where '.' is not a separator, so the rule matched neither the
-            // host nor any of its subdomains.
-            if (host.Length == 0) return null;
-            var hostNameType = Uri.CheckHostName(host);
-            if (hostNameType is not (UriHostNameType.Dns or UriHostNameType.Basic)) return null;
+        // A terminator of '*' or '?' means the host text is a glob, not a host
+        // anchor: "||cacheserve.*/promodisplay/" is not the host "cacheserve".
+        // Treating it as one produced a hostPathPattern of "*/promodisplay/*",
+        // which can never match a path, so the rule silently became a no-op
+        // while still occupying an index slot. Return null so the rule falls
+        // back to the generic glob path that matches it correctly.
+        if (end >= 0 && pattern[end] is '*' or '?') return null;
+        var host = (end < 0 ? pattern[2..] : pattern[2..end]).Trim('.');
+        // Single-label hosts such as "localhost" or "intranet" are valid ||host
+        // anchors. Rejecting them pushed the rule onto the generic "host^*"
+        // path, where '.' is not a separator, so the rule matched neither the
+        // host nor any of its subdomains.
+        if (host.Length == 0) return null;
+        var hostNameType = Uri.CheckHostName(host);
+        if (hostNameType is not (UriHostNameType.Dns or UriHostNameType.Basic)) return null;
             hostEnd = end < 0 ? pattern.Length : end;
             return host;
         }

@@ -4,12 +4,14 @@
 
 ### Ad blocking correctness follow-up
 
-- Restored 302 wildcard `||host` rules that a single-label-host relaxation had silently disabled. `*` and `?` are host terminators, so `||cacheserve.*/promodisplay/` was being read as the host `cacheserve`, yielding a path pattern of `*/promodisplay/*` that can never match. A wildcard host is now a glob and falls back to the generic matching path.
+- Restored 315 wildcard `||host` rules that a single-label-host relaxation had silently disabled. `*` and `?` are host terminators, so `||cacheserve.*/promodisplay/` was being read as the host `cacheserve`, yielding a path pattern of `*/promodisplay/*` that can never match. A wildcard host is now a glob and falls back to the generic matching path.
+- Fixed a compile abort introduced while optimizing the `$badfilter` identity key. A hand-written span buffer overflowed on any rule with more options than its fixed capacity, and because the compile has no per-line recovery the entire filter set was discarded: the shipped 20-source catalog silently reduced to the 88 built-in fallback rules while reporting success. The key is built with a bounded, allocation-safe sort again, and is skipped entirely for lists that contain no `$badfilter`. Measured over the real 20-list catalog: 164,754 unique lines, 115,602 network rules, 31,135 cosmetic rules, 464 ms, 116.9 MiB.
+- Restored `$badfilter` matching for space-padded options, where a hand-written trim measured its length from the wrong end and left a trailing space in the comparison key.
+- Bounded `$denyallow` to its own value. Absorbing the whole remainder of the option text turned a trailing `$third-party` into a denyallow domain and dropped the rule's third-party scoping, so it began firing on first-party requests.
 - Classified subframes from URLs recorded by each frame's own navigation event. `RequestedSourceKind` cannot identify them: per the WebView2 SDK it reads `Document` for the main page, dedicated workers, iframes, and the shared-worker main script alike, so the previous fallback never fired for an iframe and instead mislabelled worker scripts as subdocuments.
 - Accept the comma form of `$denyallow`. Splitting the option text on commas truncated the value, left its tail looking like a separate option, and deleted the whole rule by failure rather than by error.
 - Restored the reordered-`$badfilter` regression test's second assertion, which had been an exact duplicate of the first and so proved nothing.
-- Rebuilt the `$badfilter` identity key without the `Split`/`Select`/`Order` pipeline and skipped it entirely when a list contains no badfilter, removing a measured ~20% compile slowdown and ~17 MiB of allocation on filter load.
-- Kept the subframe URL set bounded and cleared it on top-level navigation and teardown, so it cannot grow with session length.
+- Kept the subframe URL set bounded at 128 entries and reset it whenever the top-level document is replaced, so a URL recorded as a subframe under one page cannot leak its classification into the next.
 
 ### Ad blocking correctness
 

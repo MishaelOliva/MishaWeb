@@ -82,11 +82,10 @@ public sealed class MainForm : Form
     private const int MaximumPendingExternalNavigations = 16;
     private const int MaximumPendingPermissionRequests = 16;
     private const int MaximumTrackedFramesPerTab = 256;
-/// <summary>
-/// Cap on remembered subframe document URLs per tab. Bounded and cleared on
-/// overflow and on top-level navigation, so it cannot grow with session length.
-/// </summary>
-private const int MaximumTrackedSubframeUrlsPerTab = 128;
+    // Cap on remembered subframe document URLs per tab. Bounded, cleared on
+    // overflow, and reset whenever the top-level document changes, so a URL seen
+    // as a subframe under one page cannot leak its classification into the next.
+    private const int MaximumTrackedSubframeUrlsPerTab = 128;
     private const int MaximumConcurrentFrameSetups = 2;
     private const int MaximumPendingFrameSetups = 64;
     private const int MaximumHoverStatusCharacters = 2_048;
@@ -3562,6 +3561,11 @@ private const int MaximumTrackedSubframeUrlsPerTab = 128;
         AbandonPendingFrameSetups(tab);
         tab.ReleaseTrackedFrames();
         tab.DocumentNavigationGeneration++;
+        // Subframe identities belong to the document that is being replaced. A URL
+        // recorded as a subframe under the outgoing page must not stay classified
+        // as SubDocument once a new top-level document is committed, or $document
+        // rules would be skipped and $subdocument rules would fire on it.
+        tab.AdBlockSubframeUrls.Clear();
         tab.IsLoading = true;
         tab.ConsecutiveSuspendFailures = 0;
         tab.StatusText = "Loading\u2026";
@@ -3727,6 +3731,37 @@ private const int MaximumTrackedSubframeUrlsPerTab = 128;
     /// parameter type so callers outside the assembly, which do not reference
     /// the WebView2 SDK, can still drive the decision table.
     /// </summary>
+    /// <summary>
+    /// Stand-in for the per-tab subframe URL set, used to verify its bounds and
+    /// release behaviour without constructing a WebView2-backed tab.
+    /// </summary>
+    internal sealed class AdBlockSubframeState
+    {
+        private readonly HashSet<string> urls = new(StringComparer.OrdinalIgnoreCase);
+
+        public int Remaining => urls.Count;
+
+        public void Record(string url)
+        {
+            if (urls.Count >= MaximumTrackedSubframeUrlsPerTab) urls.Clear();
+            urls.Add(url);
+        }
+
+        public bool Contains(string url) => urls.Contains(url);
+
+        public void Clear() => urls.Clear();
+    }
+
+    internal static AdBlockSubframeState CreateAdBlockSubframeStateForTesting()
+    {
+        var state = new AdBlockSubframeState();
+        for (var index = 0; index < MaximumTrackedSubframeUrlsPerTab; index++)
+        {
+            state.Record($"https://preloaded{index}.invalid/page");
+        }
+        return state;
+    }
+
     internal static AdBlockResourceType MapResourceTypeForTesting(
         string? webViewContext,
         string? fetchDestination = null,
@@ -4095,11 +4130,7 @@ private const int MaximumTrackedSubframeUrlsPerTab = 128;
             // labels identically. See MapResourceType.
             if (BrowserPolicy.IsHttpUrl(e.Uri))
             {
-                if (tab.AdBlockSubframeUrls.Count >= MaximumTrackedSubframeUrlsPerTab)
-                {
-                    tab.AdBlockSubframeUrls.Clear();
-                }
-                tab.AdBlockSubframeUrls.Add(e.Uri);
+                tab.AdBlockSubframeUrls.Record(e.Uri);
             }
         };
         EventHandler<CoreWebView2DOMContentLoadedEventArgs> domContentLoadedHandler = (_, _) =>
@@ -5282,6 +5313,7 @@ private const int MaximumTrackedSubframeUrlsPerTab = 128;
         tab.ReaderModeActive = false;
         tab.NavigationRequestId++;
         tab.DocumentNavigationGeneration++;
+        tab.AdBlockSubframeUrls.Clear();
         tab.InitializationGeneration++;
         tab.MotionPolicyGeneration++;
         tab.AllowedPopupBootstrapUrl = null;
@@ -14374,7 +14406,7 @@ private const int MaximumTrackedSubframeUrlsPerTab = 128;
         /// each frame's own NavigationStarting event instead. Cleared on every
         /// top-level navigation and bounded, so it cannot grow with session length.
         /// </summary>
-        public HashSet<string> AdBlockSubframeUrls { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public AdBlockSubframeState AdBlockSubframeUrls { get; } = new();
         public Dictionary<CoreWebView2Frame, string> FrameOrigins { get; } = [];
         public HashSet<CoreWebView2Frame> FrameSetupInProgress { get; } = [];
         public bool ResourceFilterInstalled { get; set; }
