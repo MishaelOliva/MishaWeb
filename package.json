@@ -1,7 +1,7 @@
 {
   "name": "misha-web",
   "private": true,
-  "version": "2.2.0",
+  "version": "2.3.0",
   "scripts": {
     "desktop:restore": "dotnet restore desktop.tests/MishaWeb.SmokeTests.csproj --locked-mode",
     "desktop:build": "dotnet build desktop/MishaWeb.csproj -c Release --warnaserror -p:ContinuousIntegrationBuild=true",

@@ -1,6 +1,6 @@
 # MishaWeb
 
-MishaWeb 2.2.0 is a compact native Windows browser built with WinForms and the installed Microsoft Edge WebView2 Runtime. It has no frontend framework, background service, telemetry client, or bundled browser engine.
+MishaWeb 2.3.0 is a compact native Windows browser built with WinForms and the installed Microsoft Edge WebView2 Runtime. It has no frontend framework, background service, telemetry client, or bundled browser engine.
 
 ## Highlights
 

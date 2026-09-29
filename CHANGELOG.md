@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.3.0 - 2026-09-29
 
 ### Reader mode and toolbar status
 
