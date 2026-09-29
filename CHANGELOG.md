@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- YouTube ad blocker: stopped cosmetic `:has()` rules from hiding an entire Shorts shelf or search row when only one promoted item inside it was an ad, and extended coverage to the current desktop, mobile, Shorts, and player ad renderers.
+- YouTube ad blocker: matched network-layer and document-layer YouTube domains from one audited list (`youtube.com`, `youtube-nocookie.com`, `youtubekids.com`) by DNS suffix instead of URL substring, so nocookie embeds keep their player bootstrap and lookalike hosts such as `myyoutube.com` no longer receive YouTube-shaped ad stubs or a reflected request `Origin`.
+- YouTube ad blocker: cut per-poll main-thread work — the watch query string is parsed once per navigation, `getStatsForNerds`/`getPlayerStateObject` are called at most once per pass, the skip-button lookup is a single combined selector that clicks each control once per ad, the per-poll enforcement probe no longer runs document-wide `:has()` compounds, and ad-class churn no longer drives an unbounded pass per mutation.
+- YouTube ad blocker: parse the player's buffer-health and resolution stats numerically instead of comparing display strings, so the transport-stall recovery keeps working if YouTube changes its formatting, while a missing field still never reads as a stall.
+
 - Moved Windows builds to .NET 10 LTS with an SDK pin, locked NuGet dependency graphs, deterministic warning-as-error builds, and Windows CI coverage.
 - Updated the pinned WebView2 SDK and embedded x64 loader to stable 1.0.4129.50, with refreshed lock and redistribution metadata.
 - Replaced direct publish-to-destination commands with isolated, allowlisted staging and transactional promotion so stale development files cannot leak into release folders.

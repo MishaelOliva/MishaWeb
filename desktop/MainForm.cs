@@ -3841,9 +3841,53 @@ public sealed class MainForm : Form
         return false;
     }
 
-    private static bool IsYouTubeHost(string host) =>
-        host.Equals("youtube.com", StringComparison.OrdinalIgnoreCase)
-        || host.EndsWith(".youtube.com", StringComparison.OrdinalIgnoreCase);
+    // AdBlockDocumentScript.cs runs its YouTube runtime on every YouTube-owned
+    // domain. The network layer has to agree with that list: if it only knew
+    // about youtube.com, an embed served from youtube-nocookie.com could lose
+    // its player bootstrap to a filter-list rule. Host matching is by DNS
+    // suffix, never by substring, so myyoutube.com stays an ordinary site.
+    internal static readonly string[] YouTubeOwnedDomains =
+    [
+        "youtube.com", "youtube-nocookie.com", "youtubekids.com"
+    ];
+
+    // Hosts that only ever carry ad traffic. A blocked request to one of these
+    // is answered with an empty JSON body instead of an error status.
+    internal static readonly string[] AdNetworkStubDomains =
+    [
+        "doubleclick.net", "googlesyndication.com", "googleadservices.com"
+    ];
+
+    private static bool IsHostWithinDomains(string? host, string[] domains)
+    {
+        // Runs for every intercepted request, so the suffix test compares spans
+        // instead of concatenating ".<domain>" for each candidate.
+        if (string.IsNullOrWhiteSpace(host)) return false;
+        var value = host.AsSpan().Trim();
+        if (value.Length == 0 || value[0] == '[') return false;
+        foreach (var domain in domains)
+        {
+            if (value.Equals(domain, StringComparison.OrdinalIgnoreCase)) return true;
+            if (value.Length <= domain.Length) continue;
+            var suffixStart = value.Length - domain.Length;
+            if (value[suffixStart - 1] == '.'
+                && value[suffixStart..].Equals(domain, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    internal static bool IsYouTubeHost(string? host) => IsHostWithinDomains(host, YouTubeOwnedDomains);
+
+    internal static bool IsAdNetworkHost(string? host) => IsHostWithinDomains(host, AdNetworkStubDomains);
+
+    private static bool IsYouTubeUrl(string? url) =>
+        !string.IsNullOrWhiteSpace(url)
+        && Uri.TryCreate(url, UriKind.Absolute, out var uri)
+        && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+        && IsYouTubeHost(uri.Host);
 
     private CoreWebView2WebResourceResponse? CreateBlockedResourceResponse(
         AdBlockResourceType resourceType,
@@ -3852,31 +3896,25 @@ public sealed class MainForm : Form
         CoreWebView2HttpRequestHeaders? requestHeaders = null)
     {
         if (environment is null) return null;
-        var isYouTubeContext = (topLevelUrl is not null && topLevelUrl.Contains("youtube.com", StringComparison.OrdinalIgnoreCase))
-            || (requestUrl is not null && (requestUrl.Contains("youtube.com", StringComparison.OrdinalIgnoreCase)
-                || requestUrl.Contains("doubleclick.net", StringComparison.OrdinalIgnoreCase)
-                || requestUrl.Contains("googleads", StringComparison.OrdinalIgnoreCase)
-                || requestUrl.Contains("googlesyndication", StringComparison.OrdinalIgnoreCase)));
+        // Shape the stub after the parsed host, never after a substring of the
+        // URL text. "https://myyoutube.com/" contains "youtube.com" as a
+        // substring, and answering that site's fetch with a fabricated
+        // /pagead/id payload would hand a non-YouTube page a YouTube response.
+        var isYouTubeContext = IsYouTubeUrl(topLevelUrl)
+            || IsYouTubeUrl(requestUrl)
+            || (Uri.TryCreate(requestUrl, UriKind.Absolute, out var adRequest)
+                && IsAdNetworkHost(adRequest.IdnHost));
 
         if (isYouTubeContext)
         {
             var origin = "https://www.youtube.com";
-            if (requestHeaders is not null && requestHeaders.Contains("Origin"))
-            {
-                try
-                {
-                    var headerOrigin = requestHeaders.GetHeader("Origin");
-                    if (!string.IsNullOrWhiteSpace(headerOrigin) && headerOrigin != "null")
-                    {
-                        origin = headerOrigin;
-                    }
-                }
-                catch { }
-            }
-            else if (!string.IsNullOrEmpty(topLevelUrl) && Uri.TryCreate(topLevelUrl, UriKind.Absolute, out var topUri))
-            {
-                origin = topUri.GetLeftPart(UriPartial.Authority);
-            }
+            // Echo the requester origin only after it parses as a plain
+            // http(s) origin, so a crafted Origin header cannot be reflected
+            // into the stub response headers.
+            var headerOrigin = NormalizePermissionOrigin(
+                requestHeaders is not null ? GetRequestHeader(requestHeaders, "Origin") : null);
+            var topLevelOrigin = NormalizePermissionOrigin(topLevelUrl);
+            origin = headerOrigin ?? topLevelOrigin ?? origin;
 
             if (requestUrl is not null && requestUrl.Contains("/pagead/id", StringComparison.OrdinalIgnoreCase))
             {

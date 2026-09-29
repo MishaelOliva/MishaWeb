@@ -2844,6 +2844,68 @@ Check(
         requestUrl: "https://www.youtube.com/pagead/adview",
         resourceType: AdBlockResourceType.Fetch));
 
+Check(
+    "youtube host matching is by domain suffix, not URL substring",
+    MainForm.IsYouTubeHost("youtube.com")
+        && MainForm.IsYouTubeHost("www.youtube.com")
+        && MainForm.IsYouTubeHost("m.youtube.com")
+        && MainForm.IsYouTubeHost("music.youtube.com")
+        && !MainForm.IsYouTubeHost("myyoutube.com")
+        && !MainForm.IsYouTubeHost("notyoutube.com")
+        && !MainForm.IsYouTubeHost("youtube.com.evil.example")
+        && !MainForm.IsYouTubeHost("evil.example/youtube.com")
+        && !MainForm.IsYouTubeHost(string.Empty)
+        && !MainForm.IsYouTubeHost(null));
+Check(
+    "network and document shield agree on every YouTube-owned domain",
+    MainForm.IsYouTubeHost("www.youtube-nocookie.com")
+        && MainForm.IsYouTubeHost("www.youtubekids.com")
+        && AdBlockDocumentScript.YouTubeHostMarkers.Length == MainForm.YouTubeOwnedDomains.Length
+        && MainForm.YouTubeOwnedDomains
+            .All(domain => AdBlockDocumentScript.YouTubeHostMarkers.Contains(domain, StringComparer.Ordinal))
+        // The injected guard has to name every domain too, or a nocookie embed
+        // would be sanitized on the document side but not on the network side.
+        && AdBlockDocumentScript.YouTubeHostMarkers.All(domain =>
+            AdBlockEngine.DocumentScript.Contains($"value === '{domain}'", StringComparison.Ordinal)
+            || AdBlockEngine.DocumentScript.Contains($"endsWith('.{domain}')", StringComparison.Ordinal)));
+Check(
+    "nocookie and kids embeds keep their player bootstrap out of the filter list",
+    MainForm.ShouldBypassYouTubePlaybackRequest(
+        topLevelUrl: "https://www.youtube-nocookie.com/embed/0mNykxUtSGE",
+        sourceUrl: null,
+        requestUrl: "https://www.youtube-nocookie.com/youtubei/v1/player?key=test",
+        resourceType: AdBlockResourceType.Fetch)
+    && MainForm.ShouldBypassYouTubePlaybackRequest(
+        topLevelUrl: "https://www.youtube.com/watch?v=0mNykxUtSGE",
+        sourceUrl: null,
+        requestUrl: "https://www.youtube.com/youtubei/v1/player?key=test",
+        resourceType: AdBlockResourceType.XmlHttpRequest)
+    && !MainForm.ShouldBypassYouTubePlaybackRequest(
+        topLevelUrl: "https://www.youtube-nocookie.com/embed/0mNykxUtSGE",
+        sourceUrl: null,
+        requestUrl: "https://www.youtube-nocookie.com/pagead/adview",
+        resourceType: AdBlockResourceType.Fetch));
+Check(
+    "a lookalike host never inherits the youtube playback bypass",
+    !MainForm.ShouldBypassYouTubePlaybackRequest(
+        topLevelUrl: "https://myyoutube.com/embed",
+        sourceUrl: null,
+        requestUrl: "https://myyoutube.com/youtubei/v1/player?key=test",
+        resourceType: AdBlockResourceType.Fetch)
+    && !MainForm.ShouldBypassYouTubePlaybackRequest(
+        topLevelUrl: "https://youtube.com.evil.example/",
+        sourceUrl: null,
+        requestUrl: "https://youtube.com.evil.example/youtubei/v1/player",
+        resourceType: AdBlockResourceType.Fetch));
+Check(
+    "ad-network stub detection is by host suffix, not URL substring",
+    MainForm.IsAdNetworkHost("googleads.g.doubleclick.net")
+        && MainForm.IsAdNetworkHost("pagead2.googlesyndication.com")
+        && MainForm.IsAdNetworkHost("doubleclick.net")
+        && !MainForm.IsAdNetworkHost("mydoubleclick.net")
+        && !MainForm.IsAdNetworkHost("evil.example/doubleclick.net")
+        && !MainForm.IsAdNetworkHost(string.Empty));
+
 var cosmeticInjectionEngine = new AdBlockEngine(initialRules:
 [
     "victim.example##@import url(https://attacker.invalid/x.css);/*",
@@ -4135,6 +4197,75 @@ Check(
         "Object.defineProperty(window, '__mishaAdBlockEnabled'",
         StringComparison.Ordinal)
         && adBlockDocumentScript.Contains("set: () => {}", StringComparison.Ordinal));
+Check(
+    "YouTube cosmetic rules cover current desktop, mobile, shorts, and player ad surfaces",
+    adBlockDocumentScript.Contains("ytd-player-legacy-desktop-watch-ads-renderer", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("ytm-player-legacy-desktop-watch-ads-renderer", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("ytd-compact-promoted-item-renderer", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("ytd-promoted-sparkles-text-search-renderer", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("ytd-video-masthead-ad-v15-renderer", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains(".ytp-ad-overlay-slot", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains(".ytp-ad-image-overlay", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("ytm-shorts-lockup-view-model:has(ad-slot-renderer)", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("ytd-reel-item-renderer:has(ad-slot-renderer)", StringComparison.Ordinal));
+Check(
+    "an in-feed ad never collapses the shorts shelf or search row that hosts it",
+    !adBlockDocumentScript.Contains("#shorts-inner-container > .ytd-shorts:has", StringComparison.Ordinal)
+        && !adBlockDocumentScript.Contains("ytd-shorts:has", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("ytd-rich-item-renderer:has(> #content > ytd-ad-slot-renderer)", StringComparison.Ordinal));
+Check(
+    "YouTube payload pruning covers the current ad break and engagement panel keys",
+    adBlockDocumentScript.Contains("'instreamAdVideoRenderer'", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("'adEngagementPanelContent'", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("'adsEngagementPanelContentRenderer'", StringComparison.Ordinal));
+Check(
+    "the player loop reads nerd stats numerically instead of matching display strings",
+    adBlockDocumentScript.Contains("const parseBufferHealthSeconds = value =>", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("const hasUsableResolution = value =>", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("const hasZeroResolution = value =>", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("bufferHealth === 0", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("bufferHealth > 0", StringComparison.Ordinal)
+        && !adBlockDocumentScript.Contains("=== '0.00 s'", StringComparison.Ordinal)
+        && !adBlockDocumentScript.Contains("!== '0x0'", StringComparison.Ordinal));
+Check(
+    "the player loop calls getStatsForNerds and getPlayerStateObject once per pass",
+    adBlockDocumentScript.Contains("const createPlayerSnapshot = player =>", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("snapshot.refresh().stats?.debug_info", StringComparison.Ordinal)
+        && CountOccurrences(adBlockDocumentScript, "getStatsForNerds?.()") == 1
+        && CountOccurrences(adBlockDocumentScript, "getPlayerStateObject?.()") == 1);
+Check(
+    "the watch query is parsed once per navigation instead of per poll",
+    adBlockDocumentScript.Contains("const watchQuery = () => {", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("if (search !== watchQueryKey) {", StringComparison.Ordinal)
+        && CountOccurrences(adBlockDocumentScript, "new URLSearchParams(") == 1);
+Check(
+    "ad skipping uses one combined lookup and clicks each control once per ad",
+    adBlockDocumentScript.Contains("const skipAdSelector = skipSelectors.join(',');", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("for (const button of document.querySelectorAll(skipAdSelector))", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("clickedSkipButtons.has(button)", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("clickedSkipButtons.clear();", StringComparison.Ordinal)
+        && !adBlockDocumentScript.Contains("for (const selector of skipSelectors)", StringComparison.Ordinal));
+Check(
+    "urgent player passes are floored so an ad cannot storm the player API",
+    adBlockDocumentScript.Contains("const urgentCleanupIntervalMs = 100;", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("urgentCleanupTimer = window.setTimeout(() => {", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("const runCleanupPass = () => {", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("window.clearTimeout(urgentCleanupTimer);", StringComparison.Ordinal));
+Check(
+    "the per-poll enforcement probe avoids document-wide :has() compounds",
+    adBlockDocumentScript.Contains(
+        "'ytd-enforcement-message-view-model, yt-enforcement-message-view-model, '",
+        StringComparison.Ordinal)
+        // Exactly three remain, all in the injected stylesheet. Any fourth
+        // would mean a :has() compound crept back into the per-poll query.
+        && CountOccurrences(adBlockDocumentScript, "tp-yt-paper-dialog:has(") == 3
+        && adBlockDocumentScript.Contains(
+            "const owner = enforcement.closest?.(",
+            StringComparison.Ordinal));
+Check(
+    "disabling the shield cancels every scheduled player timer",
+    adBlockDocumentScript.Contains("window.clearTimeout(instantPlayTimer);", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("window.clearTimeout(urgentCleanupTimer);", StringComparison.Ordinal));
 var generatedAdBlockScript = AdBlockEngine.CreateDocumentScript("__smoke_control_channel");
 Check(
     "document shield control channels are unique-install placeholders",
@@ -4194,6 +4325,20 @@ Check(
 Check(
     "YouTube server recovery stays fail-open after its retry budget",
     youtubeTransportRecovery.GetValueOrDefault("serverBudgetFailsOpen"));
+var youtubeAdSkip = ExecuteYouTubeAdSkipFixture(generatedAdBlockScript);
+Check(
+    "YouTube ad skipping clicks every control through one combined lookup",
+    youtubeAdSkip.GetValueOrDefault("firstPass")
+        && youtubeAdSkip.GetValueOrDefault("singleLookup"));
+Check(
+    "YouTube ad skipping does not re-click the same control on every poll",
+    youtubeAdSkip.GetValueOrDefault("dedupesRepeatedPolls"));
+Check(
+    "YouTube restores playback rate and mute after an ad",
+    youtubeAdSkip.GetValueOrDefault("restoresAfterAd"));
+Check(
+    "YouTube ad skipping accepts fresh controls in the next ad",
+    youtubeAdSkip.GetValueOrDefault("clearsBetweenAds"));
 var documentScriptSyntaxPath = Path.Combine(
     Path.GetTempPath(),
     "MishaWeb-AdBlock-" + Guid.NewGuid().ToString("N") + ".js");
@@ -8770,6 +8915,162 @@ Dictionary<string, bool> ExecuteYouTubeTransportRecoveryFixture(string script)
                     invalidVideoIdsIgnored:missingResponseIdIgnored&&invalidResponseIdIgnored&&invalidRequestedIdIgnored,
                     mismatchedVideoIgnored,
                     serverBudgetFailsOpen
+                }));
+            })();
+            """;
+        File.WriteAllText(path, prelude + script + assertions);
+        var start = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "node",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        start.ArgumentList.Add(path);
+        using var process = System.Diagnostics.Process.Start(start);
+        if (process is null || !process.WaitForExit(5_000))
+        {
+            if (process is { HasExited: false }) process.Kill(entireProcessTree: true);
+            return [];
+        }
+        var output = process.StandardOutput.ReadToEnd();
+        var error = process.StandardError.ReadToEnd();
+        if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(output))
+        {
+            if (error.Length > 0) Console.Error.WriteLine(error);
+            return [];
+        }
+        try
+        {
+            return JsonSerializer.Deserialize<Dictionary<string, bool>>(output) ?? [];
+        }
+        catch (JsonException)
+        {
+            Console.Error.WriteLine(output);
+            if (error.Length > 0) Console.Error.WriteLine(error);
+            return [];
+        }
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+Dictionary<string, bool> ExecuteYouTubeAdSkipFixture(string script)
+{
+    var path = Path.Combine(
+        Path.GetTempPath(),
+        "MishaWeb-YouTube-AdSkip-" + Guid.NewGuid().ToString("N") + ".js");
+    try
+    {
+        var prelude =
+            """
+            globalThis.window=globalThis;
+            globalThis.location={hostname:'www.youtube.com',pathname:'/watch',search:'?v=q8xYvyYYpf0',href:'https://www.youtube.com/watch?v=q8xYvyYYpf0'};
+            globalThis.HTMLElement=class { click(){ this.clicks=(this.clicks||0)+1; } };
+            globalThis.HTMLVideoElement=class extends HTMLElement {};
+            globalThis.Node=class {};
+            Node.prototype.appendChild=function(node){return node;};
+            globalThis.HTMLIFrameElement=class extends HTMLElement {};
+            globalThis.__frameWindow={};
+            Object.defineProperty(HTMLIFrameElement.prototype,'contentWindow',{configurable:true,get(){return __frameWindow;}});
+            globalThis.__timerId=0;
+            globalThis.__timers=new Map();
+            window.setTimeout=(callback,delay=0)=>{const id=++__timerId;__timers.set(id,{callback,delay});return id;};
+            window.clearTimeout=id=>{__timers.delete(id);};
+            globalThis.__windowEvents={};
+            window.addEventListener=(name,handler)=>{__windowEvents[name]=handler;};
+            window.removeEventListener=()=>{};
+            window.fetch=()=>Promise.resolve({url:'https://www.youtube.com/youtubei/v1/next'});
+            window.ytcfg={data_:{INNERTUBE_CONTEXT:{client:{userAgent:'Mozilla/5.0 (Ad Fixture) Chrome'}}}};
+            window.ytInitialData={};
+            // Start with no ad on screen so the document-start pass stays quiet.
+            globalThis.__adShowing=false;
+            globalThis.__skipSelectorCalls=0;
+            globalThis.__legacySkipQueryCalls=0;
+            globalThis.__video=new HTMLVideoElement();
+            Object.assign(__video,{readyState:4,duration:60,currentTime:10,paused:true,muted:false,playbackRate:1});
+            globalThis.__skipA=new HTMLElement();
+            globalThis.__skipB=new HTMLElement();
+            globalThis.__skipC=new HTMLElement();
+            globalThis.__player={
+                getPlayerResponse:()=>undefined,
+                loadVideoById:()=>{},
+                playVideo:()=>{},
+                getProgressState:()=>({duration:60,loaded:60,current:10}),
+                getPlayerStateObject:()=>({isBuffering:false}),
+                getStatsForNerds:()=>({buffer_health_seconds:'1.20 s',resolution:'1280x720',debug_info:''}),
+                classList:{contains:name=>name==='ad-showing'&&__adShowing,remove:()=>{}}
+            };
+            globalThis.__documentEvents={};
+            globalThis.MutationObserver=class{constructor(callback){this.callback=callback;}observe(){}disconnect(){}};
+            globalThis.document={
+                hidden:false,
+                readyState:'complete',
+                documentElement:{appendChild:()=>{},setAttribute:()=>{},removeAttribute:()=>{}},
+                createElement:()=>({id:'',textContent:'',remove:()=>{}}),
+                getElementById:id=>id==='movie_player'?__player:null,
+                querySelector:selector=>{
+                    if(typeof selector==='string'&&selector.includes('ytp-ad'))__legacySkipQueryCalls++;
+                    return selector==='video.html5-main-video, video'?__video:null;
+                },
+                querySelectorAll:selector=>{
+                    if(typeof selector==='string'&&selector.includes('ytp-ad')){
+                        __skipSelectorCalls++;
+                        return __skipSelectorCalls<=2?[__skipA,__skipB]:[__skipC];
+                    }
+                    return [__video];
+                },
+                addEventListener:(name,handler)=>{(__documentEvents[name]??=[]).push(handler);},
+                removeEventListener:()=>{}
+            };
+            """;
+        var assertions =
+            """
+            (()=>{
+                const pulse=()=>{
+                    for(const handler of (__documentEvents['yt-player-updated']||[]))handler();
+                    const timer=[...__timers].find(([,entry])=>entry.delay===150);
+                    if(timer){__timers.delete(timer[0]);timer[1].callback();}
+                };
+                const clicks=node=>node.clicks||0;
+
+                __adShowing=true;
+                pulse();
+                const firstPass=clicks(__skipA)===1
+                    && clicks(__skipB)===1
+                    && __skipSelectorCalls===1
+                    && __video.muted===true
+                    && __video.playbackRate===16;
+                // The old loop ran one querySelector per skip selector on every
+                // poll. None of those may survive.
+                const noPerSelectorQueries=__legacySkipQueryCalls===0;
+
+                pulse();
+                const secondPassDeduped=clicks(__skipA)===1
+                    && clicks(__skipB)===1
+                    && __skipSelectorCalls===2;
+
+                __adShowing=false;
+                pulse();
+                const restoredAfterAd=__video.muted===false
+                    && __video.playbackRate===1
+                    && clicks(__skipA)===1;
+
+                // A new ad gets fresh controls; the cleared set must not block them.
+                __adShowing=true;
+                pulse();
+                const newAdClicked=clicks(__skipC)===1
+                    && __skipSelectorCalls===3;
+
+                console.log(JSON.stringify({
+                    firstPass:firstPass&&noPerSelectorQueries,
+                    singleLookup:noPerSelectorQueries&&__skipSelectorCalls===3,
+                    dedupesRepeatedPolls:secondPassDeduped,
+                    restoresAfterAd:restoredAfterAd,
+                    clearsBetweenAds:newAdClicked
                 }));
             })();
             """;

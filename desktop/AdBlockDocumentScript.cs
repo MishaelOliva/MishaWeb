@@ -6,6 +6,16 @@ namespace MishaWeb;
 /// </summary>
 internal static class AdBlockDocumentScript
 {
+    /// <summary>
+    /// Domains the injected runtime treats as YouTube. MainForm's network-layer
+    /// domain set is asserted against this list and against the script source so
+    /// the document guard and the request guard cannot drift apart.
+    /// </summary>
+    internal static readonly string[] YouTubeHostMarkers =
+    [
+        "youtube.com", "youtube-nocookie.com", "youtubekids.com"
+    ];
+
     public const string Source =
         """
         (() => {
@@ -51,6 +61,20 @@ internal static class AdBlockDocumentScript
             const isYouTube = isYouTubeHost(host);
             const isYouTubeWatch = () => host === 'www.youtube.com'
                 && location.pathname === '/watch';
+            // The player loop re-reads the watch query several times per tick.
+            // Cache the parsed form and invalidate it on the exact string the
+            // browser exposes, so a single-page navigation can never reuse a
+            // stale video id or start offset.
+            let watchQueryKey = null;
+            let watchQueryCache = null;
+            const watchQuery = () => {
+                const search = location.search;
+                if (search !== watchQueryKey) {
+                    watchQueryKey = search;
+                    watchQueryCache = new URLSearchParams(search);
+                }
+                return watchQueryCache;
+            };
             const recoveryMaskAttribute = 'data-misha-youtube-recovery';
             let recoveryMaskActive = false;
             let recoveryMaskVerified = false;
@@ -105,6 +129,10 @@ internal static class AdBlockDocumentScript
             ];
 
             if (isYouTube) {
+                // Ad placements collapse the single unit that hosts them. Hiding a
+                // whole feed shelf or search row would take real videos with it,
+                // so the :has() rules are scoped to the individual promoted item
+                // and the shared ad slot is hidden on its own everywhere else.
                 selectors.push(
                     '#masthead-ad', '#panels ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-ads"]',
                     '.video-ads', '.ytp-ad-module', '.ytp-ad-overlay-container', '.ytp-ad-progress-list',
@@ -112,12 +140,17 @@ internal static class AdBlockDocumentScript
                     'ytd-in-feed-ad-layout-renderer', 'ytd-search-pyv-renderer',
                     'ytd-banner-promo-renderer', 'ytd-statement-banner-renderer',
                     'ytd-rich-item-renderer:has(> #content > ytd-ad-slot-renderer)',
-                    '#shorts-inner-container > .ytd-shorts:has(ytd-ad-slot-renderer)',
+                    'ytd-compact-promoted-item-renderer', 'ytd-promoted-sparkles-text-search-renderer',
+                    'ytd-video-masthead-ad-v15-renderer', 'ytd-player-legacy-desktop-watch-ads-renderer',
+                    'ytd-reel-item-renderer:has(ad-slot-renderer)',
                     'ytm-companion-ad-renderer', 'ytm-companion-slot', 'ytm-promoted-sparkles-web-renderer',
+                    'ytm-shorts-lockup-view-model:has(ad-slot-renderer)',
                     'ytm-rich-item-renderer:has(ad-slot-renderer)', 'ad-slot-renderer',
                     '.ytp-ad-player-overlay', '.ytp-ad-player-overlay-layout',
                     '.ytp-ad-player-overlay-instream-info', '.ytp-ad-text',
                     '.ytp-ad-preview-container', '.ytp-ad-action-interstitial',
+                    '.ytp-ad-overlay-slot', '.ytp-ad-image-overlay', '.ytp-ad-overlay-text',
+                    'ytm-ad-overlay', 'ytm-player-legacy-desktop-watch-ads-renderer',
                     '.ytp-paid-content-overlay', 'ytd-merchandise-shelf-renderer',
                     '.ytp-ad-player-overlay-flyout-cta', '.ytp-ad-survey',
                     'ytd-ad-break-renderer', '.ytp-suggested-action'
@@ -201,7 +234,9 @@ internal static class AdBlockDocumentScript
                 'adBreaks', 'adBreak', 'adSlotRenderer', 'adPlacementRenderer',
                 'adBreakServiceRenderer', 'instreamVideoAdRenderer',
                 'adSafetyReason', 'linearAdSequenceRenderer', 'playerLegacyDesktopWatchAdsRenderer',
-                'adBreakRenderer', 'adPlacement', 'videoAdRenderer'
+                'adBreakRenderer', 'adPlacement', 'videoAdRenderer',
+                'instreamAdVideoRenderer', 'adEngagementPanelContent',
+                'adsEngagementPanelContentRenderer'
             ]);
             const isAdEntry = value => !!value && typeof value === 'object' && (
                 value.adSlotRenderer
@@ -273,7 +308,7 @@ internal static class AdBlockDocumentScript
                             || Boolean(playability.errorScreen?.playerErrorMessageRenderer);
 
                         if (!obj.videoDetails && isYouTubeWatch()) {
-                            const vId = new URLSearchParams(location.search).get('v') || '';
+                            const vId = watchQuery().get('v') || '';
                             if (isValidYouTubeVideoId(vId)) {
                                 obj.videoDetails = { videoId: vId };
                             }
@@ -571,7 +606,7 @@ internal static class AdBlockDocumentScript
 
             const getRecoveryContract = playerResponse => {
                 const videoId = playerResponse?.videoDetails?.videoId
-                    || new URLSearchParams(location.search).get('v')
+                    || watchQuery().get('v')
                     || '';
                 const status = playerResponse?.playabilityStatus;
                 const errorScreen = status?.errorScreen;
@@ -700,7 +735,7 @@ internal static class AdBlockDocumentScript
                 return Number.isFinite(seconds) && seconds >= 0 ? seconds : 0;
             };
             const getRequestedStartSeconds = playerResponse => {
-                const query = new URLSearchParams(location.search);
+                const query = watchQuery();
                 const requested = query.get('t') ?? query.get('start');
                 if (requested !== null) return parseStartSeconds(requested);
                 const configured = Number(
@@ -1046,6 +1081,8 @@ internal static class AdBlockDocumentScript
                 '.ytp-ad-skip-button-text',
                 '[id^="skip-button:"] button'
             ];
+            const skipAdSelector = skipSelectors.join(',');
+            const clickedSkipButtons = new Set();
 
             const maybeRecoverServerContract = (player, playerResponse) => {
                 if (host !== 'www.youtube.com'
@@ -1138,6 +1175,46 @@ internal static class AdBlockDocumentScript
                 }
             };
 
+            // getStatsForNerds() and getPlayerStateObject() each cross into
+            // YouTube's Polymer player, and the loop used to call them up to
+            // three and two times per tick. Memoize both for a single pass.
+            const createPlayerSnapshot = player => {
+                const snapshot = { read: false, state: null, stats: null };
+                snapshot.refresh = () => {
+                    if (snapshot.read) return snapshot;
+                    snapshot.read = true;
+                    try { snapshot.state = player?.getPlayerStateObject?.(); } catch (_) { }
+                    try { snapshot.stats = player?.getStatsForNerds?.(); } catch (_) { }
+                    return snapshot;
+                };
+                return snapshot;
+            };
+
+            // YouTube publishes these as display strings ("0.00 s", "0x0").
+            // Parsing them numerically keeps the strict stall predicate working
+            // if the formatting ever changes, while still requiring the field to
+            // be present so a missing value never reads as a zero stall.
+            const parseBufferHealthSeconds = value => {
+                if (value === null || value === undefined) return null;
+                const match = /-?\d+(?:\.\d+)?/.exec(String(value));
+                if (!match) return null;
+                const parsed = Number(match[0]);
+                return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+            };
+            const hasUsableResolution = value => {
+                const text = String(value ?? '').trim();
+                if (!text) return false;
+                const match = /^(\d+)\s*[x×]\s*(\d+)$/.exec(text);
+                return match ? Number(match[1]) > 0 && Number(match[2]) > 0 : true;
+            };
+            const hasZeroResolution = value => {
+                // A missing field must never read as a zero-sized video, or the
+                // stall predicate would fire on any buffering state.
+                if (value === null || value === undefined) return false;
+                const match = /^(\d+)\s*[x×]\s*(\d+)$/.exec(String(value).trim());
+                return match ? Number(match[1]) === 0 && Number(match[2]) === 0 : false;
+            };
+
             const transportRetryPattern = /(?:this content isn['’]?t available|an error occurred)[,.]?\s*try again later/i;
             const textFromRuns = runs => Array.isArray(runs)
                 ? runs.map(run => run?.text || '').join(' ')
@@ -1160,6 +1237,14 @@ internal static class AdBlockDocumentScript
                         transportRecoveryErrorNode?.textContent || '')) {
                     return true;
                 }
+                // The response text is free to read. Prefer it so the common
+                // enforcement case never pays for a NodeList walk plus the
+                // forced style/layout reads the visible check below needs.
+                if (transportRetryPattern.test(getTransportResponseText(playerResponse))
+                    && (document.querySelector('ytd-watch-flexy[player-unavailable]')
+                        || document.querySelector('.ytp-error'))) {
+                    return true;
+                }
                 const candidates = document.querySelectorAll(
                     '.ytp-error, .ytp-error-content-wrap, .ytp-error-content, .ytp-error-message, '
                     + 'yt-playability-error-supported-renderers#error-screen');
@@ -1180,9 +1265,7 @@ internal static class AdBlockDocumentScript
                         }
                     } catch (_) { }
                 }
-                return (!!document.querySelector('ytd-watch-flexy[player-unavailable]')
-                    || !!document.querySelector('.ytp-error'))
-                    && transportRetryPattern.test(getTransportResponseText(playerResponse));
+                return false;
             };
 
             const getBufferedEnd = video => {
@@ -1197,7 +1280,7 @@ internal static class AdBlockDocumentScript
             };
 
             const getMatchingWatchVideoId = (playerResponse, allowRequestedFallback = false) => {
-                const requested = new URLSearchParams(location.search).get('v') || '';
+                const requested = watchQuery().get('v') || '';
                 const response = playerResponse?.videoDetails?.videoId
                     || window.ytInitialPlayerResponse?.videoDetails?.videoId
                     || (allowRequestedFallback ? requested : '');
@@ -1208,7 +1291,7 @@ internal static class AdBlockDocumentScript
                     : '';
             };
 
-            const hasActualMediaProgress = (player, playerResponse, progress, video) => {
+            const hasActualMediaProgress = (player, playerResponse, progress, video, snapshot) => {
                 const videoId = getMatchingWatchVideoId(playerResponse);
                 if (!videoId) return false;
                 if (transportRecoveryVideoId !== videoId) {
@@ -1228,19 +1311,16 @@ internal static class AdBlockDocumentScript
                     && current > transportRecoveryBaselineTime + 0.1;
                 const bufferAdvanced = transportRecoveryAttempt > 0
                     && bufferedEnd > transportRecoveryBaselineBufferedEnd + 0.25;
-                let state = null;
-                let stats = null;
-                try { state = player?.getPlayerStateObject?.(); } catch (_) { }
-                try { stats = player?.getStatsForNerds?.(); } catch (_) { }
-                const resolution = String(stats?.resolution || '');
-                const bufferHealth = String(stats?.buffer_health_seconds || '');
+                const observed = (snapshot || createPlayerSnapshot(player)).refresh();
+                const state = observed.state;
+                const stats = observed.stats;
+                const bufferHealth = parseBufferHealthSeconds(stats?.buffer_health_seconds);
                 const strictPlayable = transportRecoveryAttempt > 0
                     && playerResponse?.playabilityStatus?.status === 'OK'
                     && state?.isBuffering === false
-                    && resolution.length > 0
-                    && resolution !== '0x0'
-                    && bufferHealth.length > 0
-                    && bufferHealth !== '0.00 s'
+                    && hasUsableResolution(stats?.resolution)
+                    && bufferHealth !== null
+                    && bufferHealth > 0
                     && !hasMatchingTransportError(playerResponse)
                     && video.readyState >= 3
                     && (video.paused === false || bufferedEnd > current + 0.05);
@@ -1282,7 +1362,7 @@ internal static class AdBlockDocumentScript
                 return false;
             };
 
-            const maybeRecoverTransportStall = (player, playerResponse, progress, video) => {
+            const maybeRecoverTransportStall = (player, playerResponse, progress, video, snapshot) => {
                 if (host !== 'www.youtube.com'
                     || location.pathname !== '/watch'
                     || isPremium()
@@ -1306,14 +1386,14 @@ internal static class AdBlockDocumentScript
                 const current = Number(progress?.current || 0);
                 const unfinished = duration > 0
                     && (loaded < duration || duration - current > 1);
-                let state = null;
-                let stats = null;
-                try { state = player.getPlayerStateObject?.(); } catch (_) { }
-                try { stats = player.getStatsForNerds?.(); } catch (_) { }
+                const observed = (snapshot || createPlayerSnapshot(player)).refresh();
+                const state = observed.state;
+                const stats = observed.stats;
+                const bufferHealth = parseBufferHealthSeconds(stats?.buffer_health_seconds);
                 const stalled = unfinished
                     && state?.isBuffering === true
-                    && String(stats?.buffer_health_seconds || '') === '0.00 s'
-                    && String(stats?.resolution || '') === '0x0'
+                    && bufferHealth === 0
+                    && hasZeroResolution(stats?.resolution)
                     && hasMatchingTransportError(playerResponse);
                 if (!stalled) return false;
 
@@ -1384,7 +1464,7 @@ internal static class AdBlockDocumentScript
 
             const triggerInstantPlay = () => {
                 if (!isEnabled() || !isYouTubeWatch() || userManuallyPaused) return;
-                const currentVideoId = new URLSearchParams(location.search).get('v') || '';
+                const currentVideoId = watchQuery().get('v') || '';
                 if (!currentVideoId) return;
 
                 if (currentVideoId !== activeWatchVideoId) {
@@ -1477,20 +1557,23 @@ internal static class AdBlockDocumentScript
                     if (playerResponse) repairPlayerResponse(playerResponse);
 
                     // Apply the current uBO SSAP gate only to non-Premium watch pages.
+                    const snapshot = createPlayerSnapshot(player);
                     const progress = player?.getProgressState?.();
                     const recoveredVideo = document.querySelector('video.html5-main-video, video');
                     const mediaProgressing = hasActualMediaProgress(
                         player,
                         playerResponse,
                         progress,
-                        recoveredVideo);
+                        recoveredVideo,
+                        snapshot);
                     finalizeExpiredTransportRecovery();
                     if (!mediaProgressing && maybeRecoverTransportStall(
                         player,
                         playerResponse,
                         progress,
-                        recoveredVideo)) return true;
-                    const serverContract = player?.getStatsForNerds?.()?.debug_info;
+                        recoveredVideo,
+                        snapshot)) return true;
+                    const serverContract = snapshot.refresh().stats?.debug_info;
                     const unfinished = progress?.duration > 0
                         && (progress.loaded < progress.duration
                             || progress.duration - progress.current > 1);
@@ -1522,17 +1605,19 @@ internal static class AdBlockDocumentScript
                                 }
                             } catch (_) { }
                         }
-                        for (const selector of skipSelectors) {
-                            try {
-                                const button = document.querySelector(selector);
-                                if (button instanceof HTMLElement) {
-                                    button.click();
-                                }
-                            } catch (_) { }
+                        // One combined lookup beats nine independent selector
+                        // passes, and each distinct control is clicked once per
+                        // ad instead of once per poll.
+                        for (const button of document.querySelectorAll(skipAdSelector)) {
+                            if (!(button instanceof HTMLElement)
+                                || clickedSkipButtons.has(button)) continue;
+                            clickedSkipButtons.add(button);
+                            try { button.click(); } catch (_) { }
                         }
                         try { player?.skipAd?.(); } catch (_) { }
                     } else if (adWasActive) {
                         adWasActive = false;
+                        clickedSkipButtons.clear();
                         const videos = document.querySelectorAll('video.html5-main-video, video');
                         for (const video of videos) {
                             if (!(video instanceof HTMLVideoElement)) continue;
@@ -1547,11 +1632,12 @@ internal static class AdBlockDocumentScript
                         try { player?.playVideo?.(); } catch (_) { }
                     }
 
+                    // Query the cheap tag/id selectors. The paper-dialog owner is
+                    // resolved with closest() below, which avoids running three
+                    // document-wide :has() compounds on every poll.
                     const enforcement = document.querySelector(
                         'ytd-enforcement-message-view-model, yt-enforcement-message-view-model, '
-                        + 'tp-yt-paper-dialog:has(ytd-enforcement-message-view-model), '
-                        + 'tp-yt-paper-dialog:has(yt-enforcement-message-view-model), '
-                        + 'tp-yt-paper-dialog:has(#enforcement-message)');
+                        + '#enforcement-message');
                     if (enforcement) {
                         adActivity = true;
                         const owner = enforcement.closest?.(
@@ -1578,7 +1664,7 @@ internal static class AdBlockDocumentScript
                         adActivity = true;
                     }
                     if (isYouTubeWatch()) {
-                        const currentVideoId = new URLSearchParams(location.search).get('v') || '';
+                        const currentVideoId = watchQuery().get('v') || '';
                         if (currentVideoId && currentVideoId !== activeWatchVideoId) {
                             activeWatchVideoId = currentVideoId;
                             autoplayAttempts = 0;
@@ -1606,12 +1692,12 @@ internal static class AdBlockDocumentScript
                 removeVideoHooks();
                 hookedVideo = video;
                 const onPlay = () => {
-                    const currentVideoId = new URLSearchParams(location.search).get('v') || '';
+                    const currentVideoId = watchQuery().get('v') || '';
                     if (currentVideoId) autoplayCompletedForVideoId = currentVideoId;
                     cleanPlayerAds();
                 };
                 const onPlaying = () => {
-                    const currentVideoId = new URLSearchParams(location.search).get('v') || '';
+                    const currentVideoId = watchQuery().get('v') || '';
                     if (currentVideoId) autoplayCompletedForVideoId = currentVideoId;
                 };
                 const onReady = () => {
@@ -1691,16 +1777,38 @@ internal static class AdBlockDocumentScript
                     if (activity) scheduleFallback(true);
                 }, document.hidden ? 5_000 : 150);
             };
+            // The player class attribute churns many times per second while an
+            // ad is on screen, and every mutation used to run a full pass in a
+            // microtask. Keep the first pass immediate and floor the rest so a
+            // single ad cannot drive hundreds of redundant player round trips.
+            const urgentCleanupIntervalMs = 100;
+            let lastUrgentCleanupAt = 0;
+            let urgentCleanupTimer = 0;
+            const runCleanupPass = () => {
+                lastUrgentCleanupAt = performance.now();
+                const activity = cleanPlayerAds();
+                observePlayer();
+                if (activity) scheduleFallback(true);
+            };
             const queueUrgentCleanup = () => {
                 if (urgentCleanupQueued || !isEnabled()) return;
                 urgentCleanupQueued = true;
-                queueMicrotask(() => {
+                const elapsed = performance.now() - lastUrgentCleanupAt;
+                if (elapsed >= urgentCleanupIntervalMs) {
+                    queueMicrotask(() => {
+                        urgentCleanupQueued = false;
+                        if (!isEnabled()) return;
+                        runCleanupPass();
+                    });
+                    return;
+                }
+                window.clearTimeout(urgentCleanupTimer);
+                urgentCleanupTimer = window.setTimeout(() => {
+                    urgentCleanupTimer = 0;
                     urgentCleanupQueued = false;
                     if (!isEnabled()) return;
-                    const activity = cleanPlayerAds();
-                    observePlayer();
-                    if (activity) scheduleFallback(true);
-                });
+                    runCleanupPass();
+                }, urgentCleanupIntervalMs - elapsed);
             };
             queuePlayerRecovery = () => {
                 pendingRecoverySignal = false;
@@ -1804,6 +1912,7 @@ internal static class AdBlockDocumentScript
             };
             const onNavigationStart = () => {
                 adWasActive = false;
+                clickedSkipButtons.clear();
                 userManuallyPaused = false;
                 activeWatchVideoId = '';
                 autoplayAttempts = 0;
@@ -1831,7 +1940,7 @@ internal static class AdBlockDocumentScript
             };
             const onNavigationFinish = () => {
                 userManuallyPaused = false;
-                activeWatchVideoId = new URLSearchParams(location.search).get('v') || '';
+                activeWatchVideoId = watchQuery().get('v') || '';
                 autoplayAttempts = 0;
                 autoplayCompletedForVideoId = '';
                 lastPlayAttempt = 0;
@@ -1881,8 +1990,13 @@ internal static class AdBlockDocumentScript
                     stopPlayerBootstrapObservation();
                     window.clearTimeout(fallbackTimer);
                     window.clearTimeout(cleanupSignalTimer);
+                    window.clearTimeout(instantPlayTimer);
+                    window.clearTimeout(urgentCleanupTimer);
+                    instantPlayTimer = 0;
+                    urgentCleanupTimer = 0;
                     cleanupQueued = false;
                     urgentCleanupQueued = false;
+                    clickedSkipButtons.clear();
                     for (const eventName of cleanupEvents) {
                         document.removeEventListener(eventName, queueCleanup);
                     }
