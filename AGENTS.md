@@ -78,10 +78,10 @@ Self-contained, provider-agnostic defaults for this repository. Higher-priority 
 
 For work that changes user-visible UI, ad-blocking behavior, memory behavior, or backend correctness, use the `critique` subagent to score the result before declaring it done. The bar is **9.0/10**.
 
-- Run the `critique` subagent after your own verification passes, not before, and tell it which loop it is, for example `Loop 1 of 3`.
+- Run the `critique` subagent after your own verification passes, not before, and tell it which loop it is, for example `Loop 1 of 4`.
 - The subagent is read-only. It renders the chrome, scores eight categories including memory efficiency, and returns a final `CRITIQUE_RESULT: PASS|FAIL SCORE=... PASSING=9.0 LOOP=k/max` line.
 - On `FAIL`, treat its top findings as the work list for the next pass, implement them, re-verify, and re-run the subagent with the next loop number.
-- Allow a **maximum of 3 loops total**. After the third `FAIL`, stop looping. Report the remaining score, the unresolved findings, and the evidence, and say plainly that the work is below the bar rather than continuing to iterate or inflating the number.
+- Allow a **maximum of 4 loops total**. After the fourth `FAIL`, stop looping. Report the remaining score, the unresolved findings, and the evidence, and say plainly that the work is below the bar rather than continuing to iterate or inflating the number.
 - Never edit the subagent's score, argue past a failing verdict, or restate a partial pass as a pass. A `PASS` requires the subagent's own `PASS` verdict.
 - If the subagent cannot verify a category, such as a failed render or an unrunnable suite, that is a failed check, not a pass. State the gap.
 

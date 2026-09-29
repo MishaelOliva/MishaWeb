@@ -20,7 +20,7 @@ you report, then re-invokes you.
 ## Your contract
 
 The caller passes you a **loop budget**. The prompt you receive contains a line
-like `Loop 2 of 3`. Read it. If it is absent, assume `Loop 1 of 3`.
+like `Loop 2 of 4`. Read it. If it is absent, assume `Loop 1 of 4`.
 
 You must finish with exactly one machine-readable verdict line, the last line of
 your reply, in this shape:
