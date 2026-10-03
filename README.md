@@ -106,4 +106,4 @@ Release builds are verified with `-warnaserror` across all projects.
 This project is licensed under the [MIT License](LICENSE). Third-party library notices and upstream filter list licenses are documented in [`licenses/THIRD-PARTY-NOTICES.txt`](licenses/THIRD-PARTY-NOTICES.txt).
 
 ---
-*Built by [Mishael Oliva](https://github.com/MishaelOliva) • [LinkedIn](https://linkedin.com/in/mishael-oliva)*
+*Built by [Mishael Oliva](https://github.com/MishaelOliva) • [LinkedIn](https://www.linkedin.com/in/mishael-oliva-96a31b3a2)*
