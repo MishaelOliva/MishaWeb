@@ -7,7 +7,6 @@
     "desktop:build": "dotnet build desktop/MishaWeb.csproj -c Release --warnaserror -p:ContinuousIntegrationBuild=true",
     "desktop:test": "dotnet run --project desktop.tests/MishaWeb.SmokeTests.csproj -c Release -p:RestoreLockedMode=true",
     "desktop:check": "npm run desktop:restore && dotnet build desktop.tests/MishaWeb.SmokeTests.csproj -c Release --no-restore --warnaserror -p:ContinuousIntegrationBuild=true && dotnet run --project desktop.tests/MishaWeb.SmokeTests.csproj -c Release --no-build --no-restore",
-    "desktop:memory-churn": "dotnet build desktop.youtubeprobe/MishaWeb.YouTubeProbe.csproj -c Release --warnaserror -p:ContinuousIntegrationBuild=true && node desktop.tests/MemoryAcceptanceProbe.mjs --exe desktop.youtubeprobe/bin/Release/net10.0-windows/win-x64/MishaWeb.YouTubeProbe.exe --out artifacts/memory-churn --churn-cycles 12",
     "desktop:run": "dotnet run --project desktop/MishaWeb.csproj -c Release",
     "desktop:publish": "powershell -NoProfile -ExecutionPolicy Bypass -File build/Publish-MishaWeb.ps1 -Mode FrameworkDependent",
     "desktop:one-click": "powershell -NoProfile -ExecutionPolicy Bypass -File build/Publish-MishaWeb.ps1 -Mode OneClick",

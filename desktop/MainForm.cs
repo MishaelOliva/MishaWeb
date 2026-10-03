@@ -2566,8 +2566,8 @@ public sealed class MainForm : Form
             view.Bounds = tab.Host.ClientRectangle;
         }
         tab.View = view;
-        view.KeyUp += (_, e) => HandleMruKeyUp(e);
-        view.KeyDown += (_, e) =>
+        KeyEventHandler keyUpHandler = (_, e) => HandleMruKeyUp(e);
+        KeyEventHandler keyDownHandler = (_, e) =>
         {
             if (e.KeyCode == Keys.N && e.Control && e.Shift)
             {
@@ -2576,6 +2576,13 @@ public sealed class MainForm : Form
                 OpenPrivateWindow();
             }
         };
+        view.KeyUp += keyUpHandler;
+        view.KeyDown += keyDownHandler;
+        tab.TrackCoreEventHandler(() =>
+        {
+            view.KeyUp -= keyUpHandler;
+            view.KeyDown -= keyDownHandler;
+        });
         tab.Host.Controls.Add(view);
         view.SendToBack();
         tab.Overlay.BringToFront();

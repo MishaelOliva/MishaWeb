@@ -36,3 +36,5 @@ web/
 
 # Agent/editor tooling and nested git worktrees must never be committed.
 .kilo/
+.opencode/
+AGENTS.md

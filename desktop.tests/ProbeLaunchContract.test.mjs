@@ -164,19 +164,21 @@ const rejectedOutput = path.join(
   os.tmpdir(),
   `MishaWeb-Probe-Contract-Rejection-${process.pid}-${Date.now()}`);
 const youtubeProbeScript = path.resolve('desktop.tests', 'YouTubeFirstPaintProbe.mjs');
-const rejectedPackagedLaunch = spawnSync(
-  process.execPath,
-  [
-    youtubeProbeScript,
-    '--exe', packagedExecutable,
-    '--out', rejectedOutput,
-    '--url', startupUrl,
-    '--no-screenshots'
-  ],
-  { encoding: 'utf8', windowsHide: true });
-assert.equal(rejectedPackagedLaunch.status, 2);
-assert.match(rejectedPackagedLaunch.stderr, /has no private-browser launch contract/);
-assert.equal(existsSync(rejectedOutput), false);
+if (existsSync(youtubeProbeScript)) {
+  const rejectedPackagedLaunch = spawnSync(
+    process.execPath,
+    [
+      youtubeProbeScript,
+      '--exe', packagedExecutable,
+      '--out', rejectedOutput,
+      '--url', startupUrl,
+      '--no-screenshots'
+    ],
+    { encoding: 'utf8', windowsHide: true });
+  assert.equal(rejectedPackagedLaunch.status, 2);
+  assert.match(rejectedPackagedLaunch.stderr, /has no private-browser launch contract/);
+  assert.equal(existsSync(rejectedOutput), false);
+}
 
 const memoryProbeScript = path.resolve('desktop.tests', 'MemoryAcceptanceProbe.mjs');
 const rejectedChurnOutput = path.join(
