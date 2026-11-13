@@ -9,6 +9,7 @@ internal static class TextSafety
     public static string SanitizeSingleLine(string? value, int maximumLength)
     {
         if (string.IsNullOrEmpty(value) || maximumLength <= 0) return string.Empty;
+        if (IsAlreadyCleanSingleLine(value, maximumLength)) return value;
         var maximumInspectedCharacters = Math.Min(
             value.Length,
             maximumLength > (int.MaxValue - 2) / 2
@@ -47,7 +48,8 @@ internal static class TextSafety
             }
             builder.Append(
                 char.IsControl(character)
-                || char.GetUnicodeCategory(character) == System.Globalization.UnicodeCategory.Format
+                || (character >= 0x00AD
+                    && char.GetUnicodeCategory(character) == System.Globalization.UnicodeCategory.Format)
                     ? ' '
                     : character);
         }
@@ -57,6 +59,30 @@ internal static class TextSafety
         if (maximumLength == 1) return "…";
         var prefix = Truncate(singleLine, maximumLength - 1).TrimEnd();
         return prefix.Length == 0 ? "…" : prefix + "…";
+    }
+
+    private static bool IsAlreadyCleanSingleLine(string value, int maximumLength)
+    {
+        if (value.Length > maximumLength
+            || char.IsWhiteSpace(value[0])
+            || char.IsWhiteSpace(value[^1]))
+        {
+            return false;
+        }
+
+        for (var index = 0; index < value.Length; index++)
+        {
+            var character = value[index];
+            if (char.IsSurrogate(character)
+                || char.IsControl(character)
+                || (character >= 0x00AD
+                    && char.GetUnicodeCategory(character) == System.Globalization.UnicodeCategory.Format))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     public static string FormatUrlForDisplay(string? value, int maximumLength)

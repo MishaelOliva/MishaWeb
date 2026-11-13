@@ -173,23 +173,25 @@ internal static class AdBlockDocumentScript
                 style.id = styleId;
                 style.textContent = selectors.join(',')
                     + '{display:none !important; visibility:hidden !important; min-height:0 !important;}'
-                    + '#cinematics canvas{will-change:transform; transform:translateZ(0);}'
-                    + 'tp-yt-paper-dialog:has(ytd-enforcement-message-view-model), '
-                    + 'tp-yt-paper-dialog:has(yt-enforcement-message-view-model), '
-                    + 'tp-yt-paper-dialog:has(#enforcement-message)'
-                    + '{display:none !important; visibility:hidden !important; pointer-events:none !important;}'
-                    + `html[${recoveryMaskAttribute}] ytd-enforcement-message-view-model,`
-                    + `html[${recoveryMaskAttribute}] yt-enforcement-message-view-model`
-                    + '{display:none !important; visibility:hidden !important; pointer-events:none !important;}'
-                    // A generic player error is hidden only after the strict
-                    // transport-stall predicate verifies that a bounded retry is
-                    // underway. The document-start pre-arm cannot hide real errors.
-                    + `html[${recoveryMaskAttribute}="verified"] .ytp-error,`
-                    + `html[${recoveryMaskAttribute}="verified"] .ytp-error-content-wrap,`
-                    + `html[${recoveryMaskAttribute}="verified"] .ytp-error-content,`
-                    + `html[${recoveryMaskAttribute}="verified"] `
-                    + 'yt-playability-error-supported-renderers#error-screen'
-                    + '{display:none !important; visibility:hidden !important; pointer-events:none !important;}';
+                    + (isYouTube
+                        ? '#cinematics canvas{will-change:transform; transform:translateZ(0);}'
+                            + 'tp-yt-paper-dialog:has(ytd-enforcement-message-view-model), '
+                            + 'tp-yt-paper-dialog:has(yt-enforcement-message-view-model), '
+                            + 'tp-yt-paper-dialog:has(#enforcement-message)'
+                            + '{display:none !important; visibility:hidden !important; pointer-events:none !important;}'
+                            + `html[${recoveryMaskAttribute}] ytd-enforcement-message-view-model,`
+                            + `html[${recoveryMaskAttribute}] yt-enforcement-message-view-model`
+                            + '{display:none !important; visibility:hidden !important; pointer-events:none !important;}'
+                            // A generic player error is hidden only after the strict
+                            // transport-stall predicate verifies that a bounded retry is
+                            // underway. The document-start pre-arm cannot hide real errors.
+                            + `html[${recoveryMaskAttribute}="verified"] .ytp-error,`
+                            + `html[${recoveryMaskAttribute}="verified"] .ytp-error-content-wrap,`
+                            + `html[${recoveryMaskAttribute}="verified"] .ytp-error-content,`
+                            + `html[${recoveryMaskAttribute}="verified"] `
+                            + 'yt-playability-error-supported-renderers#error-screen'
+                            + '{display:none !important; visibility:hidden !important; pointer-events:none !important;}'
+                        : '');
                 document.documentElement.appendChild(style);
                 if (recoveryMaskActive) {
                     syncRecoveryMask();
@@ -253,6 +255,10 @@ internal static class AdBlockDocumentScript
                 || value.instreamVideoAdRenderer
             );
             const sanitizedObjects = new WeakSet();
+            const skippedSanitizeKeys = new Set([
+                'adaptiveFormats', 'formats', 'storyboards', 'thumbnails',
+                'captions', 'heatmap', 'playerConfig'
+            ]);
 
             const sanitize = value => {
                 if (!isEnabled()
@@ -282,12 +288,14 @@ internal static class AdBlockDocumentScript
                         continue;
                     }
 
-                    for (const key of Object.keys(current)) {
+                    for (const key in current) {
+                        if (!Object.prototype.hasOwnProperty.call(current, key)) continue;
                         if (adKeys.has(key)) {
                             try { delete current[key]; }
                             catch (_) { try { current[key] = undefined; } catch (_) { } }
                             continue;
                         }
+                        if (skippedSanitizeKeys.has(key)) continue;
                         const child = current[key];
                         if (child && typeof child === 'object') pending.push(child);
                     }
@@ -299,34 +307,48 @@ internal static class AdBlockDocumentScript
             const isValidYouTubeVideoId = value => /^[A-Za-z0-9_-]{11}$/.test(value || '');
             let serverRecoveryExhausted = false;
 
+            const repairSinglePlayerResponse = obj => {
+                if (!obj || typeof obj !== 'object') return;
+                const playability = obj.playabilityStatus;
+                if (playability && typeof playability === 'object') {
+                    const hasStreams = Boolean(
+                        (Array.isArray(obj.streamingData?.adaptiveFormats) && obj.streamingData.adaptiveFormats.length > 0)
+                        || (Array.isArray(obj.streamingData?.formats) && obj.streamingData.formats.length > 0)
+                    );
+                    const isEnforcement = playability.status === 'ERROR'
+                        || playability.status === 'UNPLAYABLE'
+                        || Boolean(playability.errorScreen?.enforcementMessageViewModel)
+                        || Boolean(playability.errorScreen?.playerErrorMessageRenderer);
+
+                    if (!obj.videoDetails && isYouTubeWatch()) {
+                        const vId = watchQuery().get('v') || '';
+                        if (isValidYouTubeVideoId(vId)) {
+                            obj.videoDetails = { videoId: vId };
+                        }
+                    }
+
+                    if (serverRecoveryExhausted && hasStreams && (isEnforcement || playability.status !== 'OK')) {
+                        playability.status = 'OK';
+                        try { delete playability.errorScreen; } catch (_) { playability.errorScreen = undefined; }
+                        try { delete playability.reason; } catch (_) { playability.reason = undefined; }
+                        try { delete playability.subreason; } catch (_) { playability.subreason = undefined; }
+                        try { delete playability.messages; } catch (_) { playability.messages = undefined; }
+                    }
+                }
+            };
+
             const repairPlayerResponse = obj => {
                 if (!isEnabled() || !obj || typeof obj !== 'object') return obj;
                 try {
-                    const playability = obj.playabilityStatus;
-                    if (playability && typeof playability === 'object') {
-                        const hasStreams = Boolean(
-                            (Array.isArray(obj.streamingData?.adaptiveFormats) && obj.streamingData.adaptiveFormats.length > 0)
-                            || (Array.isArray(obj.streamingData?.formats) && obj.streamingData.formats.length > 0)
-                        );
-                        const isEnforcement = playability.status === 'ERROR'
-                            || playability.status === 'UNPLAYABLE'
-                            || Boolean(playability.errorScreen?.enforcementMessageViewModel)
-                            || Boolean(playability.errorScreen?.playerErrorMessageRenderer);
-
-                        if (!obj.videoDetails && isYouTubeWatch()) {
-                            const vId = watchQuery().get('v') || '';
-                            if (isValidYouTubeVideoId(vId)) {
-                                obj.videoDetails = { videoId: vId };
-                            }
+                    if (Array.isArray(obj)) {
+                        for (let i = 0; i < obj.length; i++) {
+                            repairPlayerResponse(obj[i]);
                         }
-
-                        if (serverRecoveryExhausted && hasStreams && (isEnforcement || playability.status !== 'OK')) {
-                            playability.status = 'OK';
-                            try { delete playability.errorScreen; } catch (_) { playability.errorScreen = undefined; }
-                            try { delete playability.reason; } catch (_) { playability.reason = undefined; }
-                            try { delete playability.subreason; } catch (_) { playability.subreason = undefined; }
-                            try { delete playability.messages; } catch (_) { playability.messages = undefined; }
-                        }
+                        return obj;
+                    }
+                    repairSinglePlayerResponse(obj);
+                    if (obj.playerResponse && typeof obj.playerResponse === 'object') {
+                        repairSinglePlayerResponse(obj.playerResponse);
                     }
                 } catch (_) { }
                 return obj;
@@ -338,6 +360,7 @@ internal static class AdBlockDocumentScript
                     const parsed = JSON.parse(value);
                     const sanitized = sanitize(parsed);
                     repairPlayerResponse(sanitized);
+                    inspectPlayerResponse(sanitized);
                     return JSON.stringify(sanitized);
                 } catch (_) { return value; }
             };
@@ -654,7 +677,7 @@ internal static class AdBlockDocumentScript
             };
             let pendingRecoverySignal = false;
             let queuePlayerRecovery = () => { pendingRecoverySignal = true; };
-            const inspectPlayerResponse = playerResponse => {
+            const inspectSinglePlayerResponse = playerResponse => {
                 const contract = getRecoveryContract(playerResponse);
                 if (!contract.videoId) return;
                 if (contract.exactAdBlockEnforcement) {
@@ -664,6 +687,19 @@ internal static class AdBlockDocumentScript
                     queuePlayerRecovery();
                 } else if (contract.exactContractError) {
                     queuePlayerRecovery();
+                }
+            };
+            const inspectPlayerResponse = playerResponse => {
+                if (!playerResponse || typeof playerResponse !== 'object') return;
+                if (Array.isArray(playerResponse)) {
+                    for (let i = 0; i < playerResponse.length; i++) {
+                        inspectPlayerResponse(playerResponse[i]);
+                    }
+                    return;
+                }
+                inspectSinglePlayerResponse(playerResponse);
+                if (playerResponse.playerResponse && typeof playerResponse.playerResponse === 'object') {
+                    inspectSinglePlayerResponse(playerResponse.playerResponse);
                 }
             };
 
@@ -893,14 +929,7 @@ internal static class AdBlockDocumentScript
                     const nativeText = response.text.bind(response);
                     Object.defineProperty(response, 'text', {
                         configurable: true,
-                        value: (...args) => nativeText(...args).then(text => {
-                            const sanitizedText = sanitizePayload(text);
-                            try {
-                                const parsed = JSON.parse(sanitizedText);
-                                inspectPlayerResponse(parsed);
-                            } catch (_) { }
-                            return sanitizedText;
-                        })
+                        value: (...args) => nativeText(...args).then(text => sanitizePayload(text))
                     });
                     const nativeClone = response.clone.bind(response);
                     Object.defineProperty(response, 'clone', {
@@ -968,11 +997,22 @@ internal static class AdBlockDocumentScript
 
             try {
                 const requestUrls = new WeakMap();
+                const xhrSanitizedCache = new WeakMap();
+                const sanitizeXhrString = (xhr, value) => {
+                    if (typeof value !== 'string') return value;
+                    const cached = xhrSanitizedCache.get(xhr);
+                    if (cached && cached.raw === value) return cached.sanitized;
+                    const sanitized = sanitizePayload(value);
+                    xhrSanitizedCache.set(xhr, { raw: value, sanitized });
+                    return sanitized;
+                };
                 const nativeOpen = XMLHttpRequest.prototype.open;
                 XMLHttpRequest.prototype.open = new Proxy(nativeOpen, {
                     apply(target, thisArg, args) {
-                        try { requestUrls.set(thisArg, new URL(args[1], location.href).href); }
-                        catch (_) { }
+                        try {
+                            requestUrls.set(thisArg, new URL(args[1], location.href).href);
+                            xhrSanitizedCache.delete(thisArg);
+                        } catch (_) { }
                         return Reflect.apply(target, thisArg, args);
                     }
                 });
@@ -983,9 +1023,15 @@ internal static class AdBlockDocumentScript
                         enumerable: responseDescriptor.enumerable,
                         get() {
                             const value = responseDescriptor.get.call(this);
-                            return shouldSanitizePlayerPayload(requestUrls.get(this))
-                                ? sanitizePayload(value)
-                                : value;
+                            if (!shouldSanitizePlayerPayload(requestUrls.get(this))) return value;
+                            if (typeof value === 'string') return sanitizeXhrString(this, value);
+                            if (value && typeof value === 'object') {
+                                const res = sanitize(value);
+                                repairPlayerResponse(res);
+                                inspectPlayerResponse(res);
+                                return res;
+                            }
+                            return value;
                         }
                     });
                 }
@@ -999,7 +1045,7 @@ internal static class AdBlockDocumentScript
                         get() {
                             const value = responseTextDescriptor.get.call(this);
                             return shouldSanitizePlayerPayload(requestUrls.get(this))
-                                ? sanitizePayload(value)
+                                ? sanitizeXhrString(this, value)
                                 : value;
                         }
                     });
@@ -1015,16 +1061,9 @@ internal static class AdBlockDocumentScript
                                     'load',
                                     () => {
                                         try {
-                                            const raw = thisArg.response;
-                                            const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
-                                            const res = sanitize(obj);
-                                            repairPlayerResponse(res);
-                                            inspectPlayerResponse(res);
-                                        } catch (_) {
-                                            const res = sanitize(thisArg.response);
-                                            repairPlayerResponse(res);
-                                            inspectPlayerResponse(res);
-                                        }
+                                            if (xhrSanitizedCache.has(thisArg)) return;
+                                            _ = thisArg.response;
+                                        } catch (_) { }
                                     },
                                     { once: true });
                             }

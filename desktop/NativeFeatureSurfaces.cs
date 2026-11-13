@@ -8,6 +8,9 @@ internal static class NativeDialogLayout
 {
     internal const int ActionRowHeight = 44;
     internal const int WrappedActionRowHeight = 84;
+    internal static readonly Font QueryFont = new("Segoe UI", 11f);
+    internal static readonly Font ListFont = new("Segoe UI", 10f);
+    internal static readonly Font CompactListFont = new("Segoe UI", 9.5f);
 
     internal static void EnableDpiScaling(Form form)
     {
@@ -96,11 +99,11 @@ internal sealed class CommandPaletteForm : Form
         queryBox.Dock = DockStyle.Fill;
         queryBox.PlaceholderText = "Type a command, tab, favorite, session, or closed tab";
         queryBox.AccessibleName = "Command palette search";
-        queryBox.Font = new Font("Segoe UI", 11f);
+        queryBox.Font = NativeDialogLayout.QueryFont;
         resultList.Dock = DockStyle.Fill;
         resultList.IntegralHeight = false;
         resultList.HorizontalScrollbar = true;
-        resultList.Font = new Font("Segoe UI", 10f);
+        resultList.Font = NativeDialogLayout.ListFont;
         resultList.AccessibleName = "Command palette results";
         root.Controls.Add(queryBox, 0, 0);
         root.Controls.Add(resultList, 0, 1);
@@ -283,7 +286,7 @@ internal sealed class MruSwitcherForm : Form
 
         itemList.Dock = DockStyle.Fill;
         itemList.IntegralHeight = false;
-        itemList.Font = new Font("Segoe UI", 10f);
+        itemList.Font = NativeDialogLayout.ListFont;
         itemList.AccessibleName = "Recent tabs list";
         Controls.Add(itemList);
         NativeUiTheme.Apply(this);
@@ -432,7 +435,7 @@ internal sealed class SessionManagerForm : Form
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, NativeDialogLayout.WrappedActionRowHeight));
         sessionList.Dock = DockStyle.Fill;
         sessionList.IntegralHeight = false;
-        sessionList.Font = new Font("Segoe UI", 10f);
+        sessionList.Font = NativeDialogLayout.ListFont;
         sessionList.AccessibleName = "Saved sessions list";
         root.Controls.Add(sessionList, 0, 0);
 
@@ -696,7 +699,7 @@ internal sealed class PermissionManagerForm : Form
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, NativeDialogLayout.ActionRowHeight));
         settingList.Dock = DockStyle.Fill;
         settingList.IntegralHeight = false;
-        settingList.Font = new Font("Segoe UI", 10f);
+        settingList.Font = NativeDialogLayout.ListFont;
         settingList.AccessibleName = "Saved website permissions list";
         root.Controls.Add(settingList, 0, 0);
         var actions = NativeDialogLayout.CreateActionBar();
@@ -847,7 +850,7 @@ internal sealed class DownloadsPopupForm : Form
         downloadList.Dock = DockStyle.Fill;
         downloadList.IntegralHeight = false;
         downloadList.HorizontalScrollbar = true;
-        downloadList.Font = new Font("Segoe UI", 9.5f);
+        downloadList.Font = NativeDialogLayout.CompactListFont;
         downloadList.AccessibleName = "Downloads list";
         root.Controls.Add(downloadList, 0, 0);
         var actions = NativeDialogLayout.CreateActionBar(wrap: true);

@@ -12,6 +12,11 @@ internal sealed record VoiceAudioSettingsResult(
 
 internal sealed class VoiceAudioSettingsDialog : Form
 {
+    private static readonly Font PickerFont = new("Segoe UI", 10f, FontStyle.Bold);
+    private static readonly Font DescriptionFont = new("Segoe UI", 9f, FontStyle.Italic);
+    private static readonly Font ExplanationFont = new("Segoe UI", 9f);
+    private static readonly Font SiteListFont = new("Segoe UI", 9.5f);
+
     private readonly string? currentHost;
     private readonly Action<VoiceAudioSettingsResult> saveCallback;
 
@@ -99,7 +104,7 @@ internal sealed class VoiceAudioSettingsDialog : Form
         // 0. Section picker
         sectionPicker.Dock = DockStyle.Fill;
         sectionPicker.DropDownStyle = ComboBoxStyle.DropDownList;
-        sectionPicker.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
+        sectionPicker.Font = PickerFont;
         sectionPicker.Items.AddRange(["Audio Output (Sound)", "Voice & Audio Input (Microphone)"]);
         sectionPicker.SelectedIndex = 0;
         sectionPicker.AccessibleName = "Voice and audio section";
@@ -109,7 +114,7 @@ internal sealed class VoiceAudioSettingsDialog : Form
         // 1. Section description
         sectionDescription.Dock = DockStyle.Fill;
         sectionDescription.AutoSize = false;
-        sectionDescription.Font = new Font("Segoe UI", 9f, FontStyle.Italic);
+        sectionDescription.Font = DescriptionFont;
         sectionDescription.ForeColor = NativeUiTheme.MutedText;
         root.Controls.Add(sectionDescription, 0, 1);
 
@@ -137,7 +142,7 @@ internal sealed class VoiceAudioSettingsDialog : Form
         // 3. Policy explanation
         policyExplanation.Dock = DockStyle.Fill;
         policyExplanation.AutoSize = false;
-        policyExplanation.Font = new Font("Segoe UI", 9f);
+        policyExplanation.Font = ExplanationFont;
         root.Controls.Add(policyExplanation, 0, 3);
 
         // 4. List type selector row
@@ -173,7 +178,7 @@ internal sealed class VoiceAudioSettingsDialog : Form
         listAndButtons.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
         siteListBox.Dock = DockStyle.Fill;
         siteListBox.IntegralHeight = false;
-        siteListBox.Font = new Font("Segoe UI", 9.5f);
+        siteListBox.Font = SiteListFont;
         siteListBox.AccessibleName = "Configured sites list";
         siteListBox.SelectedIndexChanged += (_, _) => UpdateButtonStates();
         listAndButtons.Controls.Add(siteListBox, 0, 0);

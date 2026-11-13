@@ -36,10 +36,10 @@ internal sealed class SmartSearchBar : UserControl
 
     // Custom WinForms controls must paint opaque pixels on every frame. Alpha-filled
     // child buffers accumulate stale glyphs during interactive resizing on some GPUs.
-    private static readonly Color SurfaceColor = BlendOpaque(NativeUiTheme.Surface, NativeUiTheme.Window, 148);
-    private static readonly Color SurfaceColorSecondary = BlendOpaque(NativeUiTheme.Chrome, NativeUiTheme.Window, 148);
-    private static readonly Color InputSurfaceColor = BlendOpaque(NativeUiTheme.Field, SurfaceColor, 196);
-    private static readonly Color BorderColor = NativeUiTheme.Border;
+    private static readonly Color SurfaceColor = Color.FromArgb(255, 52, 21, 51);
+    private static readonly Color SurfaceColorSecondary = SurfaceColor;
+    private static readonly Color InputSurfaceColor = SurfaceColor;
+    private static readonly Color BorderColor = Color.FromArgb(205, 198, 108, 158);
     private static readonly Color FocusColor = NativeUiTheme.Focus;
     private static readonly Color PrimaryTextColor = NativeUiTheme.Text;
     private static readonly Color SecondaryTextColor = NativeUiTheme.SecondaryText;
@@ -47,9 +47,10 @@ internal sealed class SmartSearchBar : UserControl
     private static readonly Color AccentColor = NativeUiTheme.Accent;
     private static readonly Color AccentHoverColor = NativeUiTheme.AccentHover;
     private static readonly Color AccentPressedColor = NativeUiTheme.AccentPressed;
-    private static readonly Color PillColor = BlendOpaque(NativeUiTheme.Chrome, SurfaceColor, 242);
-    private static readonly Color PillHoverColor = BlendOpaque(NativeUiTheme.SurfaceRaised, SurfaceColor, 248);
-    private static readonly Color PillPressedColor = BlendOpaque(NativeUiTheme.Selection, SurfaceColor, 252);
+    private static readonly Color PillColor = BlendOpaque(Color.FromArgb(86, 36, 76), SurfaceColor, 242);
+    private static readonly Color PillHoverColor = BlendOpaque(Color.FromArgb(108, 46, 95), SurfaceColor, 248);
+    private static readonly Color PillPressedColor = BlendOpaque(Color.FromArgb(124, 52, 108), SurfaceColor, 252);
+    private static readonly Color IdleActionTextColor = Color.FromArgb(255, 242, 212, 228);
     private static readonly Font InputFont = new("Segoe UI", 11f);
     private static readonly Font LabelFont = new("Segoe UI Semibold", 8f);
     private static readonly Font ProviderFont = new("Segoe UI Semibold", 8.25f);
@@ -61,7 +62,7 @@ internal sealed class SmartSearchBar : UserControl
     private readonly SearchGlyph icon = new();
     private readonly TextBox input = new();
     private readonly Label modeLabel = new();
-    private readonly Label hintLabel = new();
+    private readonly RoundedHintLabel hintLabel = new();
     private readonly ProviderPillButton providerButton = new();
     private readonly ArrowActionButton actionButton = new();
     private readonly ToolTip toolTip = new();
@@ -103,7 +104,7 @@ internal sealed class SmartSearchBar : UserControl
         TrySetTransparentBackColor(layout);
         layout.ColumnCount = 6;
         layout.RowCount = 2;
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 17));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 21));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 45));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -120,20 +121,20 @@ internal sealed class SmartSearchBar : UserControl
         modeLabel.Dock = DockStyle.Fill;
         modeLabel.Margin = new Padding(6, 0, 0, 0);
         modeLabel.Font = LabelFont;
-        modeLabel.ForeColor = MutedTextColor;
-        modeLabel.TextAlign = ContentAlignment.BottomLeft;
+        modeLabel.ForeColor = FocusColor;
+        modeLabel.TextAlign = ContentAlignment.MiddleLeft;
         modeLabel.AutoEllipsis = true;
         modeLabel.TabStop = false;
         modeLabel.AccessibleRole = AccessibleRole.StaticText;
 
         hintLabel.AutoSize = true;
-        hintLabel.Margin = new Padding(0, 0, 6, 0);
+        hintLabel.Margin = new Padding(0, 1, 6, 1);
         hintLabel.Font = HintFont;
-        hintLabel.ForeColor = MutedTextColor;
+        hintLabel.ForeColor = SecondaryTextColor;
         hintLabel.Text = "CTRL + K";
         hintLabel.TextAlign = ContentAlignment.MiddleCenter;
-        hintLabel.Padding = new Padding(4, 2, 4, 2);
-        TrySetBackColor(hintLabel, Color.FromArgb(44, NativeUiTheme.Focus));
+        hintLabel.Padding = new Padding(6, 2, 6, 2);
+        TrySetTransparentBackColor(hintLabel);
         hintLabel.AccessibleName = "Keyboard shortcut Ctrl plus K";
         hintLabel.AccessibleRole = AccessibleRole.StaticText;
 
@@ -282,6 +283,11 @@ internal sealed class SmartSearchBar : UserControl
         Invalidate(true);
     }
 
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
+        if (!NativeStartPage.PaintChildBackdropSlice(this, e)) base.OnPaintBackground(e);
+    }
+
     protected override void OnSystemColorsChanged(EventArgs e)
     {
         base.OnSystemColorsChanged(e);
@@ -292,13 +298,10 @@ internal sealed class SmartSearchBar : UserControl
     {
         input.ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : PrimaryTextColor;
         TrySetBackColor(input, SystemInformation.HighContrast ? SystemColors.Window : InputSurfaceColor, SystemColors.Window);
-        modeLabel.ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : MutedTextColor;
-        hintLabel.ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : MutedTextColor;
-        TrySetBackColor(
-            hintLabel,
-            SystemInformation.HighContrast ? SystemColors.Window : Color.FromArgb(44, NativeUiTheme.Focus),
-            SystemColors.Window);
+        modeLabel.ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : FocusColor;
+        hintLabel.ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : SecondaryTextColor;
         surface.Invalidate();
+        hintLabel.Invalidate();
         providerButton.Invalidate();
         actionButton.Invalidate();
         Invalidate(true);
@@ -401,7 +404,7 @@ internal sealed class SmartSearchBar : UserControl
         }
         else
         {
-            var resolution = BrowserPolicy.ResolveAddress(value);
+            var resolution = BrowserPolicy.ResolveAddress(value, providerId);
             if (resolution.Error is not null)
             {
                 presentation = new SmartSearchPresentation(
@@ -489,23 +492,23 @@ internal sealed class SmartSearchBar : UserControl
     {
         MinimumSize = new Size(Scale(260), Scale(48));
         surface.Padding = new Padding(Scale(2));
-        surface.CornerRadius = Scale(18);
+        surface.CornerRadius = Scale(20);
         layout.Padding = new Padding(Scale(7), Scale(5), Scale(7), Scale(5));
-        layout.RowStyles[0].Height = Scale(17);
+        layout.RowStyles[0].Height = Scale(21);
         layout.ColumnStyles[0].SizeType = SizeType.Absolute;
         layout.ColumnStyles[0].Width = Scale(45);
         layout.ColumnStyles[2].SizeType = SizeType.Absolute;
         layout.ColumnStyles[2].Width = Scale(8);
 
         modeLabel.Margin = new Padding(Scale(6), 0, 0, 0);
-        hintLabel.Margin = new Padding(0, 0, Scale(6), 0);
-        hintLabel.Padding = new Padding(Scale(4), Scale(2), Scale(4), Scale(2));
+        hintLabel.Margin = new Padding(0, Scale(1), Scale(6), Scale(1));
+        hintLabel.Padding = new Padding(Scale(6), Scale(2), Scale(6), Scale(2));
         providerButton.Margin = new Padding(0, 0, Scale(6), 0);
         providerButton.MinimumSize = new Size(Scale(118), 0);
         providerButton.CornerRadius = Scale(10);
-        input.Margin = new Padding(Scale(6), Scale(1), Scale(8), Scale(3));
-        actionButton.Margin = new Padding(Scale(1), Scale(1), Scale(2), Scale(1));
-        actionButton.CornerRadius = Scale(12);
+        input.Margin = new Padding(Scale(6), Scale(1), Scale(8), Scale(2));
+        actionButton.Margin = new Padding(Scale(2), Scale(1), Scale(2), Scale(1));
+        actionButton.CornerRadius = Scale(14);
     }
 
     private int Scale(int logicalValue)
@@ -529,6 +532,57 @@ internal sealed class SmartSearchBar : UserControl
             ((foreground.B * alpha) + (background.B * inverse) + 127) / 255);
     }
 
+    private static void PaintLiquidGlassSlice(Control child, PaintEventArgs e)
+    {
+        if (SystemInformation.HighContrast)
+        {
+            using var bg = new SolidBrush(SystemColors.Window);
+            e.Graphics.FillRectangle(bg, child.ClientRectangle);
+            return;
+        }
+
+        if (!NativeStartPage.PaintChildBackdropSlice(child, e))
+        {
+            using var fallbackBg = new SolidBrush(NativeUiTheme.Window);
+            e.Graphics.FillRectangle(fallbackBg, child.ClientRectangle);
+        }
+
+        GlassSurface? hostSurface = null;
+        var offsetX = 0;
+        var offsetY = 0;
+        Control? current = child;
+        while (current is not null && current is not GlassSurface)
+        {
+            offsetX += current.Left;
+            offsetY += current.Top;
+            current = current.Parent;
+        }
+
+        if (current is GlassSurface found)
+        {
+            hostSurface = found;
+        }
+
+        if (hostSurface is null)
+        {
+            using var fallbackSurface = new SolidBrush(SurfaceColor);
+            e.Graphics.FillRectangle(fallbackSurface, child.ClientRectangle);
+            return;
+        }
+
+        var state = e.Graphics.Save();
+        try
+        {
+            e.Graphics.SetClip(child.ClientRectangle, CombineMode.Intersect);
+            e.Graphics.TranslateTransform(-offsetX, -offsetY);
+            hostSurface.PaintGlassInterior(e.Graphics);
+        }
+        finally
+        {
+            e.Graphics.Restore(state);
+        }
+    }
+
     private sealed class GlassSurface : Panel
     {
         private bool isFocused;
@@ -542,7 +596,7 @@ internal sealed class SmartSearchBar : UserControl
                 | ControlStyles.SupportsTransparentBackColor
                 | ControlStyles.UserPaint,
                 true);
-            CornerRadius = 18;
+            CornerRadius = 20;
         }
 
         public int CornerRadius { get; set; }
@@ -558,8 +612,63 @@ internal sealed class SmartSearchBar : UserControl
             }
         }
 
+        public void PaintGlassInterior(Graphics graphics)
+        {
+            if (Width <= 1 || Height <= 1) return;
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            var bounds = new RectangleF(0.5f, 0.5f, Math.Max(1, Width - 1f), Math.Max(1, Height - 1f));
+            using var path = CreateRoundedPath(bounds, CornerRadius);
+            var state = graphics.Save();
+            try
+            {
+                graphics.SetClip(path, CombineMode.Intersect);
+                using var tintBrush = new LinearGradientBrush(
+                    bounds,
+                    Color.FromArgb(186, 72, 30, 68),
+                    Color.FromArgb(232, 62, 24, 58),
+                    LinearGradientMode.Vertical);
+                tintBrush.InterpolationColors = new ColorBlend
+                {
+                    Colors = new[]
+                    {
+                        Color.FromArgb(182, 74, 32, 70),
+                        SurfaceColor,
+                        SurfaceColor,
+                        Color.FromArgb(228, 72, 26, 66)
+                    },
+                    Positions = new[] { 0f, 0.40f, 0.87f, 1f }
+                };
+                graphics.FillPath(tintBrush, path);
+
+                var specHeight = Math.Max(8f, bounds.Height * 0.41f);
+                var specRect = new RectangleF(
+                    bounds.X - (bounds.Width * 0.08f),
+                    bounds.Y - (specHeight * 0.25f),
+                    bounds.Width * 1.16f,
+                    specHeight * 1.15f);
+                using var specPath = new GraphicsPath();
+                specPath.AddEllipse(specRect);
+                using var specBrush = new LinearGradientBrush(
+                    new RectangleF(bounds.X, bounds.Y, bounds.Width, specHeight + 1f),
+                    Color.FromArgb(isFocused ? 54 : 38, 255, 244, 252),
+                    Color.FromArgb(0, 255, 224, 244),
+                    LinearGradientMode.Vertical);
+                graphics.FillPath(specBrush, specPath);
+            }
+            finally
+            {
+                graphics.Restore(state);
+            }
+        }
+
         protected override void OnPaintBackground(PaintEventArgs e)
         {
+            if (!NativeStartPage.PaintChildBackdropSlice(this, e))
+            {
+                using var bg = new SolidBrush(SystemInformation.HighContrast ? SystemColors.Window : NativeUiTheme.Window);
+                e.Graphics.FillRectangle(bg, ClientRectangle);
+            }
+
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             var bounds = new RectangleF(0.5f, 0.5f, Math.Max(1, Width - 1f), Math.Max(1, Height - 1f));
             using var path = CreateRoundedPath(bounds, CornerRadius);
@@ -572,31 +681,35 @@ internal sealed class SmartSearchBar : UserControl
             }
             else
             {
-                using var fill = new LinearGradientBrush(
-                    ClientRectangle,
-                    SurfaceColor,
-                    SurfaceColorSecondary,
-                    LinearGradientMode.ForwardDiagonal);
-                e.Graphics.FillPath(fill, path);
+                PaintGlassInterior(e.Graphics);
 
-                using var border = new Pen(isFocused ? FocusBorderColor : BorderColor, isFocused ? 1.8f : 1f);
-                using var highlight = new Pen(Color.FromArgb(54, NativeUiTheme.Focus));
+                using var outerRimBrush = new LinearGradientBrush(
+                    bounds,
+                    Color.FromArgb(isFocused ? 225 : 178, 255, 232, 246),
+                    Color.FromArgb(isFocused ? 185 : 118, NativeUiTheme.Accent),
+                    LinearGradientMode.Vertical);
+                using var border = new Pen(outerRimBrush, isFocused ? 1.8f : 1.15f);
                 e.Graphics.DrawPath(border, path);
-                e.Graphics.DrawPath(highlight, path);
+
+                var innerBounds = bounds;
+                innerBounds.Inflate(-1.1f, -1.1f);
+                if (innerBounds.Width > 8f && innerBounds.Height > 8f)
+                {
+                    using var innerPath = CreateRoundedPath(innerBounds, Math.Max(2f, CornerRadius - 1.1f));
+                    using var innerRimBrush = new LinearGradientBrush(
+                        innerBounds,
+                        Color.FromArgb(isFocused ? 105 : 74, 255, 255, 255),
+                        Color.FromArgb(isFocused ? 46 : 22, NativeUiTheme.Focus),
+                        LinearGradientMode.Vertical);
+                    using var innerBorder = new Pen(innerRimBrush, 1f);
+                    e.Graphics.DrawPath(innerBorder, innerPath);
+                }
             }
         }
 
         protected override void OnResize(EventArgs eventargs)
         {
             base.OnResize(eventargs);
-            if (Width <= 1 || Height <= 1) return;
-
-            using var path = CreateRoundedPath(
-                new RectangleF(0, 0, Width, Height),
-                CornerRadius);
-            var previousRegion = Region;
-            Region = new Region(path);
-            previousRegion?.Dispose();
             Invalidate(true);
         }
 
@@ -630,6 +743,7 @@ internal sealed class SmartSearchBar : UserControl
 
         protected override void OnPaint(PaintEventArgs e)
         {
+            PaintLiquidGlassSlice(this, e);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             var scale = Math.Max(1f, DeviceDpi / 96f);
             var tile = new RectangleF(
@@ -639,7 +753,7 @@ internal sealed class SmartSearchBar : UserControl
                 34f * scale);
             var halo = tile;
             halo.Inflate(4f * scale, 4f * scale);
-            using var haloBrush = new SolidBrush(Color.FromArgb(32, NativeUiTheme.Accent));
+            using var haloBrush = new SolidBrush(Color.FromArgb(44, NativeUiTheme.Accent));
             e.Graphics.FillEllipse(haloBrush, halo);
             using var tileBrush = new LinearGradientBrush(
                 tile,
@@ -647,16 +761,123 @@ internal sealed class SmartSearchBar : UserControl
                 SystemInformation.HighContrast ? SystemColors.Highlight : NativeUiTheme.Lavender,
                 LinearGradientMode.ForwardDiagonal);
             e.Graphics.FillEllipse(tileBrush, tile);
-            var diameter = 10f * scale;
-            var left = tile.Left + (7f * scale);
-            var top = tile.Top + (6f * scale);
-            using var pen = new Pen(SystemInformation.HighContrast ? SystemColors.HighlightText : NativeUiTheme.AccentText, Math.Max(1.3f, 1.6f * scale))
+            if (!SystemInformation.HighContrast)
+            {
+                var specTile = new RectangleF(
+                    tile.X + (tile.Width * 0.14f),
+                    tile.Y + (1.5f * scale),
+                    tile.Width * 0.72f,
+                    tile.Height * 0.42f);
+                using var specBrush = new LinearGradientBrush(
+                    specTile,
+                    Color.FromArgb(115, 255, 255, 255),
+                    Color.FromArgb(0, 255, 255, 255),
+                    LinearGradientMode.Vertical);
+                e.Graphics.FillEllipse(specBrush, specTile);
+
+                var ringRect = tile;
+                ringRect.Inflate(-0.75f * scale, -0.75f * scale);
+                using var innerRing = new Pen(Color.FromArgb(148, 255, 255, 255), Math.Max(1f, 1.1f * scale));
+                e.Graphics.DrawEllipse(innerRing, ringRect);
+            }
+
+            var totalGlyphSize = 14.5f * scale;
+            var lensDiameter = 10f * scale;
+            var left = tile.Left + ((tile.Width - totalGlyphSize) / 2f);
+            var top = tile.Top + ((tile.Height - totalGlyphSize) / 2f);
+            var radius = lensDiameter / 2f;
+            var centerX = left + radius;
+            var centerY = top + radius;
+            var diag = radius * 0.7071f;
+            using var pen = new Pen(
+                SystemInformation.HighContrast ? SystemColors.HighlightText : NativeUiTheme.Text,
+                Math.Max(1.4f, 1.75f * scale))
             {
                 StartCap = LineCap.Round,
                 EndCap = LineCap.Round
             };
-            e.Graphics.DrawEllipse(pen, left, top, diameter, diameter);
-            e.Graphics.DrawLine(pen, left + diameter - scale, top + diameter - scale, left + diameter + (4f * scale), top + diameter + (4f * scale));
+            e.Graphics.DrawEllipse(pen, left, top, lensDiameter, lensDiameter);
+            e.Graphics.DrawLine(
+                pen,
+                centerX + diag,
+                centerY + diag,
+                left + totalGlyphSize,
+                top + totalGlyphSize);
+        }
+    }
+
+    private sealed class RoundedHintLabel : Label
+    {
+        public RoundedHintLabel()
+        {
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint
+                | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.ResizeRedraw
+                | ControlStyles.SupportsTransparentBackColor
+                | ControlStyles.UserPaint,
+                true);
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            PaintLiquidGlassSlice(this, e);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            var bounds = new RectangleF(0.5f, 0.5f, Math.Max(1f, Width - 1f), Math.Max(1f, Height - 1f));
+            var radius = Math.Min(bounds.Height / 2f, 6f * Math.Max(1f, DeviceDpi / 96f));
+            using var path = CreateRoundedPath(bounds, radius);
+            if (SystemInformation.HighContrast)
+            {
+                using var fill = new SolidBrush(SystemColors.Window);
+                using var border = new Pen(SystemColors.WindowText, 1f);
+                e.Graphics.FillPath(fill, path);
+                e.Graphics.DrawPath(border, path);
+            }
+            else
+            {
+                using var fill = new LinearGradientBrush(
+                    bounds,
+                    Color.FromArgb(62, 255, 224, 244),
+                    Color.FromArgb(24, NativeUiTheme.Accent),
+                    LinearGradientMode.Vertical);
+                using var borderBrush = new LinearGradientBrush(
+                    bounds,
+                    Color.FromArgb(148, 255, 228, 245),
+                    Color.FromArgb(52, NativeUiTheme.Accent),
+                    LinearGradientMode.Vertical);
+                using var border = new Pen(borderBrush, 1f);
+                e.Graphics.FillPath(fill, path);
+                e.Graphics.DrawPath(border, path);
+            }
+
+            TextRenderer.DrawText(
+                e.Graphics,
+                Text,
+                Font,
+                ClientRectangle,
+                SystemInformation.HighContrast ? SystemColors.WindowText : ForeColor,
+                TextFormatFlags.HorizontalCenter
+                | TextFormatFlags.VerticalCenter
+                | TextFormatFlags.NoPadding
+                | TextFormatFlags.NoPrefix
+                | TextFormatFlags.SingleLine);
+        }
+
+        private static GraphicsPath CreateRoundedPath(RectangleF bounds, float radius)
+        {
+            var path = new GraphicsPath();
+            var safeRadius = Math.Max(1f, Math.Min(radius, Math.Min(bounds.Width, bounds.Height) / 2f));
+            var diameter = safeRadius * 2f;
+            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
+            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
+            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+            path.CloseFigure();
+            return path;
         }
     }
 
@@ -718,65 +939,79 @@ internal sealed class SmartSearchBar : UserControl
 
         protected override void OnPaint(PaintEventArgs e)
         {
+            PaintLiquidGlassSlice(this, e);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             var bounds = new RectangleF(0.5f, 0.5f, Math.Max(1, Width - 1f), Math.Max(1, Height - 1f));
             using var path = CreateRoundedPath(bounds, CornerRadius);
-            var color = SystemInformation.HighContrast
-                ? SystemColors.Highlight
-                : pressed ? PressedColor : hovered ? HoverColor : FillColor;
-            var primaryColor = FlattenColor(color, SurfaceColor);
-            var secondaryColor = Color.FromArgb(
-                255,
-                Math.Min(255, primaryColor.R + 20),
-                Math.Min(255, primaryColor.G + 14),
-                Math.Min(255, primaryColor.B + 20));
-            if (!Enabled)
+            if (SystemInformation.HighContrast)
             {
-                if (SystemInformation.HighContrast)
-                {
-                    primaryColor = SystemColors.Control;
-                    secondaryColor = SystemColors.Control;
-                }
-                else
-                {
-                    primaryColor = BlendOpaque(primaryColor, SurfaceColor, 108);
-                    secondaryColor = BlendOpaque(secondaryColor, SurfaceColor, 92);
-                }
+                using var fill = new SolidBrush(Enabled ? SystemColors.Highlight : SystemColors.Control);
+                using var border = new Pen(SystemColors.WindowText, Focused ? 1.6f : 1f);
+                e.Graphics.FillPath(fill, path);
+                e.Graphics.DrawPath(border, path);
             }
-            using var fill = new LinearGradientBrush(
-                bounds,
-                primaryColor,
-                secondaryColor,
-                LinearGradientMode.ForwardDiagonal);
-            using var border = new Pen(
-                SystemInformation.HighContrast ? SystemColors.WindowText : Focused ? FocusColor : BorderColor,
-                Focused ? 1.6f : 0.9f);
-            e.Graphics.FillPath(fill, path);
-            e.Graphics.DrawPath(border, path);
+            else
+            {
+                var topAlpha = !Enabled ? 46 : pressed ? 176 : hovered ? 142 : 96;
+                var bottomAlpha = !Enabled ? 28 : pressed ? 132 : hovered ? 104 : 68;
+                using var fill = new LinearGradientBrush(
+                    bounds,
+                    Color.FromArgb(topAlpha, 128, 56, 108),
+                    Color.FromArgb(bottomAlpha, 72, 26, 66),
+                    LinearGradientMode.Vertical);
+                e.Graphics.FillPath(fill, path);
+
+                var state = e.Graphics.Save();
+                try
+                {
+                    e.Graphics.SetClip(path, CombineMode.Intersect);
+                    var specRect = new RectangleF(bounds.X, bounds.Y, bounds.Width, Math.Max(4f, bounds.Height * 0.48f));
+                    using var specBrush = new LinearGradientBrush(
+                        specRect,
+                        Color.FromArgb(hovered ? 78 : 54, 255, 255, 255),
+                        Color.FromArgb(0, 255, 232, 246),
+                        LinearGradientMode.Vertical);
+                    e.Graphics.FillRectangle(specBrush, specRect);
+                }
+                finally
+                {
+                    e.Graphics.Restore(state);
+                }
+
+                using var borderBrush = new LinearGradientBrush(
+                    bounds,
+                    Color.FromArgb(Focused ? 235 : hovered ? 210 : 175, 255, 224, 245),
+                    Color.FromArgb(Focused ? 185 : 96, NativeUiTheme.Accent),
+                    LinearGradientMode.Vertical);
+                using var border = new Pen(borderBrush, Focused ? 1.5f : 1f);
+                e.Graphics.DrawPath(border, path);
+            }
 
             var scale = Math.Max(1f, DeviceDpi / 96f);
             var iconCenter = new PointF(14f * scale, Height / 2f);
             using var iconPen = new Pen(
                 SystemInformation.HighContrast
                     ? Enabled ? SystemColors.HighlightText : SystemColors.GrayText
-                    : Enabled ? SecondaryTextColor : MutedTextColor,
+                    : Enabled ? FocusColor : MutedTextColor,
                 Math.Max(1.1f, 1.35f * scale))
             {
                 StartCap = LineCap.Round,
                 EndCap = LineCap.Round
             };
+            var lensRadius = 4.2f * scale;
+            var lensDiameter = lensRadius * 2f;
             e.Graphics.DrawEllipse(
                 iconPen,
-                iconCenter.X - (4.2f * scale),
-                iconCenter.Y - (5f * scale),
-                9f * scale,
-                9f * scale);
+                iconCenter.X - lensRadius,
+                iconCenter.Y - lensRadius - (0.6f * scale),
+                lensDiameter,
+                lensDiameter);
             e.Graphics.DrawLine(
                 iconPen,
-                iconCenter.X + (2.2f * scale),
-                iconCenter.Y + (3f * scale),
-                iconCenter.X + (5.6f * scale),
-                iconCenter.Y + (6.2f * scale));
+                iconCenter.X + (lensRadius * 0.65f),
+                iconCenter.Y + (lensRadius * 0.55f),
+                iconCenter.X + (lensRadius * 1.35f),
+                iconCenter.Y + (lensRadius * 1.25f));
 
             TextRenderer.DrawText(
                 e.Graphics,
@@ -883,64 +1118,102 @@ internal sealed class SmartSearchBar : UserControl
 
         protected override void OnPaint(PaintEventArgs e)
         {
+            PaintLiquidGlassSlice(this, e);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             var bounds = new RectangleF(0.5f, 0.5f, Math.Max(1, Width - 1f), Math.Max(1, Height - 1f));
             using var path = CreateRoundedPath(bounds, CornerRadius);
             var color = SystemInformation.HighContrast
                 ? SystemColors.Highlight
                 : pressed ? PressedColor : hovered ? HoverColor : FillColor;
-            var primaryColor = FlattenColor(color, SurfaceColor);
-            var secondaryColor = Color.FromArgb(
-                255,
-                Math.Min(255, primaryColor.R + 18),
-                Math.Min(255, primaryColor.G + 12),
-                Math.Min(255, primaryColor.B + 24));
-            if (!Enabled)
+            if (SystemInformation.HighContrast)
             {
-                if (SystemInformation.HighContrast)
-                {
-                    primaryColor = SystemColors.Control;
-                    secondaryColor = SystemColors.Control;
-                }
-                else
-                {
-                    primaryColor = BlendOpaque(primaryColor, SurfaceColor, 116);
-                    secondaryColor = BlendOpaque(secondaryColor, SurfaceColor, 98);
-                }
+                using var hcFill = new SolidBrush(Enabled ? color : SystemColors.Control);
+                using var hcBorder = new Pen(SystemColors.WindowText, Focused ? 1.8f : 1f);
+                e.Graphics.FillPath(hcFill, path);
+                e.Graphics.DrawPath(hcBorder, path);
             }
-            using var fill = new LinearGradientBrush(
-                bounds,
-                primaryColor,
-                secondaryColor,
-                LinearGradientMode.ForwardDiagonal);
-            using var border = new Pen(
-                SystemInformation.HighContrast ? SystemColors.WindowText : Focused ? FocusColor : color,
-                Focused ? 1.8f : 1f);
-            e.Graphics.FillPath(fill, path);
-            e.Graphics.DrawPath(border, path);
-            using var sheen = new Pen(Color.FromArgb(68, NativeUiTheme.Focus), 1f);
-            e.Graphics.DrawPath(sheen, path);
-            if (!Compact)
+            else
             {
+                var topColor = Enabled
+                    ? Color.FromArgb(pressed ? 236 : hovered ? 228 : 210, color)
+                    : Color.FromArgb(124, 152, 74, 126);
+                var bottomColor = Enabled
+                    ? Color.FromArgb(pressed ? 224 : hovered ? 210 : 188, NativeUiTheme.Lavender)
+                    : Color.FromArgb(104, 116, 62, 118);
+                using var fill = new LinearGradientBrush(
+                    bounds,
+                    topColor,
+                    bottomColor,
+                    LinearGradientMode.ForwardDiagonal);
+                e.Graphics.FillPath(fill, path);
+
+                var state = e.Graphics.Save();
+                try
+                {
+                    e.Graphics.SetClip(path, CombineMode.Intersect);
+                    var specHeight = Math.Max(6f, bounds.Height * 0.48f);
+                    var specRect = new RectangleF(
+                        bounds.X - (bounds.Width * 0.08f),
+                        bounds.Y - (specHeight * 0.25f),
+                        bounds.Width * 1.16f,
+                        specHeight * 1.15f);
+                    using var specPath = new GraphicsPath();
+                    specPath.AddEllipse(specRect);
+                    using var specBrush = new LinearGradientBrush(
+                        new RectangleF(bounds.X, bounds.Y, bounds.Width, specHeight + 1f),
+                        Color.FromArgb(Enabled ? 96 : 64, 255, 255, 255),
+                        Color.FromArgb(0, 255, 232, 248),
+                        LinearGradientMode.Vertical);
+                    e.Graphics.FillPath(specBrush, specPath);
+                }
+                finally
+                {
+                    e.Graphics.Restore(state);
+                }
+
+                using var borderBrush = new LinearGradientBrush(
+                    bounds,
+                    Color.FromArgb(Focused ? 240 : Enabled ? 215 : 168, 255, 232, 246),
+                    Color.FromArgb(Focused ? 200 : Enabled ? 148 : 88, NativeUiTheme.Accent),
+                    LinearGradientMode.Vertical);
+                using var border = new Pen(borderBrush, Focused ? 1.8f : 1.1f);
+                e.Graphics.DrawPath(border, path);
+            }
+
+            var scale = Math.Max(1f, DeviceDpi / 96f);
+            var contentColor = SystemInformation.HighContrast
+                ? Enabled ? SystemColors.HighlightText : SystemColors.GrayText
+                : Enabled ? ForeColor : IdleActionTextColor;
+            var centerY = Height / 2f;
+            float arrowCenterX;
+            if (!Compact && !string.IsNullOrEmpty(Text))
+            {
+                var textSize = TextRenderer.MeasureText(
+                    e.Graphics,
+                    Text,
+                    Font,
+                    ClientSize,
+                    TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+                var gap = 6f * scale;
+                var chevronWidth = 4f * scale;
+                var groupWidth = Math.Min(Math.Max(1f, Width - (12f * scale)), textSize.Width + gap + chevronWidth);
+                var groupLeft = Math.Max(6f * scale, (Width - groupWidth) / 2f);
+                var textWidth = Math.Max(1, (int)Math.Ceiling(groupWidth - gap - chevronWidth));
                 TextRenderer.DrawText(
                     e.Graphics,
                     Text,
                     Font,
-                    new Rectangle(4, 0, Math.Max(1, Width - Scale(20)), Height),
-                    SystemInformation.HighContrast
-                        ? Enabled ? SystemColors.HighlightText : SystemColors.GrayText
-                        : Enabled ? ForeColor : Color.FromArgb(160, ForeColor),
-                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+                    new Rectangle((int)Math.Floor(groupLeft), 0, textWidth, Height),
+                    contentColor,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+                arrowCenterX = groupLeft + textWidth + gap + (chevronWidth / 2f);
+            }
+            else
+            {
+                arrowCenterX = Width / 2f;
             }
 
-            var scale = Math.Max(1f, DeviceDpi / 96f);
-            var centerX = Width - (10f * scale);
-            var centerY = Height / 2f;
-            using var arrow = new Pen(
-                SystemInformation.HighContrast
-                    ? Enabled ? SystemColors.HighlightText : SystemColors.GrayText
-                    : Enabled ? ForeColor : Color.FromArgb(150, ForeColor),
-                Math.Max(1.1f, 1.3f * scale))
+            using var arrow = new Pen(contentColor, Math.Max(1.2f, 1.4f * scale))
             {
                 StartCap = LineCap.Round,
                 EndCap = LineCap.Round,
@@ -948,9 +1221,9 @@ internal sealed class SmartSearchBar : UserControl
             };
             e.Graphics.DrawLines(arrow,
             [
-                new PointF(centerX - (2f * scale), centerY - (3f * scale)),
-                new PointF(centerX + (1.5f * scale), centerY),
-                new PointF(centerX - (2f * scale), centerY + (3f * scale))
+                new PointF(arrowCenterX - (2f * scale), centerY - (3.2f * scale)),
+                new PointF(arrowCenterX + (1.5f * scale), centerY),
+                new PointF(arrowCenterX - (2f * scale), centerY + (3.2f * scale))
             ]);
         }
 

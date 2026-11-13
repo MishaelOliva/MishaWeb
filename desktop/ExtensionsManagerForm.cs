@@ -29,6 +29,16 @@ internal sealed record ExtensionManagerRow(
 
 internal sealed class ExtensionsManagerForm : Form
 {
+    private static readonly Font HeaderTitleFont = new("Segoe UI", 12f, FontStyle.Bold);
+    private static readonly Font BodyFont = new("Segoe UI", 9f);
+    private static readonly Font EmptyLabelFont = new("Segoe UI", 10.5f);
+    private static readonly Font CardNameFont = new("Segoe UI", 10.5f, FontStyle.Bold);
+    private static readonly Font CardBadgeFont = new("Segoe UI", 8.25f);
+    private static readonly Font CardStatusFont = new("Segoe UI", 8.5f, FontStyle.Bold);
+    private static readonly Font CardDetailFont = new("Segoe UI", 8.5f);
+    private static readonly Font CardIdFont = new("Consolas", 8.25f);
+    private static readonly Font FallbackIconFont = new("Segoe UI", 12f, FontStyle.Bold);
+
     private readonly Func<Task<IReadOnlyList<ExtensionManagerRow>>> rowProvider;
     private readonly Func<string, CancellationToken, Task> installFromStore;
     private readonly Func<string, CancellationToken, Task> importPackage;
@@ -113,7 +123,7 @@ internal sealed class ExtensionsManagerForm : Form
         var titleLabel = new Label
         {
             AutoSize = true,
-            Font = new Font("Segoe UI", 12f, FontStyle.Bold),
+            Font = HeaderTitleFont,
             ForeColor = NativeUiTheme.Text,
             Text = "Extensions"
         };
@@ -123,7 +133,7 @@ internal sealed class ExtensionsManagerForm : Form
             MaximumSize = new Size(800, 0),
             Margin = new Padding(0, 2, 0, 0),
             ForeColor = NativeUiTheme.SecondaryText,
-            Font = new Font("Segoe UI", 9f),
+            Font = BodyFont,
             Text = "Install from Chrome Web Store by URL or extension ID. "
                 + "Extensions can read and change webpages, so install only ones you trust."
         };
@@ -195,7 +205,7 @@ internal sealed class ExtensionsManagerForm : Form
 
         emptyLabel.Dock = DockStyle.Fill;
         emptyLabel.TextAlign = ContentAlignment.MiddleCenter;
-        emptyLabel.Font = new Font("Segoe UI", 10.5f);
+        emptyLabel.Font = EmptyLabelFont;
         emptyLabel.ForeColor = NativeUiTheme.MutedText;
         emptyLabel.Text = "No browser extensions are installed";
         emptyLabel.Visible = false;
@@ -621,8 +631,7 @@ internal sealed class ExtensionsManagerForm : Form
 
             if (row.IconPath is not null && File.Exists(row.IconPath))
             {
-                try { iconImage = Image.FromFile(row.IconPath); }
-                catch { }
+                iconImage = TryLoadUnlockedBitmap(row.IconPath);
             }
 
             var iconBox = new ExtensionIconBox(iconImage, row.Name);
@@ -642,7 +651,7 @@ internal sealed class ExtensionsManagerForm : Form
             var nameLabel = new Label
             {
                 AutoSize = true,
-                Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
+                Font = CardNameFont,
                 ForeColor = NativeUiTheme.Text,
                 Text = row.Name,
                 Margin = new Padding(0, 0, 6, 2)
@@ -651,7 +660,7 @@ internal sealed class ExtensionsManagerForm : Form
             var versionBadge = new Label
             {
                 AutoSize = true,
-                Font = new Font("Segoe UI", 8.25f),
+                Font = CardBadgeFont,
                 BackColor = NativeUiTheme.SurfaceRaised,
                 ForeColor = NativeUiTheme.SecondaryText,
                 Text = $"v{row.Version}",
@@ -665,7 +674,7 @@ internal sealed class ExtensionsManagerForm : Form
             var sourceBadge = new Label
             {
                 AutoSize = true,
-                Font = new Font("Segoe UI", 8.25f),
+                Font = CardBadgeFont,
                 BackColor = NativeUiTheme.SurfaceRaised,
                 ForeColor = NativeUiTheme.MutedText,
                 Text = sourceText,
@@ -676,7 +685,7 @@ internal sealed class ExtensionsManagerForm : Form
             var statusBadge = new Label
             {
                 AutoSize = true,
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+                Font = CardStatusFont,
                 ForeColor = row.IsEnabled ? NativeUiTheme.Positive : NativeUiTheme.MutedText,
                 Text = row.IsEnabled ? "Enabled" : "Disabled",
                 Margin = new Padding(0, 2, 0, 2)
@@ -694,7 +703,7 @@ internal sealed class ExtensionsManagerForm : Form
             {
                 Dock = DockStyle.Top,
                 AutoSize = true,
-                Font = new Font("Segoe UI", 9f),
+                Font = BodyFont,
                 ForeColor = NativeUiTheme.SecondaryText,
                 Text = descText,
                 Margin = new Padding(0, 0, 0, 4)
@@ -705,7 +714,7 @@ internal sealed class ExtensionsManagerForm : Form
             {
                 Dock = DockStyle.Top,
                 AutoSize = true,
-                Font = new Font("Consolas", 8.25f),
+                Font = CardIdFont,
                 ForeColor = NativeUiTheme.MutedText,
                 Text = $"ID: {row.Id}",
                 Margin = new Padding(0, 0, 0, 8)
@@ -793,7 +802,7 @@ internal sealed class ExtensionsManagerForm : Form
                 {
                     Dock = DockStyle.Top,
                     AutoSize = true,
-                    Font = new Font("Segoe UI", 8.5f),
+                    Font = CardDetailFont,
                     ForeColor = NativeUiTheme.SecondaryText,
                     Text = $"Package folder: {row.FolderPath}",
                     Margin = new Padding(0, 0, 0, 4)
@@ -807,7 +816,7 @@ internal sealed class ExtensionsManagerForm : Form
                 {
                     Dock = DockStyle.Top,
                     AutoSize = true,
-                    Font = new Font("Segoe UI", 8.5f),
+                    Font = CardDetailFont,
                     ForeColor = NativeUiTheme.Accent,
                     Text = $"Chrome Web Store: https://chromewebstore.google.com/detail/{row.StoreId}",
                     Margin = new Padding(0, 0, 0, 6)
@@ -823,7 +832,7 @@ internal sealed class ExtensionsManagerForm : Form
             {
                 Dock = DockStyle.Top,
                 AutoSize = true,
-                Font = new Font("Segoe UI", 8.5f),
+                Font = CardDetailFont,
                 ForeColor = NativeUiTheme.SecondaryText,
                 Text = capText,
                 Margin = new Padding(0, 0, 0, 4)
@@ -835,6 +844,23 @@ internal sealed class ExtensionsManagerForm : Form
 
             Controls.Add(layout);
             if (openPopupButton is not null) NativeUiTheme.ApplyAccentButton(openPopupButton);
+        }
+
+        private static Bitmap? TryLoadUnlockedBitmap(string filePath)
+        {
+            try
+            {
+                using var stream = File.OpenRead(filePath);
+                using var decoded = Image.FromStream(
+                    stream,
+                    useEmbeddedColorManagement: false,
+                    validateImageData: true);
+                return new Bitmap(decoded);
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         public void UpdateBusyState(bool busy)
@@ -900,13 +926,12 @@ internal sealed class ExtensionsManagerForm : Form
 
             var letter = string.IsNullOrWhiteSpace(name) ? "E" : name.TrimStart()[0].ToString().ToUpperInvariant();
             using var textBrush = new SolidBrush(NativeUiTheme.Accent);
-            using var font = new Font("Segoe UI", 12f, FontStyle.Bold);
             using var sf = new StringFormat
             {
                 Alignment = StringAlignment.Center,
                 LineAlignment = StringAlignment.Center
             };
-            g.DrawString(letter, font, textBrush, ClientRectangle, sf);
+            g.DrawString(letter, FallbackIconFont, textBrush, ClientRectangle, sf);
         }
     }
 }

@@ -19,10 +19,29 @@ internal sealed class SearchSuggestionService
         Timeout = TimeSpan.FromMilliseconds(1200)
     };
 
+    private static readonly TimeSpan CacheDuration = TimeSpan.FromMinutes(10);
     private readonly ConcurrentDictionary<string, (DateTimeOffset FetchedAt, string[] Suggestions)> cache =
         new(StringComparer.OrdinalIgnoreCase);
 
     public static SearchSuggestionService Instance { get; } = new();
+
+    public bool TryGetCachedSuggestions(string? query, out IReadOnlyList<string> suggestions)
+    {
+        suggestions = Array.Empty<string>();
+        if (string.IsNullOrWhiteSpace(query)) return false;
+
+        var trimmed = TextSafety.RemoveUnpairedSurrogates(query.Trim());
+        if (trimmed.Length == 0 || trimmed.Length > 100) return false;
+
+        if (cache.TryGetValue(trimmed, out var cached)
+            && DateTimeOffset.UtcNow - cached.FetchedAt < CacheDuration)
+        {
+            suggestions = cached.Suggestions;
+            return true;
+        }
+
+        return false;
+    }
 
     public async Task<IReadOnlyList<string>> GetSearchSuggestionsAsync(
         string query,
@@ -33,7 +52,7 @@ internal sealed class SearchSuggestionService
         if (trimmed.Length == 0 || trimmed.Length > 100) return Array.Empty<string>();
 
         if (cache.TryGetValue(trimmed, out var cached)
-            && DateTimeOffset.UtcNow - cached.FetchedAt < TimeSpan.FromMinutes(10))
+            && DateTimeOffset.UtcNow - cached.FetchedAt < CacheDuration)
         {
             return cached.Suggestions;
         }
@@ -72,8 +91,34 @@ internal sealed class SearchSuggestionService
                     }
 
                     var results = list.ToArray();
-                    if (cache.Count > 150) cache.Clear();
-                    cache[trimmed] = (DateTimeOffset.UtcNow, results);
+                    var now = DateTimeOffset.UtcNow;
+                    if (cache.Count >= 150)
+                    {
+                        var cutoff = now - CacheDuration;
+                        var expiredKeys = new List<string>();
+                        foreach (var entry in cache)
+                        {
+                            if (entry.Value.FetchedAt < cutoff) expiredKeys.Add(entry.Key);
+                        }
+                        foreach (var key in expiredKeys) cache.TryRemove(key, out _);
+
+                        while (cache.Count >= 150)
+                        {
+                            string? oldestKey = null;
+                            var oldestTime = DateTimeOffset.MaxValue;
+                            foreach (var entry in cache)
+                            {
+                                if (entry.Value.FetchedAt < oldestTime)
+                                {
+                                    oldestTime = entry.Value.FetchedAt;
+                                    oldestKey = entry.Key;
+                                }
+                            }
+                            if (oldestKey is null) break;
+                            cache.TryRemove(oldestKey, out _);
+                        }
+                    }
+                    cache[trimmed] = (now, results);
                     return results;
                 }
             }

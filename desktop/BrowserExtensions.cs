@@ -88,6 +88,9 @@ internal sealed class BrowserExtensions
     private readonly string managedFolderPath;
     private readonly string registryPath;
     private static readonly object RegistrySync = new();
+    private long cachedRegistryLength = -1;
+    private long cachedRegistryLastWriteTicks = -1;
+    private Dictionary<string, ManagedBrowserExtension>? cachedRegistryRecords;
     private readonly SemaphoreSlim updateCheckGate = new(1, 1);
     private readonly Dictionary<string, CachedScript> scriptCache = new(StringComparer.OrdinalIgnoreCase);
 
@@ -1863,7 +1866,19 @@ internal sealed class BrowserExtensions
         {
             if (!File.Exists(registryPath))
             {
+                cachedRegistryRecords = null;
+                cachedRegistryLength = -1;
+                cachedRegistryLastWriteTicks = -1;
                 return new Dictionary<string, ManagedBrowserExtension>(StringComparer.OrdinalIgnoreCase);
+            }
+            var registryInfo = new FileInfo(registryPath);
+            if (cachedRegistryRecords is not null
+                && registryInfo.Length == cachedRegistryLength
+                && registryInfo.LastWriteTimeUtc.Ticks == cachedRegistryLastWriteTicks)
+            {
+                return new Dictionary<string, ManagedBrowserExtension>(
+                    cachedRegistryRecords,
+                    StringComparer.OrdinalIgnoreCase);
             }
             byte[] bytes;
             using (var stream = new FileStream(
@@ -1914,7 +1929,12 @@ internal sealed class BrowserExtensions
                     FolderPath = fullFolderPath
                 };
             }
-            return validRecords;
+            cachedRegistryLength = registryInfo.Length;
+            cachedRegistryLastWriteTicks = registryInfo.LastWriteTimeUtc.Ticks;
+            cachedRegistryRecords = validRecords;
+            return new Dictionary<string, ManagedBrowserExtension>(
+                validRecords,
+                StringComparer.OrdinalIgnoreCase);
         }
         catch (Exception error) when (error is IOException
             or UnauthorizedAccessException
@@ -1952,6 +1972,9 @@ internal sealed class BrowserExtensions
         {
             File.WriteAllBytes(temporaryPath, bytes);
             File.Move(temporaryPath, registryPath, overwrite: true);
+            cachedRegistryRecords = null;
+            cachedRegistryLength = -1;
+            cachedRegistryLastWriteTicks = -1;
         }
         finally
         {

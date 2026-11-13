@@ -142,7 +142,6 @@ public sealed class MainForm : Form
         CoreWebView2WebResourceRequestSourceKinds.SharedWorker
         | CoreWebView2WebResourceRequestSourceKinds.ServiceWorker;
     private static readonly string[] RequestSourceHeaderNames = ["Referer", "Origin"];
-    private static readonly Font TabCloseFont = new("Segoe UI", 10.5f);
 
     private readonly TableLayoutPanel rootLayout = new();
     private readonly TableLayoutPanel titleBar = new();
@@ -166,8 +165,8 @@ public sealed class MainForm : Form
     private readonly ChromeButton siteInfoButton = new();
     private readonly ChromeButton favoriteButton = new();
     private readonly ChromeButton downloadsButton = new();
-    private readonly Button newTabButton = new();
-    private readonly Button tabListButton = new();
+    private readonly ChromeButton newTabButton = new();
+    private readonly ChromeButton tabListButton = new();
     private readonly ChromeButton menuButton = new();
     private readonly WindowCaptionButton minimizeButton = new();
     private readonly WindowCaptionButton maximizeButton = new();
@@ -297,6 +296,9 @@ public sealed class MainForm : Form
     private FormWindowState normalWindowState;
     private Rectangle normalBounds;
     private FormWindowState lastNonMinimizedWindowState = FormWindowState.Normal;
+    private bool isInSizeMove;
+    private bool pendingPlacementSaveAfterSizeMove;
+    private (FormWindowState State, bool FullScreen, bool DomFullScreen)? lastAppliedWindowControlState;
     private string transientStatus = string.Empty;
     private string lastAnnouncedStatus = string.Empty;
     private string? lastRenderedStatusText;
@@ -630,7 +632,9 @@ public sealed class MainForm : Form
 
                 if (WindowState == FormWindowState.Minimized)
                 {
-                    WindowState = FormWindowState.Normal;
+                    WindowState = lastNonMinimizedWindowState == FormWindowState.Maximized
+                        ? FormWindowState.Maximized
+                        : FormWindowState.Normal;
                 }
                 if (!Visible) Show();
                 Activate();
@@ -689,6 +693,7 @@ public sealed class MainForm : Form
     {
         base.OnDpiChanged(e);
         UpdateChromeRowsForFullscreen();
+        UpdateResponsiveToolbar();
         UpdateFindBarLayout();
         ResizeTabHeaders();
         if (addressSuggestionPopup.Visible)
@@ -712,6 +717,22 @@ public sealed class MainForm : Form
             // Keep DefWindowProc's activation bookkeeping without letting it paint
             // a native inactive caption over the app-owned title bar.
             message.LParam = new IntPtr(-1);
+        }
+
+        if (message.Msg == NativeMethods.WmEnterSizeMove)
+        {
+            isInSizeMove = true;
+            pendingPlacementSaveAfterSizeMove = false;
+        }
+        else if (message.Msg == NativeMethods.WmExitSizeMove)
+        {
+            isInSizeMove = false;
+            if (pendingPlacementSaveAfterSizeMove)
+            {
+                pendingPlacementSaveAfterSizeMove = false;
+                TrackWindowPlacementChange();
+                ScheduleStateSave();
+            }
         }
 
         if (message.Msg == NativeMethods.WmNcCalcSize && message.WParam != IntPtr.Zero)
@@ -892,7 +913,11 @@ public sealed class MainForm : Form
             // Keep the actual tab headers in the client area so their mouse
             // events can start a reorder drag. Only the unused strip space
             // should behave like a draggable window caption.
-            return !tabs.Any(tab => IsPointInsideControl(tab.Header, screenPoint));
+            for (var index = 0; index < tabs.Count; index++)
+            {
+                if (IsPointInsideControl(tabs[index].Header, screenPoint)) return false;
+            }
+            return true;
         }
         return true;
     }
@@ -937,7 +962,16 @@ public sealed class MainForm : Form
         info.MaxPosition.X = monitorInfo.WorkArea.Left - monitorInfo.MonitorArea.Left;
         info.MaxPosition.Y = monitorInfo.WorkArea.Top - monitorInfo.MonitorArea.Top;
         info.MaxSize.X = monitorInfo.WorkArea.Right - monitorInfo.WorkArea.Left;
-        info.MaxSize.Y = monitorInfo.WorkArea.Bottom - monitorInfo.WorkArea.Top;
+        var maxHeight = monitorInfo.WorkArea.Bottom - monitorInfo.WorkArea.Top;
+        if (monitorInfo.WorkArea.Left == monitorInfo.MonitorArea.Left
+            && monitorInfo.WorkArea.Top == monitorInfo.MonitorArea.Top
+            && monitorInfo.WorkArea.Right == monitorInfo.MonitorArea.Right
+            && monitorInfo.WorkArea.Bottom == monitorInfo.MonitorArea.Bottom)
+        {
+            // Leave a 1px strip when WorkArea fills the monitor so an auto-hide taskbar can still appear.
+            maxHeight = Math.Max(1, maxHeight - 1);
+        }
+        info.MaxSize.Y = maxHeight;
         Marshal.StructureToPtr(info, minMaxInfoPointer, false);
     }
 
@@ -1105,7 +1139,7 @@ public sealed class MainForm : Form
         omniboxPanel.FocusBorderColor = palette.Focus;
         foreach (Control control in omniboxPanel.Controls)
         {
-            control.BackColor = palette.FieldSurface;
+            TrySetBackColor(control, Color.Transparent, palette.FieldSurface);
             control.ForeColor = palette.FieldText;
         }
         addressBar.BackColor = palette.FieldSurface;
@@ -1297,13 +1331,17 @@ public sealed class MainForm : Form
 
         ConfigureTitleBarButton(
             newTabButton,
-            "+",
+            string.Empty,
             isPrivateMode ? "New incognito tab (Ctrl+T)" : "New tab (Ctrl+T)",
             isPrivateMode ? "New incognito tab" : "New tab",
             14f);
+        newTabButton.IconKind = ChromeIconKind.NewTab;
+        newTabButton.CornerRadius = 9;
         newTabButton.Dock = DockStyle.None;
         newTabButton.Size = new Size(32, 32);
-        ConfigureTitleBarButton(tabListButton, "\u2304", "All tabs", "All tabs", 11f);
+        ConfigureTitleBarButton(tabListButton, string.Empty, "All tabs", "All tabs", 11f);
+        tabListButton.IconKind = ChromeIconKind.TabList;
+        tabListButton.CornerRadius = 9;
         ConfigureTitleBarButton(minimizeButton, string.Empty, "Minimize", "Minimize", 10f);
         minimizeButton.Glyph = CaptionGlyph.Minimize;
         ConfigureTitleBarButton(maximizeButton, string.Empty, "Maximize", "Maximize", 11f);
@@ -1348,8 +1386,16 @@ public sealed class MainForm : Form
     {
         toolbar.Dock = DockStyle.Fill;
         toolbar.Margin = Padding.Empty;
-        toolbar.Padding = new Padding(10, 5, 10, 5);
+        toolbar.Padding = new Padding(10, 5, 10, 6);
         toolbar.BackColor = ToolbarColor;
+        toolbar.Paint += (_, e) =>
+        {
+            if (IsHighContrastActive || toolbar.Width <= 2 || toolbar.Height <= 2) return;
+            using var topRim = new Pen(Color.FromArgb(32, 255, 232, 248), 1f);
+            e.Graphics.DrawLine(topRim, 0, 0, toolbar.Width - 1, 0);
+            using var bottomSep = new Pen(Color.FromArgb(62, 255, 224, 245), 1f);
+            e.Graphics.DrawLine(bottomSep, 0, toolbar.Height - 1, toolbar.Width - 1, toolbar.Height - 1);
+        };
         toolbar.RowCount = 1;
         toolbar.ColumnCount = 8;
         toolbar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -1380,7 +1426,9 @@ public sealed class MainForm : Form
         homeButton.IconKind = ChromeIconKind.Home;
         menuButton.IconKind = ChromeIconKind.Menu;
         siteInfoButton.IconKind = ChromeIconKind.SiteInfo;
+        siteInfoButton.IsOmniboxEmbedded = true;
         favoriteButton.IconKind = ChromeIconKind.Favorite;
+        favoriteButton.IsOmniboxEmbedded = true;
         downloadsButton.IconKind = ChromeIconKind.Downloads;
         reloadButton.GlyphState = "reload";
         siteInfoButton.GlyphState = "unknown";
@@ -1447,18 +1495,18 @@ public sealed class MainForm : Form
         omniboxPanel.FillColor = OmniboxColor;
         omniboxPanel.BorderColor = NativeUiTheme.Border;
         omniboxPanel.FocusBorderColor = OmniboxFocusColor;
-        omniboxPanel.CornerRadius = 11;
-        omniboxPanel.Padding = new Padding(1);
+        omniboxPanel.CornerRadius = 15;
+        omniboxPanel.Padding = new Padding(2);
 
         var omniboxLayout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             Margin = Padding.Empty,
             Padding = new Padding(3, 0, 3, 0),
-            BackColor = OmniboxColor,
             ColumnCount = 4,
             RowCount = 1
         };
+        TrySetBackColor(omniboxLayout, Color.Transparent, OmniboxColor);
         omniboxLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         omniboxLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 32));
         omniboxLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -1752,10 +1800,13 @@ public sealed class MainForm : Form
             UpdateResponsiveToolbar();
             PositionAddressSuggestions();
         };
-        SizeChanged += (_, _) => UpdateWindowControls();
-        SizeChanged += (_, _) => PositionAddressSuggestions();
-        SizeChanged += (_, _) => TrackWindowPlacementChange();
-        SizeChanged += (_, _) => RunUiTask(HandleWindowStateChangeAsync, "Could not change tab power state");
+        SizeChanged += (_, _) =>
+        {
+            UpdateWindowControls();
+            PositionAddressSuggestions();
+            TrackWindowPlacementChange();
+            RunUiTask(HandleWindowStateChangeAsync, "Could not change tab power state");
+        };
         LocationChanged += (_, _) => TrackWindowPlacementChange();
         SystemEvents.UserPreferenceChanged += OnSystemPreferenceChanged;
     }
@@ -2155,9 +2206,12 @@ public sealed class MainForm : Form
     /// </summary>
     internal const string DisableGpuRasterizationVariable = "MISHAWEB_DISABLE_GPU_RASTERIZATION";
 
+    private static readonly string? InitialExternalBrowserArguments =
+        Environment.GetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
+
     private static CoreWebView2EnvironmentOptions CreateEnvironmentOptions()
     {
-        var extraArgs = Environment.GetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
+        var extraArgs = InitialExternalBrowserArguments;
         // These three flags route all raster work into the WebView2 GPU process,
         // which holds roughly 90% of the private commit measured by the memory
         // acceptance probe. They are a memory/render trade-off, so keep them
@@ -3435,16 +3489,25 @@ public sealed class MainForm : Form
                 Bounds = Screen.FromControl(this).Bounds;
             }
         }
-        else if (hasDomFullScreenWindowState && !isFullScreen)
+        else if (hasDomFullScreenWindowState)
         {
-            Bounds = normalBoundsBeforeDomFullScreen;
-            WindowState = normalWindowStateBeforeDomFullScreen;
+            if (!isFullScreen)
+            {
+                Bounds = normalBoundsBeforeDomFullScreen;
+                WindowState = normalWindowStateBeforeDomFullScreen;
+            }
+            else
+            {
+                normalBounds = normalBoundsBeforeDomFullScreen;
+                normalWindowState = normalWindowStateBeforeDomFullScreen;
+            }
             hasDomFullScreenWindowState = false;
         }
 
         isDomFullScreen = value;
         if (!value) findBar.Visible = findBarWasVisibleBeforeDomFullScreen;
         UpdateChromeRowsForFullscreen();
+        UpdateWindowControls();
     }
 
     private void ExitDomFullScreen()
@@ -3647,7 +3710,9 @@ public sealed class MainForm : Form
     {
         if (!adBlockEnabled || isClosing || tab.IsClosed) return;
 
-        var topLevelUrl = tab.Core?.Source ?? tab.Url;
+        var topLevelUrl = !string.IsNullOrEmpty(tab.Url) && !tab.IsStartPage
+            ? tab.Url
+            : (tab.Core?.Source ?? tab.Url);
         var documentSource = (e.RequestedSourceKind & DocumentRequestSources) != 0;
         var workerSource = (e.RequestedSourceKind & WorkerRequestSources) != 0;
         var sourceUrl = GetAdBlockSourceUrl(
@@ -4537,12 +4602,18 @@ public sealed class MainForm : Form
             : CreateCosmeticStyleScript(css, pageUrl));
     }
 
+    private static string? lastCosmeticCssSource;
+    private static string? lastSerializedCosmeticCss;
+
     private static string CreateCosmeticStyleScript(
         string css,
         string pageUrl,
         bool requireMatchingHost = true)
     {
-        var serializedCss = JsonSerializer.Serialize(css);
+        var serializedCss = ReferenceEquals(css, lastCosmeticCssSource)
+            || string.Equals(css, lastCosmeticCssSource, StringComparison.Ordinal)
+            ? lastSerializedCosmeticCss!
+            : (lastSerializedCosmeticCss = JsonSerializer.Serialize(lastCosmeticCssSource = css));
         var serializedPageUrl = JsonSerializer.Serialize(pageUrl);
         // The guard used to compare the full URL, so a client-side redirect or a
         // History API rewrite before DOMContentLoaded silently dropped the whole
@@ -5585,6 +5656,21 @@ public sealed class MainForm : Form
 
         if (links.Count < maximumLinks)
         {
+            var seenRecentHosts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var history in state.History)
+            {
+                if (!Uri.TryCreate(history.Url, UriKind.Absolute, out var hostUri)) continue;
+                var host = hostUri.Host.StartsWith("www.", StringComparison.OrdinalIgnoreCase)
+                    ? hostUri.Host[4..]
+                    : hostUri.Host;
+                if (!seenRecentHosts.Add(host)) continue;
+                AddLink(history.Title, history.Url, "Recent");
+                if (links.Count >= maximumLinks) break;
+            }
+        }
+
+        if (links.Count < maximumLinks)
+        {
             foreach (var history in state.History)
             {
                 AddLink(history.Title, history.Url, "Recent");
@@ -5708,6 +5794,7 @@ public sealed class MainForm : Form
         bool restoreDiscarded = true)
     {
         if (tab.IsClosed || !tabs.Contains(tab)) return;
+        tab.BackgroundReductionGeneration++;
         var previousTab = activeTab != tab ? activeTab : null;
         if (previousTab is not null)
         {
@@ -6064,17 +6151,18 @@ public sealed class MainForm : Form
 
         ApplyLiveTabMemoryTarget(tab, foreground: false);
         RefreshMemorySweepTimer();
+        var reductionGeneration = ++tab.BackgroundReductionGeneration;
         RunUiTask(
             async () =>
             {
                 await Task.Delay(2500);
-                if (isClosing || tab.IsClosed || (tab == activeTab && !isWindowMinimized)) return;
+                if (isClosing || tab.IsClosed || tab.BackgroundReductionGeneration != reductionGeneration || (tab == activeTab && !isWindowMinimized)) return;
                 CompactBackgroundTabMemory(tab);
 
                 var mode = TabLifecyclePolicy.ResolveMode(memorySaverEnabled, ultraLightEnabled);
                 if (mode != TabLifecycleMode.Ultra) return;
                 await Task.Delay(2500);
-                if (isClosing || tab.IsClosed || (tab == activeTab && !isWindowMinimized)) return;
+                if (isClosing || tab.IsClosed || tab.BackgroundReductionGeneration != reductionGeneration || (tab == activeTab && !isWindowMinimized)) return;
                 var currentMode = TabLifecyclePolicy.ResolveMode(memorySaverEnabled, ultraLightEnabled);
                 if (currentMode != TabLifecycleMode.Ultra) return;
                 var suspended = await TrySuspendTabAsync(
@@ -6098,14 +6186,6 @@ public sealed class MainForm : Form
             return;
         }
 
-        if (!IsTabAudible(tab) && tab.ActiveDownloads == 0 && tab.Core is { } core)
-        {
-            try
-            {
-                _ = core.ExecuteScriptAsync("try { window.gc && window.gc(); } catch (_) {}");
-            }
-            catch { }
-        }
         SystemResourceInfo.TrimCurrentProcessWorkingSet();
     }
 
@@ -6381,28 +6461,16 @@ public sealed class MainForm : Form
         }
     }
 
-    private void TrimAllProcessMemory()
+    private void TrimAllProcessMemory(bool includeActiveForeground = false)
     {
         if (isClosing) return;
         try
         {
-            foreach (var tab in tabs)
-            {
-                if (!tab.IsClosed && tab.Core is { } core)
-                {
-                    try
-                    {
-                        _ = core.ExecuteScriptAsync("try { window.gc && window.gc(); } catch (_) {}");
-                    }
-                    catch
-                    {
-                        // Ignore COM or lifecycle errors
-                    }
-                }
-            }
-
             GC.Collect(2, GCCollectionMode.Optimized, blocking: false);
-            SystemResourceInfo.TrimCurrentProcessWorkingSet();
+            if (includeActiveForeground || isWindowMinimized)
+            {
+                SystemResourceInfo.TrimCurrentProcessWorkingSet();
+            }
             if (environment is not null)
             {
                 try
@@ -6412,27 +6480,13 @@ public sealed class MainForm : Form
                     {
                         foreach (var processInfo in processInfos)
                         {
-                            SystemResourceInfo.TrimProcessWorkingSet(processInfo.ProcessId);
-                            if (processInfo.Kind == CoreWebView2ProcessKind.Renderer)
+                            if (!includeActiveForeground
+                                && !isWindowMinimized
+                                && processInfo.Kind == CoreWebView2ProcessKind.Gpu)
                             {
-                                try
-                                {
-                                    using var proc = Process.GetProcessById(processInfo.ProcessId);
-                                    if (proc.PrivateMemorySize64 > MaxInactiveRendererPrivateBytes)
-                                    {
-                                        foreach (var tab in tabs)
-                                        {
-                                            if (!tab.IsClosed && tab.Core is { } core)
-                                            {
-                                                _ = core.ExecuteScriptAsync("try { window.gc && window.gc({type:'major',execution:'sync'}); } catch (_) {}");
-                                            }
-                                        }
-                                    }
-                                }
-                                catch
-                                {
-                                }
+                                continue;
                             }
+                            SystemResourceInfo.TrimProcessWorkingSet(processInfo.ProcessId);
                         }
                     }
                 }
@@ -6624,7 +6678,8 @@ public sealed class MainForm : Form
         return tab.PendingMediaPermissionRefreshes > 0
             || tab.PendingMediaPermissionRequests > 0
             || CommunicationCompatibilityPolicy.IsCallSite(effectiveUrl)
-            || IsYouTubeWatchUrl(effectiveUrl)
+            || (IsYouTubeWatchUrl(effectiveUrl)
+                && (tab.IsLoading || tab.IsInitializing || tab.IsAudible))
             || CommunicationCompatibilityPolicy.ShouldProtectBackgroundTab(
                 tab.KeepAwake,
                 tab.MicrophoneAccessGranted,
@@ -6672,6 +6727,7 @@ public sealed class MainForm : Form
 
         if (minimized)
         {
+            CancelTabDrag();
             var minimizingTab = activeTab;
             if (minimizingTab?.View is not null) minimizingTab.View.Visible = false;
             if (minimizingTab?.StartPageView is not null)
@@ -6694,7 +6750,7 @@ public sealed class MainForm : Form
                     expectedMode: mode);
                 if (!suspended) TryDiscardTabAfterFailedSuspend(minimizingTab);
             }
-            TrimAllProcessMemory();
+            TrimAllProcessMemory(includeActiveForeground: true);
             RefreshMemorySweepTimer();
             return;
         }
@@ -9795,9 +9851,46 @@ public sealed class MainForm : Form
         ScheduleStateSave();
     }
 
+    private static void ClearAndDisposeMenuItems(ToolStripItemCollection items, int startIndex = 0)
+    {
+        for (var index = items.Count - 1; index >= startIndex; index--)
+        {
+            var item = items[index];
+            items.RemoveAt(index);
+            if (item is ToolStripDropDownItem dropDownItem && dropDownItem.HasDropDownItems)
+            {
+                ClearAndDisposeMenuItems(dropDownItem.DropDownItems);
+            }
+            var image = item.Image;
+            if (image is not null)
+            {
+                item.Image = null;
+                image.Dispose();
+            }
+            item.Dispose();
+        }
+    }
+
+    private static Bitmap? TryLoadUnlockedBitmap(string filePath)
+    {
+        try
+        {
+            using var stream = File.OpenRead(filePath);
+            using var decoded = Image.FromStream(
+                stream,
+                useEmbeddedColorManagement: false,
+                validateImageData: true);
+            return new Bitmap(decoded);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private void ShowTabListMenu()
     {
-        tabListMenu.Items.Clear();
+        ClearAndDisposeMenuItems(tabListMenu.Items);
         var searchBox = new ToolStripTextBox
         {
             AutoSize = false,
@@ -9811,7 +9904,7 @@ public sealed class MainForm : Form
 
         void Populate(string query)
         {
-            while (tabListMenu.Items.Count > 2) tabListMenu.Items.RemoveAt(2);
+            ClearAndDisposeMenuItems(tabListMenu.Items, startIndex: 2);
             var matchingTabs = query.Length == 0
                 ? tabs.ToArray()
                 : CommandRankingEngine.Rank(
@@ -9861,7 +9954,7 @@ public sealed class MainForm : Form
         extensionsMenuItem.ToolTipText = isPrivateMode
             ? "Extensions are unavailable in private windows"
             : "Install and manage browser extensions";
-        extensionsMenuItem.DropDownItems.Clear();
+        ClearAndDisposeMenuItems(extensionsMenuItem.DropDownItems);
         var manageItem = new ToolStripMenuItem("Manage extensions…")
         {
             ToolTipText = "Open the extensions manager"
@@ -9885,7 +9978,7 @@ public sealed class MainForm : Form
                         var iconFullPath = Path.Combine(ext.FolderPath, ext.IconPath.Replace('/', Path.DirectorySeparatorChar));
                         if (File.Exists(iconFullPath))
                         {
-                            try { icon = Image.FromFile(iconFullPath); } catch { }
+                            icon = TryLoadUnlockedBitmap(iconFullPath);
                         }
                     }
                     var extItem = new ToolStripMenuItem(TrimMenuText(ext.Name, 42), icon);
@@ -9930,7 +10023,7 @@ public sealed class MainForm : Form
             }
         }
         PopulateSearchProviderMenu();
-        favoritesMenu.DropDownItems.Clear();
+        ClearAndDisposeMenuItems(favoritesMenu.DropDownItems);
         if (state.Bookmarks.Count == 0)
         {
             favoritesMenu.DropDownItems.Add(new ToolStripMenuItem("No favorites yet") { Enabled = false });
@@ -9950,7 +10043,7 @@ public sealed class MainForm : Form
         favoritesMenu.DropDownItems.Add(new ToolStripSeparator());
         favoritesMenu.DropDownItems.Add("Add or remove this page", null, (_, _) => ToggleFavorite());
 
-        historyMenu.DropDownItems.Clear();
+        ClearAndDisposeMenuItems(historyMenu.DropDownItems);
         if (state.History.Count == 0)
         {
             historyMenu.DropDownItems.Add(new ToolStripMenuItem("No browsing history") { Enabled = false });
@@ -9977,7 +10070,7 @@ public sealed class MainForm : Form
             });
         }
 
-        downloadsMenu.DropDownItems.Clear();
+        ClearAndDisposeMenuItems(downloadsMenu.DropDownItems);
         if (downloads.Count == 0)
         {
             downloadsMenu.DropDownItems.Add(new ToolStripMenuItem("No downloads this session") { Enabled = false });
@@ -10019,7 +10112,7 @@ public sealed class MainForm : Form
         downloadsMenu.DropDownItems.Add(new ToolStripSeparator());
         downloadsMenu.DropDownItems.Add("Open Downloads folder", null, (_, _) => OpenDownloadsFolder());
 
-        zoomMenu.DropDownItems.Clear();
+        ClearAndDisposeMenuItems(zoomMenu.DropDownItems);
         zoomMenu.DropDownItems.Add("Zoom out", null, (_, _) => ChangeZoom(-0.10));
         zoomMenu.DropDownItems.Add("Reset to 100%", null, (_, _) => ChangeZoom(0, true));
         zoomMenu.DropDownItems.Add("Zoom in", null, (_, _) => ChangeZoom(0.10));
@@ -11870,46 +11963,62 @@ public sealed class MainForm : Form
 
         lastAddressSuggestionInput = query;
         var localSuggestions = AddressSuggestionEngine.GetSuggestions(query, state);
-        addressSuggestionPopup.SetSuggestions(localSuggestions);
-        PositionAddressSuggestions(suggestionAnchor);
 
         liveSuggestionCts?.Cancel();
         liveSuggestionCts?.Dispose();
         liveSuggestionCts = null;
 
-        var targetAnchor = suggestionAnchor;
-        var cts = new CancellationTokenSource();
-        liveSuggestionCts = cts;
-
-        _ = Task.Run(async () =>
+        if (!isPrivateMode && !BrowserPolicy.IsRecognizedAddressInput(query))
         {
-            try
+            if (SearchSuggestionService.Instance.TryGetCachedSuggestions(query, out var cachedLiveQueries))
             {
-                var liveQueries = await SearchSuggestionService.Instance.GetSearchSuggestionsAsync(query, cts.Token).ConfigureAwait(false);
-                if (cts.Token.IsCancellationRequested || isClosing) return;
+                var merged = AddressSuggestionEngine.MergeWithLiveSearch(localSuggestions, cachedLiveQueries, query, state);
+                addressSuggestionPopup.SetSuggestions(merged);
+                PositionAddressSuggestions(suggestionAnchor);
+                return;
+            }
 
-                if (!IsHandleCreated || IsDisposed) return;
-                BeginInvoke(() =>
-                {
-                    if (cts.Token.IsCancellationRequested || isClosing || IsDisposed) return;
-                    if (lastAddressSuggestionInput != query) return;
-                    var currentlyActive = (addressBarEditing && addressBar.Focused)
-                        || (smartSearchBarEditing && activeSmartSearchBar is not null && activeSmartSearchBar.InputControl.Focused);
-                    if (!currentlyActive) return;
+            addressSuggestionPopup.SetSuggestions(localSuggestions);
+            PositionAddressSuggestions(suggestionAnchor);
 
-                    var merged = AddressSuggestionEngine.MergeWithLiveSearch(localSuggestions, liveQueries, query, state);
-                    addressSuggestionPopup.SetSuggestions(merged);
-                    PositionAddressSuggestions(targetAnchor);
-                });
-            }
-            catch (OperationCanceledException)
-            {
-            }
-            catch (Exception error)
-            {
-                stateStore.Log("Live search suggestions error", error);
-            }
-        });
+            var targetAnchor = suggestionAnchor;
+            var cts = new CancellationTokenSource();
+            liveSuggestionCts = cts;
+            _ = FetchLiveSearchSuggestionsAsync(query, localSuggestions, targetAnchor, cts.Token);
+            return;
+        }
+
+        addressSuggestionPopup.SetSuggestions(localSuggestions);
+        PositionAddressSuggestions(suggestionAnchor);
+    }
+
+    private async Task FetchLiveSearchSuggestionsAsync(
+        string query,
+        IReadOnlyList<AddressSuggestion> localSuggestions,
+        Control? targetAnchor,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var liveQueries = await SearchSuggestionService.Instance.GetSearchSuggestionsAsync(query, cancellationToken);
+            if (cancellationToken.IsCancellationRequested || isClosing || IsDisposed) return;
+            if (lastAddressSuggestionInput != query) return;
+
+            var currentlyActive = (addressBarEditing && addressBar.Focused)
+                || (smartSearchBarEditing && activeSmartSearchBar is not null && activeSmartSearchBar.InputControl.Focused);
+            if (!currentlyActive) return;
+
+            var merged = AddressSuggestionEngine.MergeWithLiveSearch(localSuggestions, liveQueries, query, state);
+            addressSuggestionPopup.SetSuggestions(merged);
+            PositionAddressSuggestions(targetAnchor);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception error)
+        {
+            stateStore.Log("Live search suggestions error", error);
+        }
     }
 
     private void QueueAddressSuggestions(string? input = null, Control? anchor = null)
@@ -12298,7 +12407,14 @@ public sealed class MainForm : Form
         }
         if (keyData == Keys.F11)
         {
-            ToggleFullScreen();
+            if (isDomFullScreen && !isFullScreen)
+            {
+                ExitDomFullScreen();
+            }
+            else
+            {
+                ToggleFullScreen();
+            }
             return true;
         }
         if (keyData == Keys.Escape)
@@ -12778,37 +12894,48 @@ public sealed class MainForm : Form
             minimumTabWidth,
             ScaleChromeLogical(220));
         var contentWidth = tabStrip.Padding.Horizontal;
-        foreach (var tab in tabs)
+        var isMaximized = WindowState == FormWindowState.Maximized;
+        tabStrip.SuspendLayout();
+        try
         {
-            var headerWidth = tab.IsPinned
-                ? Math.Clamp(
-                    Math.Min(width, ScaleChromeLogical(124)),
-                    ScaleChromeLogical(92),
-                    ScaleChromeLogical(124))
-                : width;
-            tab.Header.Width = headerWidth;
-            contentWidth += headerWidth + tab.Header.Margin.Horizontal;
+            foreach (var tab in tabs)
+            {
+                var headerWidth = tab.IsPinned
+                    ? Math.Clamp(
+                        Math.Min(width, ScaleChromeLogical(124)),
+                        ScaleChromeLogical(92),
+                        ScaleChromeLogical(124))
+                    : width;
+                tab.Header.Width = headerWidth;
+                tab.Header.Height = stripHeight;
+                tab.Header.SetMaximized(isMaximized);
+                contentWidth += headerWidth + tab.Header.Margin.Horizontal;
+            }
+            var stripWidth = Math.Min(contentWidth, availableWidth);
+            var overflowing = contentWidth > availableWidth;
+            tabStrip.AutoScrollMinSize = overflowing
+                ? new Size(contentWidth, 0)
+                : Size.Empty;
+            if (!overflowing) tabStrip.AutoScrollPosition = Point.Empty;
+            // Keep the native horizontal bar clipped just below the custom title
+            // row. Wheel scrolling and active-tab reveal remain available without
+            // adding a heavyweight second chrome row.
+            var stripControlHeight = stripHeight
+                + (overflowing ? SystemInformation.HorizontalScrollBarHeight : 0);
+            tabStrip.SetBounds(0, 0, stripWidth, stripControlHeight);
+            newTabButton.SetBounds(stripWidth, 0, newTabWidth, stripHeight);
+            newTabButton.BringToFront();
+            tabStrip.AccessibleDescription = overflowing
+                ? "Open tabs. Use the mouse wheel or keyboard shortcuts to reach tabs outside the visible strip."
+                : "Open tabs";
+            if (overflowing && activeTab?.Header.Parent == tabStrip)
+            {
+                tabStrip.ScrollControlIntoView(activeTab.Header);
+            }
         }
-        var stripWidth = Math.Min(contentWidth, availableWidth);
-        var overflowing = contentWidth > availableWidth;
-        tabStrip.AutoScrollMinSize = overflowing
-            ? new Size(contentWidth, 0)
-            : Size.Empty;
-        if (!overflowing) tabStrip.AutoScrollPosition = Point.Empty;
-        // Keep the native horizontal bar clipped just below the custom title
-        // row. Wheel scrolling and active-tab reveal remain available without
-        // adding a heavyweight second chrome row.
-        var stripControlHeight = stripHeight
-            + (overflowing ? SystemInformation.HorizontalScrollBarHeight : 0);
-        tabStrip.SetBounds(0, 0, stripWidth, stripControlHeight);
-        newTabButton.SetBounds(stripWidth, 0, newTabWidth, stripHeight);
-        newTabButton.BringToFront();
-        tabStrip.AccessibleDescription = overflowing
-            ? "Open tabs. Use the mouse wheel or keyboard shortcuts to reach tabs outside the visible strip."
-            : "Open tabs";
-        if (overflowing && activeTab?.Header.Parent == tabStrip)
+        finally
         {
-            tabStrip.ScrollControlIntoView(activeTab.Header);
+            tabStrip.ResumeLayout(true);
         }
         if (draggedTab is not null)
         {
@@ -12831,29 +12958,37 @@ public sealed class MainForm : Form
     private void UpdateResponsiveToolbar()
     {
         if (toolbar.ColumnStyles.Count < 8) return;
-        var width = toolbar.ClientSize.Width;
-        SetToolbarColumnVisibility(3, width >= ScaleToolbarLogical(560), ScaleToolbarLogical(36));
-        SetToolbarColumnVisibility(6, downloadsButtonAutoVisible, ScaleToolbarLogical(38));
-        // GetControlFromPosition can omit a control that started hidden; keep
-        // the download action explicitly synchronized with its reserved cell.
-        downloadsButton.Visible = downloadsButtonAutoVisible;
-
-        var fixedWidth = toolbar.Padding.Horizontal;
-        foreach (var column in new[] { 0, 1, 2, 3, 6, 7 })
+        toolbar.SuspendLayout();
+        try
         {
-            fixedWidth += (int)Math.Ceiling(toolbar.ColumnStyles[column].Width);
-        }
+            var width = toolbar.ClientSize.Width;
+            SetToolbarColumnVisibility(3, width >= ScaleToolbarLogical(560), ScaleToolbarLogical(36));
+            SetToolbarColumnVisibility(6, downloadsButtonAutoVisible, ScaleToolbarLogical(38));
+            // GetControlFromPosition can omit a control that started hidden; keep
+            // the download action explicitly synchronized with its reserved cell.
+            downloadsButton.Visible = downloadsButtonAutoVisible;
 
-        // Keep hover/status geometry stable. Text is ellipsized inside one
-        // fixed column, so frequent link changes never trigger measurement or
-        // toolbar column churn.
-        var preferredStatusWidth = ScaleToolbarLogical(MaximumToolbarStatusWidth);
-        var statusVisible = statusLabel.Text.Length > 0
-            && width - fixedWidth - preferredStatusWidth >= ScaleToolbarLogical(MinimumToolbarOmniboxWidth) + omniboxPanel.Margin.Horizontal;
-        var statusColumn = toolbar.ColumnStyles[5];
-        statusColumn.SizeType = SizeType.Absolute;
-        statusColumn.Width = statusVisible ? preferredStatusWidth : 0;
-        statusLabel.Visible = statusVisible;
+            var fixedWidth = toolbar.Padding.Horizontal;
+            foreach (var column in new[] { 0, 1, 2, 3, 6, 7 })
+            {
+                fixedWidth += (int)Math.Ceiling(toolbar.ColumnStyles[column].Width);
+            }
+
+            // Keep hover/status geometry stable. Text is ellipsized inside one
+            // fixed column, so frequent link changes never trigger measurement or
+            // toolbar column churn.
+            var preferredStatusWidth = ScaleToolbarLogical(MaximumToolbarStatusWidth);
+            var statusVisible = statusLabel.Text.Length > 0
+                && width - fixedWidth - preferredStatusWidth >= ScaleToolbarLogical(MinimumToolbarOmniboxWidth) + omniboxPanel.Margin.Horizontal;
+            var statusColumn = toolbar.ColumnStyles[5];
+            statusColumn.SizeType = SizeType.Absolute;
+            statusColumn.Width = statusVisible ? preferredStatusWidth : 0;
+            statusLabel.Visible = statusVisible;
+        }
+        finally
+        {
+            toolbar.ResumeLayout(true);
+        }
     }
 
     private int ScaleToolbarLogical(int logicalPixels)
@@ -12871,25 +13006,33 @@ public sealed class MainForm : Form
     private void UpdateFindBarLayout()
     {
         if (findBar.ColumnStyles.Count < 5) return;
-        var width = Math.Max(1, findBar.ClientSize.Width);
-        var buttonWidth = ScaleChromeLogical(36);
-        var matchWidth = ScaleChromeLogical(width >= ScaleChromeLogical(640) ? 110 : 72);
-        var rightPadding = ScaleChromeLogical(10);
-        var preferredLeft = width >= ScaleChromeLogical(900)
-            ? ScaleChromeLogical(244)
-            : width >= ScaleChromeLogical(700) ? ScaleChromeLogical(120) : ScaleChromeLogical(12);
-        var minimumInput = ScaleChromeLogical(120);
-        var fixedControls = matchWidth + (buttonWidth * 3) + rightPadding;
-        var leftPadding = Math.Min(
-            preferredLeft,
-            Math.Max(ScaleChromeLogical(4), width - fixedControls - minimumInput));
-        findBar.Padding = new Padding(
-            leftPadding,
-            ScaleChromeLogical(5),
-            rightPadding,
-            ScaleChromeLogical(5));
-        findBar.ColumnStyles[1].Width = matchWidth;
-        for (var index = 2; index <= 4; index++) findBar.ColumnStyles[index].Width = buttonWidth;
+        findBar.SuspendLayout();
+        try
+        {
+            var width = Math.Max(1, findBar.ClientSize.Width);
+            var buttonWidth = ScaleChromeLogical(36);
+            var matchWidth = ScaleChromeLogical(width >= ScaleChromeLogical(640) ? 110 : 72);
+            var rightPadding = ScaleChromeLogical(10);
+            var preferredLeft = width >= ScaleChromeLogical(900)
+                ? ScaleChromeLogical(244)
+                : width >= ScaleChromeLogical(700) ? ScaleChromeLogical(120) : ScaleChromeLogical(12);
+            var minimumInput = ScaleChromeLogical(120);
+            var fixedControls = matchWidth + (buttonWidth * 3) + rightPadding;
+            var leftPadding = Math.Min(
+                preferredLeft,
+                Math.Max(ScaleChromeLogical(4), width - fixedControls - minimumInput));
+            findBar.Padding = new Padding(
+                leftPadding,
+                ScaleChromeLogical(5),
+                rightPadding,
+                ScaleChromeLogical(5));
+            findBar.ColumnStyles[1].Width = matchWidth;
+            for (var index = 2; index <= 4; index++) findBar.ColumnStyles[index].Width = buttonWidth;
+        }
+        finally
+        {
+            findBar.ResumeLayout(true);
+        }
     }
 
     private void SetToolbarColumnVisibility(int column, bool visible, float expandedWidth)
@@ -12912,6 +13055,10 @@ public sealed class MainForm : Form
 
     private void UpdateWindowControls()
     {
+        var currentState = (WindowState, isFullScreen, isDomFullScreen);
+        if (lastAppliedWindowControlState == currentState) return;
+        lastAppliedWindowControlState = currentState;
+
         var isMaximized = WindowState == FormWindowState.Maximized;
         maximizeButton.Glyph = isMaximized ? CaptionGlyph.Restore : CaptionGlyph.Maximize;
         maximizeButton.Invalidate();
@@ -12919,6 +13066,12 @@ public sealed class MainForm : Form
         maximizeButton.AccessibleDescription = maximizeButton.AccessibleName;
         toolTip.SetToolTip(maximizeButton, maximizeButton.AccessibleName);
         Padding = isMaximized || isFullScreen || isDomFullScreen ? Padding.Empty : new Padding(1);
+        var nextTitleBarPadding = isMaximized ? new Padding(6, 0, 0, 4) : new Padding(6, 4, 0, 4);
+        if (titleBar.Padding != nextTitleBarPadding)
+        {
+            titleBar.Padding = nextTitleBarPadding;
+            ResizeTabHeaders();
+        }
     }
 
     private void ToggleMaximizeRestore()
@@ -13028,8 +13181,17 @@ public sealed class MainForm : Form
         isFullScreen = !isFullScreen;
         if (isFullScreen)
         {
-            normalWindowState = WindowState;
-            normalBounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+            if (hasDomFullScreenWindowState)
+            {
+                normalWindowState = normalWindowStateBeforeDomFullScreen;
+                normalBounds = normalBoundsBeforeDomFullScreen;
+                hasDomFullScreenWindowState = false;
+            }
+            else
+            {
+                normalWindowState = WindowState;
+                normalBounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+            }
             findBarWasVisibleBeforeFullScreen = findBar.Visible;
             WindowState = FormWindowState.Normal;
             Padding = Padding.Empty;
@@ -13046,6 +13208,7 @@ public sealed class MainForm : Form
         }
 
         UpdateChromeRowsForFullscreen();
+        UpdateWindowControls();
         ScheduleStateSave();
     }
 
@@ -13079,6 +13242,11 @@ public sealed class MainForm : Form
             }
         }
 
+        if (isInSizeMove)
+        {
+            pendingPlacementSaveAfterSizeMove = true;
+            return;
+        }
         ScheduleStateSave();
     }
 
@@ -13190,7 +13358,6 @@ public sealed class MainForm : Form
 
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
     {
-        try { System.IO.File.WriteAllText("form_closing.log", $"{e.CloseReason}\n{Environment.StackTrace}"); } catch { }
         if (isClosing) return;
 
         if (Volatile.Read(ref activeExtensionMutationCount) > 0)
@@ -13654,7 +13821,9 @@ public sealed class MainForm : Form
         SiteInfo,
         Favorite,
         Downloads,
-        Menu
+        Menu,
+        NewTab,
+        TabList
     }
 
     private sealed class ChromeButton : Button
@@ -13705,6 +13874,7 @@ public sealed class MainForm : Form
         }
         public int CornerRadius { get; set; } = 10;
         public bool HighContrast { get; set; }
+        public bool IsOmniboxEmbedded { get; set; }
 
         protected override void OnTextChanged(EventArgs e)
         {
@@ -13780,28 +13950,85 @@ public sealed class MainForm : Form
                 0.5f,
                 Math.Max(1, Width - 1f),
                 Math.Max(1, Height - 1f));
-            using var surfacePath = CreateRoundedPath(surfaceBounds, Scale(CornerRadius));
-            var highlighted = HighContrast && Enabled && (isPressed || isHovered);
-            var surfaceColor = !Enabled
-                ? Color.Transparent
-                : highlighted ? SystemColors.Highlight
-                : isPressed ? PressedSurfaceColor
-                : isHovered ? HoverSurfaceColor
-                : HighContrast ? Color.Transparent : Color.FromArgb(18, 255, 255, 255);
-            if (surfaceColor.A > 0)
+            if (IsOmniboxEmbedded)
             {
-                using var surface = new SolidBrush(surfaceColor);
-                e.Graphics.FillPath(surface, surfacePath);
+                surfaceBounds.Inflate(-2f, -2f);
+            }
+            using var surfacePath = CreateRoundedPath(surfaceBounds, Scale(IsOmniboxEmbedded ? Math.Min(CornerRadius, 8) : CornerRadius));
+            var highlighted = HighContrast && Enabled && (isPressed || isHovered);
+            if (HighContrast)
+            {
+                if (highlighted)
+                {
+                    using var hcFill = new SolidBrush(SystemColors.Highlight);
+                    e.Graphics.FillPath(hcFill, surfacePath);
+                }
+            }
+            else if (IsOmniboxEmbedded)
+            {
+                if (Enabled && (isPressed || isHovered))
+                {
+                    using var pillBrush = new LinearGradientBrush(
+                        surfaceBounds,
+                        Color.FromArgb(isPressed ? 168 : 112, 128, 52, 106),
+                        Color.FromArgb(isPressed ? 132 : 82, 74, 24, 66),
+                        LinearGradientMode.Vertical);
+                    e.Graphics.FillPath(pillBrush, surfacePath);
+                }
+            }
+            else if (Enabled)
+            {
+                var topAlpha = isPressed ? 196 : isHovered ? 148 : 42;
+                var bottomAlpha = isPressed ? 164 : isHovered ? 114 : 18;
+                var topFill = isPressed
+                    ? Color.FromArgb(topAlpha, 148, 58, 118)
+                    : isHovered
+                        ? Color.FromArgb(topAlpha, 122, 48, 98)
+                        : Color.FromArgb(topAlpha, 255, 224, 244);
+                var bottomFill = isPressed
+                    ? Color.FromArgb(bottomAlpha, 76, 28, 66)
+                    : isHovered
+                        ? Color.FromArgb(bottomAlpha, 64, 22, 58)
+                        : Color.FromArgb(bottomAlpha, 168, 72, 134);
+                using var glassFill = new LinearGradientBrush(
+                    surfaceBounds,
+                    topFill,
+                    bottomFill,
+                    LinearGradientMode.Vertical);
+                e.Graphics.FillPath(glassFill, surfacePath);
+
+                var specRect = new RectangleF(
+                    surfaceBounds.X + 2f,
+                    surfaceBounds.Y + 0.5f,
+                    Math.Max(1f, surfaceBounds.Width - 4f),
+                    Math.Max(2f, surfaceBounds.Height * 0.44f));
+                using var specBrush = new LinearGradientBrush(
+                    specRect,
+                    Color.FromArgb(isPressed ? 68 : isHovered ? 74 : 44, 255, 255, 255),
+                    Color.FromArgb(0, 255, 232, 246),
+                    LinearGradientMode.Vertical);
+                e.Graphics.FillRectangle(specBrush, specRect);
             }
 
-            if (Enabled && (isHovered || isPressed || (Focused && ShowFocusCues)))
+            if (Enabled && (HighContrast ? (isHovered || isPressed || (Focused && ShowFocusCues)) : (!IsOmniboxEmbedded || isHovered || isPressed || (Focused && ShowFocusCues))))
             {
-                using var border = new Pen(
-                    HighContrast
-                        ? Focused && ShowFocusCues ? SystemColors.Highlight : SystemColors.WindowText
-                        : Focused && ShowFocusCues ? FocusStrokeColor : Color.FromArgb(96, NativeUiTheme.Focus),
-                    Focused && ShowFocusCues ? Scale(HighContrast ? 2f : 1.3f) : Scale(0.8f));
-                e.Graphics.DrawPath(border, surfacePath);
+                if (HighContrast)
+                {
+                    using var hcBorder = new Pen(
+                        Focused && ShowFocusCues ? SystemColors.Highlight : SystemColors.WindowText,
+                        Focused && ShowFocusCues ? Scale(2f) : Scale(0.8f));
+                    e.Graphics.DrawPath(hcBorder, surfacePath);
+                }
+                else
+                {
+                    using var rimBrush = new LinearGradientBrush(
+                        surfaceBounds,
+                        Color.FromArgb(Focused && ShowFocusCues ? 230 : isHovered || isPressed ? 195 : 78, 255, 228, 246),
+                        Color.FromArgb(Focused && ShowFocusCues ? 175 : isHovered || isPressed ? 108 : 26, NativeUiTheme.Accent),
+                        LinearGradientMode.Vertical);
+                    using var border = new Pen(rimBrush, Focused && ShowFocusCues ? Scale(1.35f) : Scale(0.9f));
+                    e.Graphics.DrawPath(border, surfacePath);
+                }
             }
 
             var scale = DeviceDpi / 96f;
@@ -13947,7 +14174,7 @@ public sealed class MainForm : Form
                         ]);
                     graphics.DrawLine(pen, bounds.Left + (bounds.Width * 0.15f), bounds.Bottom - (bounds.Height * 0.08f), bounds.Right - (bounds.Width * 0.15f), bounds.Bottom - (bounds.Height * 0.08f));
                     break;
-                case ChromeIconKind.Menu:
+                    case ChromeIconKind.Menu:
                     {
                         using var dot = new SolidBrush(color);
                         var dotSize = Math.Max(2f, 2.6f * scale);
@@ -13960,6 +14187,27 @@ public sealed class MainForm : Form
                                 dotSize,
                                 dotSize);
                         }
+                    }
+                    break;
+                case ChromeIconKind.NewTab:
+                    {
+                        var arm = bounds.Width * 0.30f;
+                        graphics.DrawLine(pen, center.X - arm, center.Y, center.X + arm, center.Y);
+                        graphics.DrawLine(pen, center.X, center.Y - arm, center.X, center.Y + arm);
+                    }
+                    break;
+                case ChromeIconKind.TabList:
+                    {
+                        // Vector replacement for the legacy "\u2304" downward chevron glyph.
+                        var halfWidth = bounds.Width * 0.28f;
+                        var halfHeight = bounds.Height * 0.15f;
+                        graphics.DrawLines(
+                            pen,
+                            [
+                                new PointF(center.X - halfWidth, center.Y - halfHeight),
+                                new PointF(center.X, center.Y + halfHeight),
+                                new PointF(center.X + halfWidth, center.Y - halfHeight)
+                            ]);
                     }
                     break;
             }
@@ -14022,11 +14270,10 @@ public sealed class MainForm : Form
             else if (text == "unknown")
             {
                 graphics.DrawEllipse(pen, bounds);
-                using var questionFont = new Font("Segoe UI Semibold", 9f * scale);
                 TextRenderer.DrawText(
                     graphics,
                     "?",
-                    questionFont,
+                    GetQuestionFont(scale),
                     Rectangle.Round(bounds),
                     color,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
@@ -14037,6 +14284,23 @@ public sealed class MainForm : Form
                 graphics.DrawEllipse(ring, bounds);
                 using var fill = new SolidBrush(color);
                 graphics.FillEllipse(fill, center.X - (2.2f * scale), center.Y - (2.2f * scale), 4.4f * scale, 4.4f * scale);
+            }
+        }
+
+        private static readonly object QuestionFontSync = new();
+        private static float cachedQuestionFontScale = -1f;
+        private static Font? cachedQuestionFont;
+
+        private static Font GetQuestionFont(float scale)
+        {
+            lock (QuestionFontSync)
+            {
+                if (cachedQuestionFont is null || Math.Abs(cachedQuestionFontScale - scale) > 0.001f)
+                {
+                    cachedQuestionFont = new Font("Segoe UI Semibold", 9f * scale);
+                    cachedQuestionFontScale = scale;
+                }
+                return cachedQuestionFont;
             }
         }
 
@@ -14227,33 +14491,89 @@ public sealed class MainForm : Form
         protected override void OnResize(EventArgs eventargs)
         {
             base.OnResize(eventargs);
-            if (Width <= 1 || Height <= 1) return;
-            using var path = CreateRoundedPath(new Rectangle(0, 0, Width, Height), CornerRadius);
-            var previousRegion = Region;
-            Region = new Region(path);
-            previousRegion?.Dispose();
+            Region = null;
+            Invalidate();
         }
 
         protected override void OnPaintBackground(PaintEventArgs e)
         {
+            e.Graphics.Clear(Parent?.BackColor ?? (HighContrast ? SystemColors.Window : ToolbarColor));
+            if (Width <= 2 || Height <= 2) return;
+
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            using var path = CreateRoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), CornerRadius);
-            using var fill = new SolidBrush(HighContrast ? SystemColors.Window : FillColor);
-            e.Graphics.FillPath(fill, path);
-            using var border = new Pen(
-                HighContrast ? IsFocused ? SystemColors.Highlight : SystemColors.WindowText : IsFocused ? FocusBorderColor : BorderColor,
-                IsFocused ? HighContrast ? 2f : 1.5f : 1f);
-            e.Graphics.DrawPath(border, path);
+            var bounds = new RectangleF(0.5f, 0.5f, Math.Max(1f, Width - 1f), Math.Max(1f, Height - 1f));
+            using var path = CreateRoundedPath(bounds, CornerRadius);
+            if (HighContrast)
+            {
+                using var fill = new SolidBrush(SystemColors.Window);
+                using var border = new Pen(IsFocused ? SystemColors.Highlight : SystemColors.WindowText, IsFocused ? 2f : 1f);
+                e.Graphics.FillPath(fill, path);
+                e.Graphics.DrawPath(border, path);
+                return;
+            }
+
+            using (var fill = new SolidBrush(FillColor))
+            {
+                e.Graphics.FillPath(fill, path);
+            }
+
+            var state = e.Graphics.Save();
+            try
+            {
+                e.Graphics.SetClip(path, CombineMode.Intersect);
+                var topRect = new RectangleF(bounds.X, bounds.Y, bounds.Width, 3.5f);
+                using var topSheen = new LinearGradientBrush(
+                    topRect,
+                    Color.FromArgb(IsFocused ? 68 : 44, 255, 240, 250),
+                    Color.FromArgb(0, FillColor),
+                    LinearGradientMode.Vertical);
+                e.Graphics.FillRectangle(topSheen, topRect);
+
+                var bottomRect = new RectangleF(bounds.X, bounds.Bottom - 3.5f, bounds.Width, 4f);
+                using var bottomCaustic = new LinearGradientBrush(
+                    bottomRect,
+                    Color.FromArgb(0, FillColor),
+                    Color.FromArgb(IsFocused ? 54 : 32, NativeUiTheme.Accent),
+                    LinearGradientMode.Vertical);
+                e.Graphics.FillRectangle(bottomCaustic, bottomRect);
+            }
+            finally
+            {
+                e.Graphics.Restore(state);
+            }
+
+            using var outerRimBrush = new LinearGradientBrush(
+                bounds,
+                Color.FromArgb(IsFocused ? 235 : 172, 255, 228, 246),
+                Color.FromArgb(IsFocused ? 195 : 96, IsFocused ? FocusBorderColor : NativeUiTheme.Accent),
+                LinearGradientMode.Vertical);
+            using var outerBorder = new Pen(outerRimBrush, IsFocused ? 1.6f : 1.1f);
+            e.Graphics.DrawPath(outerBorder, path);
+
+            var innerBounds = bounds;
+            innerBounds.Inflate(-1.1f, -1.1f);
+            if (innerBounds.Width > 6f && innerBounds.Height > 6f)
+            {
+                using var innerPath = CreateRoundedPath(innerBounds, Math.Max(2f, CornerRadius - 1.1f));
+                using var innerRimBrush = new LinearGradientBrush(
+                    innerBounds,
+                    Color.FromArgb(IsFocused ? 95 : 58, 255, 255, 255),
+                    Color.FromArgb(18, FocusBorderColor),
+                    LinearGradientMode.Vertical);
+                using var innerBorder = new Pen(innerRimBrush, 1f);
+                e.Graphics.DrawPath(innerBorder, innerPath);
+            }
         }
 
-        private static GraphicsPath CreateRoundedPath(Rectangle bounds, int radius)
+        private static GraphicsPath CreateRoundedPath(RectangleF bounds, float radius)
         {
-            var diameter = Math.Max(2, radius * 2);
+            var safeRadius = Math.Max(1f, Math.Min(radius, Math.Min(bounds.Width, bounds.Height) / 2f));
+            var diameter = safeRadius * 2f;
             var path = new GraphicsPath();
-            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
-            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
-            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
-            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180f, 90f);
+            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270f, 90f);
+            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0f, 90f);
+            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90f, 90f);
             path.CloseFigure();
             return path;
         }
@@ -14480,6 +14800,7 @@ public sealed class MainForm : Form
         public string? PendingMediaPermissionOrigin { get; set; }
         public int PendingMediaPermissionRefreshes { get; set; }
         public long DocumentNavigationGeneration { get; set; }
+        public long BackgroundReductionGeneration { get; set; }
         public bool MicrophoneAccessGranted => MicrophoneAllowedOrigins.Count > 0;
         public bool CameraAccessGranted => CameraAllowedOrigins.Count > 0;
         public bool HasMediaCapturePermission => MicrophoneAccessGranted || CameraAccessGranted;
@@ -14774,11 +15095,11 @@ public sealed class MainForm : Form
 
     private sealed class TabHeader : UserControl
     {
-        private readonly Label titleLabel = new();
-        private readonly Button closeButton = new();
         private readonly ToolTip toolTip;
         private bool isSelected;
         private bool isHovered;
+        private bool isCloseHovered;
+        private bool isClosePressed;
         private bool isSuspended;
         private bool isLoading;
         private bool isDiscarded;
@@ -14789,14 +15110,29 @@ public sealed class MainForm : Form
         private bool isDragging;
         private bool pointerTracking;
         private bool dragStarted;
+        private bool isMaximized;
         private Point pointerDownScreenLocation;
         private string currentTitle = "New tab";
 
         public bool IsPrivateMode { get; set; }
 
+        public void SetMaximized(bool maximized)
+        {
+            if (isMaximized == maximized) return;
+            isMaximized = maximized;
+            Invalidate();
+        }
+
         public TabHeader(ToolTip toolTip)
         {
             this.toolTip = toolTip;
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint
+                | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.ResizeRedraw
+                | ControlStyles.UserPaint,
+                true);
+            DoubleBuffered = true;
             Height = 32;
             Width = 190;
             Margin = new Padding(0, 0, 4, 0);
@@ -14806,47 +15142,15 @@ public sealed class MainForm : Form
             TabStop = true;
             AccessibleRole = AccessibleRole.PageTab;
 
-            titleLabel.Dock = DockStyle.Fill;
-            titleLabel.Margin = Padding.Empty;
-            titleLabel.TextAlign = ContentAlignment.MiddleLeft;
-            titleLabel.AutoEllipsis = true;
-            titleLabel.Font = TabTitleFont;
-            titleLabel.ForeColor = MutedTextColor;
-            MainForm.TrySetBackColor(titleLabel, Color.Transparent, TabIdleColor);
-            titleLabel.Cursor = Cursors.Hand;
-
-            closeButton.Dock = DockStyle.Right;
-            closeButton.Width = 29;
-            closeButton.Margin = Padding.Empty;
-            closeButton.Padding = Padding.Empty;
-            closeButton.Text = "\u00D7";
-            closeButton.FlatStyle = FlatStyle.Flat;
-            closeButton.FlatAppearance.BorderSize = 0;
-            closeButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(167, 47, 85);
-            closeButton.BackColor = TabIdleColor;
-            closeButton.ForeColor = MutedTextColor;
-            closeButton.Font = TabCloseFont;
-            closeButton.Cursor = Cursors.Hand;
-            closeButton.TabStop = true;
-            closeButton.AccessibleName = "Close tab";
-
-            Controls.Add(titleLabel);
-            Controls.Add(closeButton);
-
             MouseEnter += (_, _) => SetHovered(true);
-            MouseLeave += (_, _) => SetHovered(false);
-            titleLabel.MouseEnter += (_, _) => SetHovered(true);
-            titleLabel.MouseLeave += (_, _) => SetHovered(false);
-            closeButton.MouseEnter += (_, _) => SetHovered(true);
-            closeButton.MouseLeave += (_, _) => SetHovered(false);
-
-            closeButton.Click += (_, _) => CloseRequested?.Invoke(this, EventArgs.Empty);
+            MouseLeave += (_, _) =>
+            {
+                isCloseHovered = false;
+                SetHovered(false);
+            };
             MouseDown += OnPointerDown;
-            titleLabel.MouseDown += OnPointerDown;
             MouseMove += OnPointerMove;
-            titleLabel.MouseMove += OnPointerMove;
             MouseUp += OnMouseUp;
-            titleLabel.MouseUp += OnMouseUp;
             MouseCaptureChanged += OnMouseCaptureChanged;
             KeyDown += (_, e) =>
             {
@@ -14885,7 +15189,6 @@ public sealed class MainForm : Form
             if (isDragging == dragging) return;
             isDragging = dragging;
             Cursor = dragging ? Cursors.SizeWE : Cursors.Hand;
-            titleLabel.Cursor = dragging ? Cursors.SizeWE : Cursors.Hand;
             ApplyVisualState();
         }
 
@@ -14923,25 +15226,12 @@ public sealed class MainForm : Form
                 ? title
                 : $"{title}\n{stateDescription}";
             toolTip.SetToolTip(this, tooltip);
-            toolTip.SetToolTip(titleLabel, tooltip);
         }
 
         protected override void OnResize(EventArgs e)
         {
             base.OnResize(e);
-            if (Width <= 1 || Height <= 1) return;
-            using var path = new GraphicsPath();
-            const int radius = 9;
-            const int diameter = radius * 2;
-            var bounds = new Rectangle(0, 0, Width, Height);
-            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
-            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
-            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
-            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
-            path.CloseFigure();
-            var previousRegion = Region;
-            Region = new Region(path);
-            previousRegion?.Dispose();
+            Region = null;
             ApplyVisualState();
         }
 
@@ -14955,7 +15245,6 @@ public sealed class MainForm : Form
             if (disposing)
             {
                 toolTip.SetToolTip(this, string.Empty);
-                toolTip.SetToolTip(titleLabel, string.Empty);
             }
             base.Dispose(disposing);
         }
@@ -14972,18 +15261,144 @@ public sealed class MainForm : Form
             Invalidate();
         }
 
+        private bool ShouldShowCloseButton() => !isDragging && !isPinned && (isSelected || isHovered || Width >= 170);
+
+        private RectangleF GetCloseButtonBounds() => new(Math.Max(4f, Width - 28f), Math.Max(2f, (Height - 24f) / 2f), 24f, 24f);
+
+        private RectangleF GetCloseButtonHitBounds()
+        {
+            var bounds = GetCloseButtonBounds();
+            bounds.Inflate(3f, 3f);
+            return bounds;
+        }
+
+        private static GraphicsPath CreateTabRoundedPath(RectangleF bounds, float radius)
+        {
+            var safeRadius = Math.Max(1f, Math.Min(radius, Math.Min(bounds.Width, bounds.Height) / 2f));
+            var diameter = safeRadius * 2f;
+            var path = new GraphicsPath();
+            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180f, 90f);
+            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270f, 90f);
+            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0f, 90f);
+            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90f, 90f);
+            path.CloseFigure();
+            return path;
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            // All painting happens inside double-buffered OnPaint.
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
-            base.OnPaint(e);
+            var stripHostColor = Parent?.BackColor
+                ?? (HighContrast ? SystemColors.Control : IsPrivateMode ? Color.FromArgb(24, 11, 25) : ChromeColor);
+            e.Graphics.Clear(stripHostColor);
+            if (Width <= 4 || Height <= 4) return;
+
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.CompositingQuality = CompositingQuality.HighQuality;
+            e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
             var effectiveAccent = HighContrast
                 ? SystemColors.HighlightText
                 : IsPrivateMode ? NativeUiTheme.Lavender : AccentColor;
-            if (isSelected)
+            var topInset = isMaximized ? 1.5f : 2.5f;
+            var pillBounds = new RectangleF(
+                1f,
+                topInset,
+                Math.Max(1f, Width - 2f),
+                Math.Max(1f, Height - topInset - 2.5f));
+            var pillRadius = Math.Min(10f, pillBounds.Height / 2f);
+            using var pillPath = CreateTabRoundedPath(pillBounds, pillRadius);
+
+            if (HighContrast)
             {
-                using var accent = new Pen(effectiveAccent, 2f);
-                e.Graphics.DrawLine(accent, 10, Height - 2, Math.Max(10, Width - 10), Height - 2);
+                var highlighted = isSelected || isHovered;
+                using var hcFill = new SolidBrush(highlighted ? SystemColors.Highlight : SystemColors.Control);
+                e.Graphics.FillPath(hcFill, pillPath);
+                using var hcBorder = new Pen(highlighted ? SystemColors.HighlightText : SystemColors.WindowText, isSelected ? 1.5f : 1f);
+                e.Graphics.DrawPath(hcBorder, pillPath);
             }
+            else
+            {
+                var topColor = isSelected
+                    ? Color.FromArgb(228, IsPrivateMode ? 68 : 94, IsPrivateMode ? 30 : 40, IsPrivateMode ? 88 : 82)
+                    : isHovered
+                        ? Color.FromArgb(164, 74, 34, 68)
+                        : Color.FromArgb(52, 62, 28, 58);
+                var bottomColor = isSelected
+                    ? Color.FromArgb(242, IsPrivateMode ? 42 : 56, IsPrivateMode ? 18 : 22, IsPrivateMode ? 54 : 52)
+                    : isHovered
+                        ? Color.FromArgb(182, 42, 18, 42)
+                        : Color.FromArgb(28, 36, 16, 38);
+
+                var state = e.Graphics.Save();
+                try
+                {
+                    e.Graphics.SetClip(pillPath, CombineMode.Intersect);
+                    using var pillFill = new LinearGradientBrush(
+                        pillBounds,
+                        topColor,
+                        bottomColor,
+                        LinearGradientMode.Vertical);
+                    e.Graphics.FillPath(pillFill, pillPath);
+
+                    if (isSelected || isHovered)
+                    {
+                        var specHeight = Math.Max(4f, pillBounds.Height * 0.48f);
+                        var specRect = new RectangleF(pillBounds.X, pillBounds.Y, pillBounds.Width, specHeight + 1f);
+                        using var specBrush = new LinearGradientBrush(
+                            specRect,
+                            Color.FromArgb(isSelected ? 74 : 42, 255, 255, 255),
+                            Color.FromArgb(0, 255, 232, 246),
+                            LinearGradientMode.Vertical);
+                        e.Graphics.FillRectangle(specBrush, specRect);
+
+                        if (isSelected)
+                        {
+                            var causticHeight = Math.Max(4f, pillBounds.Height * 0.28f);
+                            var causticRect = new RectangleF(
+                                pillBounds.X,
+                                pillBounds.Bottom - causticHeight,
+                                pillBounds.Width,
+                                causticHeight + 1f);
+                            using var causticBrush = new LinearGradientBrush(
+                                causticRect,
+                                Color.FromArgb(0, effectiveAccent),
+                                Color.FromArgb(54, NativeUiTheme.Focus),
+                                LinearGradientMode.Vertical);
+                            e.Graphics.FillRectangle(causticBrush, causticRect);
+                        }
+                    }
+                }
+                finally
+                {
+                    e.Graphics.Restore(state);
+                }
+
+                using var rimBrush = new LinearGradientBrush(
+                    pillBounds,
+                    Color.FromArgb(isSelected ? 228 : isHovered ? 138 : 44, 255, 230, 246),
+                    Color.FromArgb(isSelected ? 152 : isHovered ? 62 : 16, effectiveAccent),
+                    LinearGradientMode.Vertical);
+                using var rimPen = new Pen(rimBrush, isSelected ? 1.25f : 0.9f);
+                e.Graphics.DrawPath(rimPen, pillPath);
+
+                if (isSelected && pillBounds.Width > 26f)
+                {
+                    var barWidth = Math.Min(pillBounds.Width - 20f, Math.Max(18f, pillBounds.Width * 0.42f));
+                    var barLeft = pillBounds.Left + ((pillBounds.Width - barWidth) / 2f);
+                    using var glowBar = new Pen(effectiveAccent, 2f)
+                    {
+                        StartCap = LineCap.Round,
+                        EndCap = LineCap.Round
+                    };
+                    e.Graphics.DrawLine(glowBar, barLeft, pillBounds.Bottom - 0.5f, barLeft + barWidth, pillBounds.Bottom - 0.5f);
+                }
+            }
+
             if (isDragging)
             {
                 using var dragOutline = new Pen(effectiveAccent, 1f)
@@ -15013,8 +15428,75 @@ public sealed class MainForm : Form
                         ? AccentColor
                         : isDiscarded ? NegativeColor : keepAwake ? PositiveColor : MutedTextColor;
                 using var stateBrush = new SolidBrush(stateColor);
-                e.Graphics.FillEllipse(stateBrush, 8, Math.Max(1, (Height - 6) / 2), 6, 6);
+                e.Graphics.FillEllipse(stateBrush, 9f, Math.Max(1f, (Height - 6f) / 2f), 6f, 6f);
             }
+
+            var showClose = ShouldShowCloseButton();
+            var titleLeft = Math.Max(10, Padding.Left);
+            var titleRightReserve = showClose ? 33 : 10;
+            var titleBounds = new Rectangle(
+                titleLeft,
+                0,
+                Math.Max(1, Width - titleLeft - titleRightReserve),
+                Height);
+            var titleColor = HighContrast
+                ? (isSelected || isHovered ? SystemColors.HighlightText : SystemColors.ControlText)
+                : isDragging ? MutedTextColor
+                : isSuspended ? Color.FromArgb(181, 138, 156)
+                : isSelected ? PageTextColor : Color.FromArgb(228, 198, 214);
+            TextRenderer.DrawText(
+                e.Graphics,
+                currentTitle,
+                TabTitleFont,
+                titleBounds,
+                titleColor,
+                TextFormatFlags.Left
+                | TextFormatFlags.VerticalCenter
+                | TextFormatFlags.SingleLine
+                | TextFormatFlags.EndEllipsis
+                | TextFormatFlags.NoPrefix
+                | TextFormatFlags.NoPadding);
+
+            if (showClose)
+            {
+                var closeBounds = GetCloseButtonBounds();
+                if (isCloseHovered || isClosePressed)
+                {
+                    using var closeFill = new SolidBrush(
+                        HighContrast
+                            ? SystemColors.Highlight
+                            : Color.FromArgb(isClosePressed ? 220 : 182, 182, 48, 92));
+                    e.Graphics.FillEllipse(closeFill, closeBounds);
+                    if (!HighContrast)
+                    {
+                        using var closeRim = new Pen(Color.FromArgb(172, 255, 232, 246), 1f);
+                        e.Graphics.DrawEllipse(closeRim, closeBounds);
+                    }
+                }
+
+                var crossColor = HighContrast
+                    ? (isCloseHovered || isSelected ? SystemColors.HighlightText : SystemColors.ControlText)
+                    : (isCloseHovered || isClosePressed) ? Color.White : isSelected ? PageTextColor : MutedTextColor;
+                var inset = 7.2f;
+                using var crossPen = new Pen(crossColor, 1.6f)
+                {
+                    StartCap = LineCap.Round,
+                    EndCap = LineCap.Round
+                };
+                e.Graphics.DrawLine(
+                    crossPen,
+                    closeBounds.Left + inset,
+                    closeBounds.Top + inset,
+                    closeBounds.Right - inset,
+                    closeBounds.Bottom - inset);
+                e.Graphics.DrawLine(
+                    crossPen,
+                    closeBounds.Right - inset,
+                    closeBounds.Top + inset,
+                    closeBounds.Left + inset,
+                    closeBounds.Bottom - inset);
+            }
+
             if (Focused)
             {
                 ControlPaint.DrawFocusRectangle(
@@ -15076,7 +15558,14 @@ public sealed class MainForm : Form
 
         private void OnPointerDown(object? sender, MouseEventArgs e)
         {
-            if (e.Button != MouseButtons.Left || pointerTracking) return;
+            if (e.Button != MouseButtons.Left || pointerTracking || isClosePressed) return;
+            if (ShouldShowCloseButton() && GetCloseButtonHitBounds().Contains(e.Location))
+            {
+                isClosePressed = true;
+                Capture = true;
+                Invalidate();
+                return;
+            }
 
             var source = sender as Control ?? this;
             pointerDownScreenLocation = source.PointToScreen(e.Location);
@@ -15087,7 +15576,14 @@ public sealed class MainForm : Form
 
         private void OnPointerMove(object? sender, MouseEventArgs e)
         {
-            if (!pointerTracking) return;
+            var nextCloseHover = ShouldShowCloseButton() && GetCloseButtonHitBounds().Contains(e.Location);
+            if (isCloseHovered != nextCloseHover)
+            {
+                isCloseHovered = nextCloseHover;
+                Invalidate();
+            }
+
+            if (isClosePressed || !pointerTracking) return;
 
             var source = sender as Control ?? this;
             var screenLocation = source.PointToScreen(e.Location);
@@ -15115,6 +15611,7 @@ public sealed class MainForm : Form
 
         private void OnMouseCaptureChanged(object? sender, EventArgs e)
         {
+            isClosePressed = false;
             if (!pointerTracking) return;
 
             var wasDragging = dragStarted;
@@ -15125,6 +15622,18 @@ public sealed class MainForm : Form
 
         private void OnMouseUp(object? sender, MouseEventArgs e)
         {
+            if (isClosePressed)
+            {
+                var insideClose = e.Button == MouseButtons.Left
+                    && ShouldShowCloseButton()
+                    && GetCloseButtonHitBounds().Contains(e.Location);
+                isClosePressed = false;
+                Capture = false;
+                Invalidate();
+                if (insideClose) CloseRequested?.Invoke(this, EventArgs.Empty);
+                return;
+            }
+
             if (e.Button == MouseButtons.Left && pointerTracking)
             {
                 var source = sender as Control ?? this;
@@ -15168,21 +15677,7 @@ public sealed class MainForm : Form
                 : isDragging ? NativeUiTheme.Pressed
                 : isSelected ? activeBackground
                 : isHovered ? hoverBackground : idleBackground;
-            var foreground = HighContrast
-                ? highlighted ? SystemColors.HighlightText : SystemColors.ControlText
-                : isDragging ? MutedTextColor
-                : isSelected ? PageTextColor : MutedTextColor;
-            titleLabel.Text = currentTitle;
-            titleLabel.ForeColor = HighContrast
-                ? foreground
-                : isSuspended ? Color.FromArgb(181, 138, 156) : foreground;
             Padding = new Padding(isAudible || isMuted ? 25 : isLoading || isDiscarded || isSuspended || keepAwake ? 20 : 10, 0, 0, 0);
-            closeButton.BackColor = background;
-            closeButton.ForeColor = foreground;
-            closeButton.FlatAppearance.MouseOverBackColor = HighContrast
-                ? SystemColors.Highlight
-                : Color.FromArgb(167, 47, 85);
-            closeButton.Visible = !isDragging && !isPinned && (isSelected || isHovered || Width >= 170);
             BackColor = background;
             Invalidate();
         }
@@ -15279,6 +15774,8 @@ public sealed class MainForm : Form
         public const int WmMouseMove = 0x0200;
         public const int WmLeftButtonUp = 0x0202;
         public const int WmCaptureChanged = 0x0215;
+        public const int WmEnterSizeMove = 0x0231;
+        public const int WmExitSizeMove = 0x0232;
         public const int WmNcMouseLeave = 0x02A2;
         public const int HtClient = 1;
         public const int HtCaption = 2;
@@ -15514,6 +16011,7 @@ public sealed class MainForm : Form
 
     private sealed class IncognitoBadgeControl : Control
     {
+        private static readonly Font BadgeFont = new("Segoe UI Semibold", 8.2f, FontStyle.Regular);
         private readonly ToolTip toolTip;
         private bool isHovered;
 
@@ -15559,12 +16057,11 @@ public sealed class MainForm : Form
             g.DrawLine(lensPen, 14, midY - 2, 18, midY - 2);
 
             // Draw "Incognito" text
-            using var font = new Font("Segoe UI Semibold", 8.2f, FontStyle.Regular);
             var textBounds = new Rectangle(27, 0, Width - 29, Height);
             TextRenderer.DrawText(
                 g,
                 "Incognito",
-                font,
+                BadgeFont,
                 textBounds,
                 NativeUiTheme.Lavender,
                 TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPadding);

@@ -651,16 +651,22 @@ internal static class AddressSuggestionEngine
 
     private static bool IsSubsequence(ReadOnlySpan<char> query, ReadOnlySpan<char> value)
     {
+        if (query.Length == 0) return true;
+        if (query.Length > value.Length) return false;
+
         var queryIndex = 0;
-        for (var index = 0; index < value.Length && queryIndex < query.Length; index++)
+        var target = char.ToUpperInvariant(query[0]);
+        for (var index = 0; value.Length - index >= query.Length - queryIndex; index++)
         {
-            if (char.ToUpperInvariant(value[index]) == char.ToUpperInvariant(query[queryIndex]))
+            if (char.ToUpperInvariant(value[index]) == target)
             {
                 queryIndex++;
+                if (queryIndex == query.Length) return true;
+                target = char.ToUpperInvariant(query[queryIndex]);
             }
         }
 
-        return queryIndex == query.Length;
+        return false;
     }
 
     private static bool UrlEqualsInput(ReadOnlySpan<char> url, ReadOnlySpan<char> query)

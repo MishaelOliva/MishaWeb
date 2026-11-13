@@ -18,42 +18,64 @@ internal static class PublicSuffixRules
 
     internal static string GetSiteKey(string host)
     {
-        var value = host.Trim().TrimEnd('.');
-        if (value.Length == 0 || IPAddress.TryParse(value, out _)) return value;
-        var normalized = BrowserPolicy.NormalizeExactHost(value) ?? value.ToLowerInvariant();
-        var labels = normalized.Split('.', StringSplitOptions.RemoveEmptyEntries);
-        if (labels.Length <= 1) return normalized;
+        var value = host.AsSpan().Trim().TrimEnd('.');
+        if (value.Length == 0 || IPAddress.TryParse(value, out _)) return new string(value);
+
+        var normalized = BrowserPolicy.NormalizeExactHost(new string(value))
+            ?? new string(value).ToLowerInvariant();
+        var span = normalized.AsSpan();
+        if (!span.Contains('.')) return normalized;
 
         var rules = Rules.Value;
-        var publicSuffixLabels = 1;
-        for (var index = 0; index < labels.Length; index++)
+        var exactLookup = rules.Exact.GetAlternateLookup<ReadOnlySpan<char>>();
+        var wildcardLookup = rules.Wildcards.GetAlternateLookup<ReadOnlySpan<char>>();
+        var exceptionLookup = rules.Exceptions.GetAlternateLookup<ReadOnlySpan<char>>();
+
+        var labelCount = 1;
+        for (var i = 0; i < span.Length; i++)
         {
-            var suffix = string.Join('.', labels, index, labels.Length - index);
-            if (rules.Exceptions.Contains(suffix))
+            if (span[i] == '.') labelCount++;
+        }
+
+        var publicSuffixLabels = 1;
+        var currentStart = 0;
+        for (var index = 0; index < labelCount; index++)
+        {
+            var suffix = span[currentStart..];
+            var dotOffset = suffix.IndexOf('.');
+            var remainingLabels = labelCount - index;
+
+            if (exceptionLookup.Contains(suffix))
             {
-                publicSuffixLabels = Math.Max(1, labels.Length - index - 1);
+                publicSuffixLabels = Math.Max(1, remainingLabels - 1);
                 break;
             }
-            if (rules.Exact.Contains(suffix))
+            if (exactLookup.Contains(suffix))
             {
-                publicSuffixLabels = Math.Max(publicSuffixLabels, labels.Length - index);
+                publicSuffixLabels = Math.Max(publicSuffixLabels, remainingLabels);
             }
-            if (index + 1 < labels.Length)
+            if (dotOffset >= 0)
             {
-                var wildcardSuffix = string.Join('.', labels, index + 1, labels.Length - index - 1);
-                if (rules.Wildcards.Contains(wildcardSuffix))
+                var wildcardSuffix = suffix[(dotOffset + 1)..];
+                if (wildcardLookup.Contains(wildcardSuffix))
                 {
-                    publicSuffixLabels = Math.Max(publicSuffixLabels, labels.Length - index);
+                    publicSuffixLabels = Math.Max(publicSuffixLabels, remainingLabels);
                 }
+                currentStart += dotOffset + 1;
             }
         }
 
-        if (labels.Length <= publicSuffixLabels) return normalized;
-        return string.Join(
-            '.',
-            labels,
-            labels.Length - publicSuffixLabels - 1,
-            publicSuffixLabels + 1);
+        if (labelCount <= publicSuffixLabels) return normalized;
+
+        var targetDotSkip = labelCount - publicSuffixLabels - 1;
+        var cutStart = 0;
+        for (var skipped = 0; skipped < targetDotSkip; skipped++)
+        {
+            var nextDot = span[cutStart..].IndexOf('.');
+            if (nextDot < 0) return normalized;
+            cutStart += nextDot + 1;
+        }
+        return normalized[cutStart..];
     }
 
     private static RuleSet LoadRules()

@@ -41,6 +41,7 @@ internal sealed class SavedItemsDialog : Form
     private const int MaximumDisplayDetailCharacters = 160;
     private const int MaximumDisplayUrlCharacters = 512;
     private const int MaximumDisplayRowCharacters = 960;
+    private static readonly Font ListFont = new("Segoe UI", 9.5f);
 
     private readonly Func<SavedItemsView, IReadOnlyList<SavedItemRow>> itemProvider;
     private readonly ComboBox viewPicker = new();
@@ -111,7 +112,7 @@ internal sealed class SavedItemsDialog : Form
         itemList.Dock = DockStyle.Fill;
         itemList.IntegralHeight = false;
         itemList.HorizontalScrollbar = true;
-        itemList.Font = new Font("Segoe UI", 9.5f);
+        itemList.Font = ListFont;
         itemList.AccessibleName = "Saved items list";
         itemList.SelectedIndexChanged += (_, _) => UpdateButtons();
         itemList.DoubleClick += (_, _) => RaiseAction(SavedItemActionKind.Open);

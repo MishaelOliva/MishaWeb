@@ -41,12 +41,13 @@ internal sealed class NativeStartPage : UserControl
     private static readonly Color PrimaryTextColor = NativeUiTheme.Text;
     private static readonly Color SecondaryTextColor = NativeUiTheme.SecondaryText;
     private static readonly Color MutedTextColor = NativeUiTheme.Muted;
-    private static readonly Color ChipColor = BlendOpaque(NativeUiTheme.Chrome, NativeUiTheme.Window, 235);
-    private static readonly Color ChipHoverColor = BlendOpaque(NativeUiTheme.Surface, NativeUiTheme.Window, 244);
-    private static readonly Color ChipPressedColor = BlendOpaque(NativeUiTheme.SurfaceRaised, NativeUiTheme.Window, 248);
+    private static readonly Color ChipColor = Color.FromArgb(255, 52, 22, 46);
+    private static readonly Color ChipHoverColor = Color.FromArgb(255, 70, 30, 62);
+    private static readonly Color ChipPressedColor = Color.FromArgb(255, 84, 36, 74);
 
     private static readonly Font BrandFont = new("Segoe UI Semibold", 27f, FontStyle.Regular);
     private static readonly Font TaglineFont = new("Segoe UI", 11f, FontStyle.Regular);
+    private static readonly Font IncognitoTaglineFont = new("Segoe UI Semibold", 10f, FontStyle.Regular);
     private static readonly Font SearchFont = new("Segoe UI", 11f, FontStyle.Regular);
     private static readonly Font ActionFont = new("Segoe UI Semibold", 9.5f, FontStyle.Regular);
     private static readonly Font FeatureHeadingFont = new("Segoe UI Semibold", 9.2f, FontStyle.Regular);
@@ -59,12 +60,12 @@ internal sealed class NativeStartPage : UserControl
     private readonly RoundedSurfacePanel card = new();
     private readonly TransparentTableLayoutPanel contentLayout = new();
     private readonly BadgeControl badge = new();
-    private readonly Label titleLabel = new();
+    private readonly BrandTitleLabel titleLabel = new();
     private readonly Label taglineLabel = new();
     private readonly SmartSearchBar searchBar = new();
     private readonly TransparentPanel featureHost = new();
     private readonly FeatureChip[] featureChips;
-    private readonly Label quickLinksTitle = new();
+    private readonly SectionHeaderLabel quickLinksTitle = new();
     private readonly TransparentPanel quickLinksHost = new();
     private bool arranging = true;
     private bool backdropFrameLeaseHeld;
@@ -242,9 +243,10 @@ internal sealed class NativeStartPage : UserControl
         {
             titleLabel.Text = "Incognito";
             titleLabel.ForeColor = NativeUiTheme.Lavender;
+            titleLabel.IsPrivateMode = true;
             taglineLabel.Text = "You're browsing in Incognito mode \u2014 history and cookies are not saved";
             taglineLabel.ForeColor = Color.FromArgb(226, 185, 248);
-            taglineLabel.Font = new Font("Segoe UI Semibold", 10f);
+            taglineLabel.Font = IncognitoTaglineFont;
             taglineLabel.Visible = true;
             taglineLabel.AccessibleDescription = "Incognito browsing is isolated from MishaWeb saved items";
             badge.AccessibleName = "Incognito browsing";
@@ -255,6 +257,7 @@ internal sealed class NativeStartPage : UserControl
         {
             titleLabel.Text = "MishaWeb";
             titleLabel.ForeColor = PrimaryTextColor;
+            titleLabel.IsPrivateMode = false;
             taglineLabel.Text = string.Empty;
             taglineLabel.ForeColor = SecondaryTextColor;
             taglineLabel.Font = TaglineFont;
@@ -484,6 +487,11 @@ internal sealed class NativeStartPage : UserControl
         StartPageArtwork.DrawBackdropSlice(e.Graphics, ClientSize, clip, clip);
     }
 
+    internal static bool PaintChildBackdropSlice(Control control, PaintEventArgs e)
+    {
+        return PaintBackdropSlice(control, e);
+    }
+
     private static bool PaintBackdropSlice(Control control, PaintEventArgs e)
     {
         var offset = Point.Empty;
@@ -566,7 +574,8 @@ internal sealed class NativeStartPage : UserControl
             ScaleLogical(2));
 
         card.CornerRadius = ScaleLogical(24);
-        badge.Size = new Size(ScaleLogical(56), ScaleLogical(56));
+        var badgeSide = ScaleLogical(compactLayout ? 52 : 60);
+        badge.Size = new Size(badgeSide, badgeSide);
         searchBar.Margin = Padding.Empty;
         searchBar.MinimumSize = new Size(ScaleLogical(260), ScaleLogical(48));
 
@@ -594,7 +603,7 @@ internal sealed class NativeStartPage : UserControl
         taglineLabel.ForeColor = highContrast
             ? SystemColors.WindowText
             : isPrivateModeActive ? Color.FromArgb(226, 185, 248) : SecondaryTextColor;
-        quickLinksTitle.ForeColor = highContrast ? SystemColors.WindowText : SecondaryTextColor;
+        quickLinksTitle.ForeColor = highContrast ? SystemColors.WindowText : FocusColor;
         card.Invalidate(true);
         foreach (var chip in featureChips) chip.Invalidate();
         quickLinksHost.Invalidate(true);
@@ -609,10 +618,16 @@ internal sealed class NativeStartPage : UserControl
             ScaleLogical(compact ? 7 : 10),
             ScaleLogical(2));
 
-        SetRowHeight(0, compact ? 56 : 66);
-        SetRowHeight(1, isPrivateModeActive ? (compact ? 48 : 58) : (compact ? 36 : 42));
+        var badgeSide = ScaleLogical(compact ? 52 : 60);
+        if (badge.Size.Width != badgeSide || badge.Size.Height != badgeSide)
+        {
+            badge.Size = new Size(badgeSide, badgeSide);
+        }
+
+        SetRowHeight(0, compact ? 58 : 68);
+        SetRowHeight(1, isPrivateModeActive ? (compact ? 48 : 58) : (compact ? 44 : 52));
         SetRowHeight(2, isPrivateModeActive ? (compact ? 28 : 34) : (compact ? 6 : 10));
-        SetRowHeight(3, compact ? 56 : 64);
+        SetRowHeight(3, compact ? 58 : 66);
         SetRowHeight(4, compact ? 8 : 12);
         var contentWidth = Math.Max(1, cardWidth - contentLayout.Padding.Horizontal);
         contentLayout.RowStyles[5].Height = 0;
@@ -788,10 +803,98 @@ internal sealed class NativeStartPage : UserControl
         return path;
     }
 
+    private static void PaintLiquidGlassCard(
+        Graphics graphics,
+        RectangleF bounds,
+        float cornerRadius,
+        bool hovered,
+        bool pressed,
+        bool focused)
+    {
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        graphics.CompositingQuality = CompositingQuality.HighSpeed;
+        using var path = CreateRoundedPath(bounds, cornerRadius);
+
+        if (SystemInformation.HighContrast)
+        {
+            var highContrastSelection = pressed || hovered || focused;
+            using var hcFill = new SolidBrush(highContrastSelection ? SystemColors.Highlight : SystemColors.Window);
+            using var hcBorder = new Pen(SystemColors.WindowText, focused ? 2f : 1f);
+            graphics.FillPath(hcFill, path);
+            graphics.DrawPath(hcBorder, path);
+            return;
+        }
+
+        var topAlpha = pressed ? 196 : hovered ? 166 : 132;
+        var bottomAlpha = pressed ? 210 : hovered ? 178 : 148;
+        var topTint = Color.FromArgb(topAlpha, hovered ? 92 : 76, hovered ? 38 : 31, hovered ? 82 : 70);
+        var bottomTint = Color.FromArgb(bottomAlpha, 42, 16, 44);
+
+        var state = graphics.Save();
+        try
+        {
+            graphics.SetClip(path, CombineMode.Intersect);
+            using var fill = new LinearGradientBrush(bounds, topTint, bottomTint, LinearGradientMode.ForwardDiagonal);
+            graphics.FillPath(fill, path);
+
+            var specHeight = Math.Max(8f, bounds.Height * 0.48f);
+            var specRect = new RectangleF(
+                bounds.X - (bounds.Width * 0.12f),
+                bounds.Y - (specHeight * 0.24f),
+                bounds.Width * 1.24f,
+                specHeight * 1.18f);
+            using var specPath = new GraphicsPath();
+            specPath.AddEllipse(specRect);
+            using var specBrush = new LinearGradientBrush(
+                new RectangleF(bounds.X, bounds.Y, bounds.Width, specHeight + 1f),
+                Color.FromArgb(hovered ? 78 : 54, 255, 255, 255),
+                Color.FromArgb(0, 255, 232, 246),
+                LinearGradientMode.Vertical);
+            graphics.FillPath(specBrush, specPath);
+
+            var causticHeight = Math.Max(6f, bounds.Height * 0.30f);
+            var causticRect = new RectangleF(bounds.X, bounds.Bottom - causticHeight, bounds.Width, causticHeight + 1f);
+            using var causticBrush = new LinearGradientBrush(
+                causticRect,
+                Color.FromArgb(0, AccentColor),
+                Color.FromArgb(hovered ? 66 : 42, FocusColor),
+                LinearGradientMode.Vertical);
+            graphics.FillRectangle(causticBrush, causticRect);
+        }
+        finally
+        {
+            graphics.Restore(state);
+        }
+
+        using var outerRimBrush = new LinearGradientBrush(
+            bounds,
+            Color.FromArgb(focused ? 235 : hovered ? 218 : 178, 255, 230, 246),
+            Color.FromArgb(focused ? 195 : hovered ? 148 : 92, AccentColor),
+            LinearGradientMode.Vertical);
+        using var outerRimPen = new Pen(outerRimBrush, focused || hovered ? 1.45f : 1.1f);
+        graphics.DrawPath(outerRimPen, path);
+
+        var innerBounds = bounds;
+        innerBounds.Inflate(-1.1f, -1.1f);
+        if (innerBounds.Width > 6f && innerBounds.Height > 6f)
+        {
+            using var innerPath = CreateRoundedPath(innerBounds, Math.Max(2f, cornerRadius - 1.1f));
+            using var innerRimBrush = new LinearGradientBrush(
+                innerBounds,
+                Color.FromArgb(hovered ? 105 : 76, 255, 255, 255),
+                Color.FromArgb(hovered ? 42 : 20, FocusColor),
+                LinearGradientMode.Vertical);
+            using var innerRimPen = new Pen(innerRimBrush, 1f);
+            graphics.DrawPath(innerRimPen, innerPath);
+        }
+    }
+
     private sealed class RoundedSurfacePanel : Panel
     {
         private bool isFocused;
         private int cornerRadius = 16;
+        private Size lastRegionSize;
+        private int lastRegionRadius;
 
         public RoundedSurfacePanel()
         {
@@ -885,6 +988,14 @@ internal sealed class NativeStartPage : UserControl
         {
             if (Width <= 1 || Height <= 1) return;
 
+            var currentSize = new Size(Width, Height);
+            if (lastRegionSize == currentSize && lastRegionRadius == CornerRadius && Region is not null)
+            {
+                return;
+            }
+
+            lastRegionSize = currentSize;
+            lastRegionRadius = CornerRadius;
             using var path = CreateRoundedPath(new RectangleF(0, 0, Width, Height), CornerRadius);
             var previousRegion = Region;
             Region = new Region(path);
@@ -1145,27 +1256,16 @@ internal sealed class NativeStartPage : UserControl
             base.OnKeyDown(e);
         }
 
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            if (!PaintBackdropSlice(this, e)) base.OnPaintBackground(e);
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
-            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            e.Graphics.CompositingQuality = CompositingQuality.HighSpeed;
             var highContrastSelection = SystemInformation.HighContrast && (pressed || hovered || Focused);
-            var background = SystemInformation.HighContrast
-                ? highContrastSelection ? SystemColors.Highlight : SystemColors.Window
-                : pressed ? ChipPressedColor : hovered ? ChipHoverColor : ChipColor;
-            using var path = CreateRoundedPath(
-                new RectangleF(0.5f, 0.5f, Math.Max(1, Width - 1f), Math.Max(1, Height - 1f)),
-                CornerRadius);
-            using var fill = new LinearGradientBrush(
-                ClientRectangle,
-                SystemInformation.HighContrast ? background : ShiftColor(background, hovered ? 12 : 7),
-                background,
-                LinearGradientMode.ForwardDiagonal);
-            using var border = new Pen(
-                SystemInformation.HighContrast ? SystemColors.WindowText : Focused ? FocusColor : SurfaceBorderColor,
-                Focused ? 2f : 1f);
-            e.Graphics.FillPath(fill, path);
-            e.Graphics.DrawPath(border, path);
+            var cardBounds = new RectangleF(0.5f, 0.5f, Math.Max(1, Width - 1f), Math.Max(1, Height - 1f));
+            PaintLiquidGlassCard(e.Graphics, cardBounds, CornerRadius, hovered, pressed, Focused);
 
             var scale = Math.Max(1f, DeviceDpi / 96f);
             var dense = Height < ScalePixels(64);
@@ -1173,6 +1273,12 @@ internal sealed class NativeStartPage : UserControl
             var badgeLeft = Math.Max(8, (int)Math.Round((dense ? 9 : 12) * scale));
             var badgeTop = Math.Max(1, (Height - badgeSize) / 2);
             var badgeBounds = new Rectangle(badgeLeft, badgeTop, badgeSize, badgeSize);
+            if (!SystemInformation.HighContrast)
+            {
+                var haloBounds = RectangleF.Inflate(badgeBounds, 3.5f * scale, 3.5f * scale);
+                using var halo = new SolidBrush(Color.FromArgb(hovered ? 48 : 24, AccentColor));
+                e.Graphics.FillEllipse(halo, haloBounds);
+            }
             var iconKind = GetSiteIconKind(link.Url);
             DrawSiteIcon(
                 e.Graphics,
@@ -1183,7 +1289,7 @@ internal sealed class NativeStartPage : UserControl
 
             var textLeft = badgeBounds.Right + Math.Max(7, (int)Math.Round((dense ? 8 : 10) * scale));
             var showChevron = Width >= ScalePixels(185);
-            var textRightPadding = Math.Max(8, (int)Math.Round((showChevron ? 29 : 10) * scale));
+            var textRightPadding = Math.Max(8, (int)Math.Round((showChevron ? 34 : 10) * scale));
             var textWidth = Math.Max(1, Width - textLeft - textRightPadding);
             var titleBounds = new Rectangle(textLeft, Math.Max(2, Height / 2 - ScalePixels(18)), textWidth, ScalePixels(18));
             var detailBounds = new Rectangle(textLeft, Height / 2 + ScalePixels(1), textWidth, ScalePixels(17));
@@ -1203,17 +1309,28 @@ internal sealed class NativeStartPage : UserControl
                 detailBounds,
                 SystemInformation.HighContrast
                     ? highContrastSelection ? SystemColors.HighlightText : SystemColors.WindowText
-                    : MutedTextColor,
+                    : SecondaryTextColor,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
 
             if (showChevron)
             {
-                var centerX = Width - Math.Max(13f, 16f * scale);
+                var centerX = Width - Math.Max(14f, 17f * scale);
                 var centerY = Height / 2f;
+                if (!SystemInformation.HighContrast && (hovered || Focused))
+                {
+                    var pillSize = 18f * scale;
+                    var pillBounds = new RectangleF(
+                        centerX - (pillSize / 2f),
+                        centerY - (pillSize / 2f),
+                        pillSize,
+                        pillSize);
+                    using var pillBrush = new SolidBrush(Color.FromArgb(44, AccentColor));
+                    e.Graphics.FillEllipse(pillBrush, pillBounds);
+                }
                 using var arrowPen = new Pen(
                     SystemInformation.HighContrast
                         ? highContrastSelection ? SystemColors.HighlightText : SystemColors.WindowText
-                        : Color.FromArgb(220, NativeUiTheme.Focus),
+                        : Color.FromArgb(hovered ? 255 : 225, NativeUiTheme.Focus),
                     Math.Max(1.2f, 1.4f * scale))
                 {
                     StartCap = LineCap.Round,
@@ -1223,9 +1340,9 @@ internal sealed class NativeStartPage : UserControl
                 e.Graphics.DrawLines(
                     arrowPen,
                     [
-                        new PointF(centerX - (2f * scale), centerY - (4f * scale)),
+                        new PointF(centerX - (2f * scale), centerY - (3.8f * scale)),
                         new PointF(centerX + (2f * scale), centerY),
-                        new PointF(centerX - (2f * scale), centerY + (4f * scale))
+                        new PointF(centerX - (2f * scale), centerY + (3.8f * scale))
                     ]);
             }
         }
@@ -1681,27 +1798,16 @@ internal sealed class NativeStartPage : UserControl
             base.OnKeyDown(e);
         }
 
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            if (!PaintBackdropSlice(this, e)) base.OnPaintBackground(e);
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
-            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            e.Graphics.CompositingQuality = CompositingQuality.HighSpeed;
-            using var path = CreateRoundedPath(
-                new RectangleF(0.5f, 0.5f, Math.Max(1, Width - 1f), Math.Max(1, Height - 1f)),
-                CornerRadius);
             var highContrastSelection = SystemInformation.HighContrast && (pressed || hovered || Focused);
-            var background = SystemInformation.HighContrast
-                ? highContrastSelection ? SystemColors.Highlight : SystemColors.Window
-                : pressed ? ChipPressedColor : hovered ? ChipHoverColor : ChipColor;
-            using var fill = new LinearGradientBrush(
-                ClientRectangle,
-                SystemInformation.HighContrast ? background : ShiftColor(background, hovered ? 12 : 7),
-                background,
-                LinearGradientMode.ForwardDiagonal);
-            using var border = new Pen(
-                SystemInformation.HighContrast ? SystemColors.WindowText : Focused ? FocusColor : SurfaceBorderColor,
-                Focused ? 2f : 1f);
-            e.Graphics.FillPath(fill, path);
-            e.Graphics.DrawPath(border, path);
+            var cardBounds = new RectangleF(0.5f, 0.5f, Math.Max(1, Width - 1f), Math.Max(1, Height - 1f));
+            PaintLiquidGlassCard(e.Graphics, cardBounds, CornerRadius, hovered, pressed, Focused);
 
             var scale = Math.Max(1f, DeviceDpi / 96f);
             var dense = Height < ScalePixels(64);
@@ -1793,6 +1899,166 @@ internal sealed class NativeStartPage : UserControl
         }
     }
 
+    private sealed class BrandTitleLabel : Label
+    {
+        public bool IsPrivateMode { get; set; }
+
+        public BrandTitleLabel()
+        {
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint
+                | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.ResizeRedraw
+                | ControlStyles.SupportsTransparentBackColor
+                | ControlStyles.UserPaint,
+                true);
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            if (!PaintBackdropSlice(this, e)) base.OnPaintBackground(e);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var text = Text ?? string.Empty;
+            if (text.Length == 0) return;
+
+            var flags = TextFormatFlags.HorizontalCenter
+                | TextFormatFlags.VerticalCenter
+                | TextFormatFlags.EndEllipsis
+                | TextFormatFlags.NoPadding
+                | TextFormatFlags.NoPrefix
+                | TextFormatFlags.SingleLine;
+
+            if (!SystemInformation.HighContrast && !IsPrivateMode && ClientSize.Width > 40 && ClientSize.Height > 16)
+            {
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                var scale = Math.Max(1f, DeviceDpi / 96f);
+                var measured = TextRenderer.MeasureText(
+                    e.Graphics,
+                    text,
+                    Font,
+                    ClientSize,
+                    TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+                var glowWidth = Math.Min(ClientSize.Width, Math.Max(80f, measured.Width + (38f * scale)));
+                var glowHeight = Math.Max(16f, ClientSize.Height * 0.78f);
+                var glowRect = new RectangleF(
+                    (ClientSize.Width - glowWidth) / 2f,
+                    (ClientSize.Height - glowHeight) / 2f,
+                    glowWidth,
+                    glowHeight);
+                using var glowPath = new GraphicsPath();
+                glowPath.AddEllipse(glowRect);
+                using var glowBrush = new PathGradientBrush(glowPath)
+                {
+                    CenterColor = Color.FromArgb(46, AccentColor),
+                    SurroundColors = [Color.FromArgb(0, AccentColor)]
+                };
+                e.Graphics.FillPath(glowBrush, glowPath);
+
+                var sparkleRadius = 4f * scale;
+                var halfTextWidth = measured.Width / 2f;
+                var centerX = ClientSize.Width / 2f;
+                var centerY = ClientSize.Height / 2f;
+                var leftSparkleX = centerX - halfTextWidth - (14f * scale);
+                var rightSparkleX = centerX + halfTextWidth + (14f * scale);
+                if (leftSparkleX > sparkleRadius + 4f && rightSparkleX < ClientSize.Width - sparkleRadius - 4f)
+                {
+                    DrawFourPointSparkle(e.Graphics, new PointF(leftSparkleX, centerY - (2f * scale)), sparkleRadius, Color.FromArgb(185, FocusColor));
+                    DrawFourPointSparkle(e.Graphics, new PointF(rightSparkleX, centerY + (1f * scale)), sparkleRadius * 0.85f, Color.FromArgb(165, AccentColorSecondary));
+                }
+            }
+
+            TextRenderer.DrawText(
+                e.Graphics,
+                text,
+                Font,
+                ClientRectangle,
+                SystemInformation.HighContrast ? SystemColors.WindowText : ForeColor,
+                flags);
+        }
+
+        private static void DrawFourPointSparkle(Graphics graphics, PointF center, float radius, Color color)
+        {
+            using var pen = new Pen(color, Math.Max(1f, radius * 0.34f))
+            {
+                StartCap = LineCap.Round,
+                EndCap = LineCap.Round
+            };
+            graphics.DrawLine(pen, center.X, center.Y - radius, center.X, center.Y + radius);
+            graphics.DrawLine(pen, center.X - radius, center.Y, center.X + radius, center.Y);
+        }
+    }
+
+    private sealed class SectionHeaderLabel : Label
+    {
+        public SectionHeaderLabel()
+        {
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint
+                | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.ResizeRedraw
+                | ControlStyles.SupportsTransparentBackColor
+                | ControlStyles.UserPaint,
+                true);
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            if (!PaintBackdropSlice(this, e)) base.OnPaintBackground(e);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var text = Text ?? string.Empty;
+            if (text.Length == 0) return;
+
+            var scale = Math.Max(1f, DeviceDpi / 96f);
+            var textLeft = 0;
+            if (!SystemInformation.HighContrast && ClientSize.Width > 24 && ClientSize.Height > 10)
+            {
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                var dotSize = 6f * scale;
+                var centerY = ClientSize.Height / 2f;
+                var dotCenterX = (dotSize / 2f) + (2f * scale);
+                var haloRect = new RectangleF(
+                    dotCenterX - (5.5f * scale),
+                    centerY - (5.5f * scale),
+                    11f * scale,
+                    11f * scale);
+                using var haloBrush = new SolidBrush(Color.FromArgb(52, AccentColor));
+                e.Graphics.FillEllipse(haloBrush, haloRect);
+                using var dotBrush = new SolidBrush(AccentColor);
+                e.Graphics.FillEllipse(
+                    dotBrush,
+                    dotCenterX - (dotSize / 2f),
+                    centerY - (dotSize / 2f),
+                    dotSize,
+                    dotSize);
+                textLeft = (int)Math.Ceiling(dotCenterX + (dotSize / 2f) + (7f * scale));
+            }
+
+            var textBounds = new Rectangle(
+                textLeft,
+                0,
+                Math.Max(1, ClientSize.Width - textLeft),
+                ClientSize.Height);
+            TextRenderer.DrawText(
+                e.Graphics,
+                text,
+                Font,
+                textBounds,
+                SystemInformation.HighContrast ? SystemColors.WindowText : ForeColor,
+                TextFormatFlags.Left
+                | TextFormatFlags.VerticalCenter
+                | TextFormatFlags.EndEllipsis
+                | TextFormatFlags.NoPadding
+                | TextFormatFlags.NoPrefix
+                | TextFormatFlags.SingleLine);
+        }
+    }
+
     private sealed class BadgeControl : Control
     {
         public bool IsPrivateMode { get; set; }
@@ -1812,16 +2078,36 @@ internal sealed class NativeStartPage : UserControl
             AccessibleRole = AccessibleRole.Graphic;
         }
 
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            if (!PaintBackdropSlice(this, e)) base.OnPaintBackground(e);
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
-            StartPageArtwork.DrawBrandMark(e.Graphics, ClientRectangle);
+            if (!SystemInformation.HighContrast && ClientSize.Width > 8 && ClientSize.Height > 8)
+            {
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                using var glowPath = new GraphicsPath();
+                glowPath.AddEllipse(new RectangleF(0f, 0f, ClientSize.Width, ClientSize.Height));
+                using var glowBrush = new PathGradientBrush(glowPath)
+                {
+                    CenterColor = Color.FromArgb(72, IsPrivateMode ? AccentColorSecondary : AccentColor),
+                    SurroundColors = [Color.FromArgb(0, AccentColor)]
+                };
+                e.Graphics.FillPath(glowBrush, glowPath);
+            }
+
+            var inset = Math.Max(2, Math.Min(ClientRectangle.Width, ClientRectangle.Height) / 14);
+            var markBounds = Rectangle.Inflate(ClientRectangle, -inset, -inset);
+            StartPageArtwork.DrawBrandMark(e.Graphics, markBounds);
             if (!IsPrivateMode) return;
 
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            var badgeSize = Math.Max(10, Math.Min(ClientRectangle.Width, ClientRectangle.Height) / 3);
+            var badgeSize = Math.Max(10, Math.Min(markBounds.Width, markBounds.Height) / 3);
             var badgeBounds = new Rectangle(
-                ClientRectangle.Right - badgeSize - 2,
-                ClientRectangle.Bottom - badgeSize - 2,
+                markBounds.Right - badgeSize - 1,
+                markBounds.Bottom - badgeSize - 1,
                 badgeSize,
                 badgeSize);
             using var fill = new SolidBrush(NativeUiTheme.Lavender);

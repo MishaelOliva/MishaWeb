@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.4.0 - 2026-11-13
+
+### Start page, chrome UI, and artwork
+
+- Updated the start page and browser chrome with liquid-glass styling, updated bunny brand artwork (`BrandArtwork.cs`, `StartPageArtwork.cs`), and an Incognito mode header layout in `NativeStartPage.cs`.
+- Refined `SmartSearchBar.cs` and `MainForm.cs` window/toolbar behavior, including custom-drawn new-tab and tab-list chrome buttons, maximized top-edge tab clicking, window placement preservation during resize/move, and omnibox button embedding.
+- Removed the superseded legacy icon and tiled start-page PNG assets from `desktop/Assets/`.
+
+### Ad blocking, suggestions, and build tooling
+
+- Improved `AdBlockEngine.cs` cosmetic CSS caching to key on host plus generic/specific hide-disable flags so same-host paths share compiled CSS while still honoring path-scoped `$generichide` rules, and avoided redundant preprocessing when loading cached filter files.
+- Scoped YouTube-only recovery CSS in `AdBlockDocumentScript.cs`, skipped heavy format subtrees during payload sanitization, handled `get_watch` envelopes, and cached XHR sanitization results in a `WeakMap`.
+- Added fast host-gating in `BrowserPolicy.cs`, allocation-free clean-string reuse in `TextSafety.cs`, and synchronous cache-miss probing in `SearchSuggestionService.cs`.
+- Updated `build/Install-MishaWeb.ps1` to pass `-p:RestoreLockedMode=false` during local one-click source installs.
+
 ## 2.3.0 - 2026-09-29
 
 ### Reader mode and toolbar status

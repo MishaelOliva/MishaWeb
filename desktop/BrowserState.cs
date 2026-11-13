@@ -656,7 +656,11 @@ internal sealed class BrowserStateStore : IDisposable
         {
             var url = NormalizeHttpUrl(item.Url);
             if (url is null) continue;
-            yield return new BookmarkEntry(SanitizeTitle(item.Title), url);
+            var title = SanitizeTitle(item.Title);
+            yield return string.Equals(item.Title, title, StringComparison.Ordinal)
+                && string.Equals(item.Url, url, StringComparison.Ordinal)
+                ? item
+                : new BookmarkEntry(title, url);
         }
     }
 
@@ -668,7 +672,11 @@ internal sealed class BrowserStateStore : IDisposable
         {
             var url = NormalizeHttpUrl(item.Url);
             if (url is null) continue;
-            yield return new HistoryEntry(SanitizeTitle(item.Title), url, item.VisitedUtc);
+            var title = SanitizeTitle(item.Title);
+            yield return string.Equals(item.Title, title, StringComparison.Ordinal)
+                && string.Equals(item.Url, url, StringComparison.Ordinal)
+                ? item
+                : new HistoryEntry(title, url, item.VisitedUtc);
         }
     }
 
@@ -681,7 +689,11 @@ internal sealed class BrowserStateStore : IDisposable
         {
             var url = NormalizeHttpUrl(item.Url);
             if (url is null) continue;
-            yield return new PinnedStartPageLink(SanitizeTitle(item.Title), url);
+            var title = SanitizeTitle(item.Title);
+            yield return string.Equals(item.Title, title, StringComparison.Ordinal)
+                && string.Equals(item.Url, url, StringComparison.Ordinal)
+                ? item
+                : new PinnedStartPageLink(title, url);
         }
     }
 
@@ -718,9 +730,16 @@ internal sealed class BrowserStateStore : IDisposable
                     : existing.AcceptedCount + acceptedCount;
                 if (existing.LastAcceptedUtc > acceptedAt) acceptedAt = existing.LastAcceptedUtc;
                 url = existing.Url;
+                normalizedEntries[url] = new AddressSuggestionUsage(url, acceptedCount, acceptedAt);
             }
-
-            normalizedEntries[url] = new AddressSuggestionUsage(url, acceptedCount, acceptedAt);
+            else
+            {
+                normalizedEntries[url] = string.Equals(item.Url, url, StringComparison.Ordinal)
+                    && item.AcceptedCount == acceptedCount
+                    && item.LastAcceptedUtc == acceptedAt
+                    ? item
+                    : new AddressSuggestionUsage(url, acceptedCount, acceptedAt);
+            }
         }
 
         foreach (var item in normalizedEntries.Values)

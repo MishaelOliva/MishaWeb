@@ -2354,7 +2354,8 @@ var regexIndexSoundnessCases = new[]
     ("numeric backreferences are conservatively left unindexed", @"(a)\1bar", "aabar", false),
     ("plus-quantified atoms do not join surrounding literals", "foo+bar", "foooobar", true),
     ("bounded repeated atoms do not join surrounding literals", "foo{2,}bar", "fooooobar", true),
-    ("lazy repeated atoms remain separated", "foo+?bar", "foooobar", true)
+    ("lazy repeated atoms remain separated", "foo+?bar", "foooobar", true),
+    ("grouped alternation does not block outer mandatory literal extraction", @"^https:\/\/(?:a|b)\.doubleclick\.net\/ads$", "https://a.doubleclick.net/ads", true)
 };
 foreach (var testCase in regexIndexSoundnessCases)
 {
@@ -2369,6 +2370,23 @@ foreach (var testCase in regexIndexSoundnessCases)
                     && !mandatoryLiteral.Equals("foobar", StringComparison.OrdinalIgnoreCase)
                     && testCase.Item3.Contains(mandatoryLiteral, StringComparison.OrdinalIgnoreCase))));
 }
+
+var cosmeticCacheEngine = new AdBlockEngine(initialRules:
+[
+    "##.generic-banner",
+    "example.com##.site-banner",
+    "@@||example.com/adfree^$generichide"
+]);
+var page1Cosmetics = cosmeticCacheEngine.GetCosmeticCss("https://example.com/page1");
+var page2Cosmetics = cosmeticCacheEngine.GetCosmeticCss("https://example.com/page2");
+var adFreeCosmetics = cosmeticCacheEngine.GetCosmeticCss("https://example.com/adfree");
+Check(
+    "cosmetic cache reuses compiled CSS across same-host paths while respecting path-scoped generichide",
+    page1Cosmetics.Contains(".generic-banner", StringComparison.Ordinal)
+        && page1Cosmetics.Contains(".site-banner", StringComparison.Ordinal)
+        && ReferenceEquals(page1Cosmetics, page2Cosmetics)
+        && !adFreeCosmetics.Contains(".generic-banner", StringComparison.Ordinal)
+        && adFreeCosmetics.Contains(".site-banner", StringComparison.Ordinal));
 
 var representativeRegexEngine = new AdBlockEngine(initialRules:
 [
@@ -3887,6 +3905,9 @@ Check(
 Check(
     "crowded tab headers remain reachable through bounded horizontal overflow",
     reservedWindowDragSpace.Scrollable);
+Check(
+    "maximized windows extend tab headers to the top edge (Y=0) so top-edge cursor clicks hit tabs",
+    VerifyMaximizedTopEdgeTabClick());
 var savedWindowPlacement = VerifySavedWindowPlacement();
 Check("a valid right-side window position and size restore exactly", savedWindowPlacement.RightSideRestored);
 Check("a saved window on a disconnected monitor is moved fully onscreen", savedWindowPlacement.OffscreenRecovered);
@@ -3944,9 +3965,9 @@ var informationalVersion = System.Reflection.CustomAttributeExtensions
     .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(productAssembly)
     ?.InformationalVersion;
 Check(
-    "release assemblies carry the 2.3.0 product version",
-    productAssembly.GetName().Version == new Version(2, 3, 0, 0)
-        && informationalVersion == "2.3.0");
+    "release assemblies carry the 2.4.0 product version",
+    productAssembly.GetName().Version == new Version(2, 4, 0, 0)
+        && informationalVersion == "2.4.0");
 Check(
     "new sessions default to standard memory saver",
     new BrowserState().MemorySaverEnabled && new BrowserState().UltraLightModeEnabled == false);
@@ -4763,6 +4784,12 @@ Check(
     adBlockDocumentScript.Contains("'instreamAdVideoRenderer'", StringComparison.Ordinal)
         && adBlockDocumentScript.Contains("'adEngagementPanelContent'", StringComparison.Ordinal)
         && adBlockDocumentScript.Contains("'adsEngagementPanelContentRenderer'", StringComparison.Ordinal));
+Check(
+    "YouTube document script skips heavy format subtrees, scopes YouTube-only CSS, handles get_watch envelopes, and caches XHR sanitization",
+    adBlockDocumentScript.Contains("skippedSanitizeKeys", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("? '#cinematics", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("playerResponse.playerResponse", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("xhrSanitizedCache = new WeakMap()", StringComparison.Ordinal));
 Check(
     "the player loop reads nerd stats numerically instead of matching display strings",
     adBlockDocumentScript.Contains("const parseBufferHealthSeconds = value =>", StringComparison.Ordinal)
@@ -6375,6 +6402,25 @@ Check(
         100,
         2 * OneGibibyte,
         -1).Count == 0);
+
+var cleanSample = "MishaWeb Fast Browser";
+var paddedSample = "  MishaWeb Fast Browser  ";
+Check(
+    "TextSafety.SanitizeSingleLine reuses already-clean strings without allocation",
+    ReferenceEquals(cleanSample, TextSafety.SanitizeSingleLine(cleanSample, 80))
+    && TextSafety.SanitizeSingleLine(paddedSample, 80) == cleanSample);
+Check(
+    "BrowserPolicy fast host gate preserves plain searches vs localhost/IP/domains",
+    !BrowserPolicy.IsRecognizedAddressInput("weather")
+    && BrowserPolicy.IsRecognizedAddressInput("localhost")
+    && BrowserPolicy.ResolveAddress("localhost:3000").Url == "http://localhost:3000/"
+    && BrowserPolicy.IsRecognizedAddressInput("[::1]:8080")
+    && BrowserPolicy.IsRecognizedAddressInput("127.0.0.1")
+    && BrowserPolicy.IsRecognizedAddressInput("example.com")
+    && BrowserPolicy.ResolveAddress("weather").Url == "https://www.google.com/search?q=weather");
+Check(
+    "SearchSuggestionService cache miss probe returns false synchronously",
+    !SearchSuggestionService.Instance.TryGetCachedSuggestions("uncached_weak_laptop_probe", out _));
 
 if (failures.Count > 0)
 {
@@ -8002,6 +8048,72 @@ bool WindowCaptionDragUsesNativeMove()
         Console.Error.WriteLine($"Reserved window-drag area probe failed: {error}");
     }
     return (error is null && valid, reservedWidth, error is null && scrollable);
+}
+
+bool VerifyMaximizedTopEdgeTabClick()
+{
+    var valid = false;
+    Exception? error = null;
+    var thread = new Thread(() =>
+    {
+        try
+        {
+            using var form = new MainForm(startBrowserOnShown: false)
+            {
+                StartPosition = FormStartPosition.Manual,
+                Location = new Point(-20_000, -20_000),
+                ShowInTaskbar = false
+            };
+            form.Show();
+            form.PrepareLoadedChromePreviewForTesting();
+            form.WindowState = FormWindowState.Maximized;
+            form.PerformLayout();
+            Application.DoEvents();
+
+            const System.Reflection.BindingFlags flags =
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var titleBar = typeof(MainForm).GetField("titleBar", flags)?.GetValue(form) as TableLayoutPanel;
+            var tabStrip = typeof(MainForm).GetField("tabStrip", flags)?.GetValue(form) as FlowLayoutPanel;
+            var isCaptionPoint = typeof(MainForm).GetMethod("IsCaptionPoint", flags);
+            if (titleBar is null || tabStrip is null || tabStrip.Controls.Count == 0 || isCaptionPoint is null)
+            {
+                return;
+            }
+
+            var header = tabStrip.Controls[0];
+            var formTop = form.PointToScreen(Point.Empty).Y;
+            var headerScreenBounds = header.RectangleToScreen(header.ClientRectangle);
+            var topEdgePoint = new Point(
+                headerScreenBounds.Left + Math.Max(1, headerScreenBounds.Width / 2),
+                formTop);
+            var topLeftCornerPoint = new Point(headerScreenBounds.Left + 2, formTop);
+            var isCaptionAtTopCenter = isCaptionPoint.Invoke(
+                form,
+                [form.PointToClient(topEdgePoint), topEdgePoint]) is true;
+            var isCaptionAtTopLeft = isCaptionPoint.Invoke(
+                form,
+                [form.PointToClient(topLeftCornerPoint), topLeftCornerPoint]) is true;
+            var regionIncludesTopLeftCorner = header.Region is null
+                || header.Region.IsVisible(new Point(2, 0));
+            valid = titleBar.Padding.Top == 0
+                && headerScreenBounds.Top == formTop
+                && !isCaptionAtTopCenter
+                && !isCaptionAtTopLeft
+                && regionIncludesTopLeftCorner;
+        }
+        catch (Exception caught)
+        {
+            error = caught;
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+    if (error is not null)
+    {
+        Console.Error.WriteLine($"Maximized top-edge tab click probe failed: {error}");
+    }
+    return error is null && valid;
 }
 
 (bool RightSideRestored, bool OffscreenRecovered, bool PresentationRestored) VerifySavedWindowPlacement()

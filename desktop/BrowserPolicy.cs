@@ -158,7 +158,7 @@ internal static class BrowserPolicy
     {
         if (string.IsNullOrWhiteSpace(url)
             || url.Length > MaximumUrlLength
-            || url.Any(char.IsControl))
+            || ContainsControlChars(url))
         {
             return false;
         }
@@ -187,7 +187,7 @@ internal static class BrowserPolicy
         normalizedUrl = string.Empty;
         if (string.IsNullOrWhiteSpace(value)
             || value.Length > MaximumUrlLength
-            || value.Any(char.IsControl)
+            || ContainsControlChars(value)
             || !Uri.TryCreate(value, UriKind.Absolute, out var uri)
             || !uri.IsFile
             || uri.IsUnc
@@ -273,7 +273,12 @@ internal static class BrowserPolicy
     private static bool LooksLikeHost(string value, out Uri uri)
     {
         uri = null!;
-        if (value.Any(char.IsWhiteSpace) || value.Contains("://", StringComparison.Ordinal)) return false;
+        if (ContainsWhiteSpace(value)
+            || value.Contains("://", StringComparison.Ordinal)
+            || !MayLookLikeHostCandidate(value))
+        {
+            return false;
+        }
         if (!Uri.TryCreate("http://" + value, UriKind.Absolute, out var candidate)) return false;
 
         var normalizedHost = candidate.IdnHost.TrimEnd('.');
@@ -297,12 +302,43 @@ internal static class BrowserPolicy
         return true;
     }
 
+    private static bool MayLookLikeHostCandidate(string value)
+    {
+        for (var index = 0; index < value.Length; index++)
+        {
+            var character = value[index];
+            if (character == '.' || character == ':') return true;
+        }
+
+        return value.Contains("localhost", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ContainsWhiteSpace(string value)
+    {
+        for (var index = 0; index < value.Length; index++)
+        {
+            if (char.IsWhiteSpace(value[index])) return true;
+        }
+
+        return false;
+    }
+
+    private static bool ContainsControlChars(string value)
+    {
+        for (var index = 0; index < value.Length; index++)
+        {
+            if (char.IsControl(value[index])) return true;
+        }
+
+        return false;
+    }
+
     private static bool TryResolveExistingLocalPath(string value, out string normalizedUrl)
     {
         normalizedUrl = string.Empty;
         if (string.IsNullOrWhiteSpace(value)
             || value.Length > MaximumUrlLength
-            || value.Any(char.IsControl)
+            || ContainsControlChars(value)
             || !Path.IsPathFullyQualified(value)
             || value.StartsWith(@"\\", StringComparison.Ordinal)
             || value.StartsWith("//", StringComparison.Ordinal))

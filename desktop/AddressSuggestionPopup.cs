@@ -21,6 +21,8 @@ internal sealed class AddressSuggestionPopup : Control
     private int removeHoverIndex = -1;
     private int pressedIndex = -1;
     private bool pressedRemove;
+    private Size lastRegionSize;
+    private int lastRegionRadius;
 
     public AddressSuggestionPopup()
     {
@@ -189,7 +191,12 @@ internal sealed class AddressSuggestionPopup : Control
     {
         base.OnResize(e);
         if (Width <= 1 || Height <= 1) return;
-        using var path = CreateRoundedPath(new Rectangle(0, 0, Width, Height), Scale(10));
+        var currentSize = new Size(Width, Height);
+        var radius = Scale(10);
+        if (lastRegionSize == currentSize && lastRegionRadius == radius && Region is not null) return;
+        lastRegionSize = currentSize;
+        lastRegionRadius = radius;
+        using var path = CreateRoundedPath(new Rectangle(0, 0, Width, Height), radius);
         var previous = Region;
         Region = new Region(path);
         previous?.Dispose();

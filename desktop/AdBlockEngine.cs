@@ -608,6 +608,7 @@ internal sealed class AdBlockEngine
         CancellationToken cancellationToken) =>
         Task.Run(() => CompiledRuleSet.FromLines(
             BuiltInFallbackRules.Concat(ReadFilterLines(files, cancellationToken)),
+            preprocess: false,
             cancellationToken), cancellationToken);
 
     private static IEnumerable<string> ReadFilterLines(
@@ -1091,7 +1092,7 @@ internal sealed class AdBlockEngine
     private static HttpClient CreateHttpClient()
     {
         var client = new HttpClient { Timeout = TimeSpan.FromSeconds(12) };
-        client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("MishaWeb", "2.3.0"));
+        client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("MishaWeb", "2.4.0"));
         return client;
     }
 
@@ -1307,11 +1308,18 @@ internal sealed class AdBlockEngine
 
         public static CompiledRuleSet FromLines(
             IEnumerable<string> lines,
+            CancellationToken cancellationToken = default) =>
+            FromLines(lines, preprocess: true, cancellationToken);
+
+        public static CompiledRuleSet FromLines(
+            IEnumerable<string> lines,
+            bool preprocess,
             CancellationToken cancellationToken = default)
         {
             var materialized = new HashSet<string>(StringComparer.Ordinal);
             var processedLineCount = 0;
-            foreach (var line in PreprocessLines(lines))
+            var sourceLines = preprocess ? PreprocessLines(lines) : lines;
+            foreach (var line in sourceLines)
             {
                 if ((processedLineCount++ & 2047) == 0)
                 {
@@ -1934,10 +1942,11 @@ internal sealed class AdBlockEngine
         private const int MaximumSelectorsPerPage = 12_000;
         private const int MaximumCachedHosts = 64;
         private const long MaximumCachedStyleBytes = 4 * 1024 * 1024;
+        private readonly record struct StyleCacheKey(string Host, bool DisableGeneric, bool DisableSpecific);
         private readonly List<CosmeticRule> genericRules = [];
         private readonly Dictionary<string, List<CosmeticRule>> domainRules = new(StringComparer.OrdinalIgnoreCase);
-        private readonly ConcurrentDictionary<string, string> styleCache = new(StringComparer.OrdinalIgnoreCase);
-        private readonly ConcurrentQueue<string> styleCacheOrder = new();
+        private readonly ConcurrentDictionary<StyleCacheKey, string> styleCache = new();
+        private readonly ConcurrentQueue<StyleCacheKey> styleCacheOrder = new();
         private readonly List<HideDisableRule> genericHideExceptions = [];
         private readonly List<HideDisableRule> specificHideExceptions = [];
         private long styleCacheBytes;
@@ -1976,16 +1985,38 @@ internal sealed class AdBlockEngine
 
         public string GetCss(Uri pageUri, bool cacheEvaluation)
         {
-            if (!cacheEvaluation) return CompileCss(pageUri);
-            var cacheKey = pageUri.GetLeftPart(UriPartial.Path) + pageUri.Query;
+            var disableGeneric = false;
+            foreach (var rule in genericHideExceptions)
+            {
+                if (rule.Matches(pageUri))
+                {
+                    disableGeneric = true;
+                    break;
+                }
+            }
+            var disableSpecific = false;
+            foreach (var rule in specificHideExceptions)
+            {
+                if (rule.Matches(pageUri))
+                {
+                    disableSpecific = true;
+                    break;
+                }
+            }
+            if (disableGeneric && disableSpecific) return string.Empty;
+
+            var host = pageUri.Host;
+            if (!cacheEvaluation) return CompileCss(host, disableGeneric, disableSpecific);
+
+            var cacheKey = new StyleCacheKey(host, disableGeneric, disableSpecific);
             if (styleCache.TryGetValue(cacheKey, out var cached)) return cached;
-            var compiled = CompileCss(pageUri);
+            var compiled = CompileCss(host, disableGeneric, disableSpecific);
             if (!styleCache.TryAdd(cacheKey, compiled))
             {
                 return styleCache.TryGetValue(cacheKey, out cached) ? cached : compiled;
             }
 
-            Interlocked.Add(ref styleCacheBytes, GetCacheEntryBytes(cacheKey, compiled));
+            Interlocked.Add(ref styleCacheBytes, GetCacheEntryBytes(cacheKey.Host, compiled));
             styleCacheOrder.Enqueue(cacheKey);
             while ((styleCache.Count > MaximumCachedHosts
                     || Volatile.Read(ref styleCacheBytes) > MaximumCachedStyleBytes)
@@ -1993,36 +2024,35 @@ internal sealed class AdBlockEngine
             {
                 if (styleCache.TryRemove(oldest, out var removed))
                 {
-                    Interlocked.Add(ref styleCacheBytes, -GetCacheEntryBytes(oldest, removed));
+                    Interlocked.Add(ref styleCacheBytes, -GetCacheEntryBytes(oldest.Host, removed));
                 }
             }
             return compiled;
         }
 
-        private static long GetCacheEntryBytes(string key, string style) =>
-            2L * (key.Length + style.Length);
+        private static long GetCacheEntryBytes(string host, string style) =>
+            2L * (host.Length + style.Length);
 
-        private string CompileCss(Uri pageUri)
+        private string CompileCss(string host, bool disableGeneric, bool disableSpecific)
         {
-            var host = pageUri.Host;
-            var disableGeneric = genericHideExceptions.Any(rule => rule.Matches(pageUri));
-            var disableSpecific = specificHideExceptions.Any(rule => rule.Matches(pageUri));
-            var exceptions = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var rule in GetCandidates(host))
+            HashSet<string>? exceptions = null;
+            foreach (var rule in GetCandidates(host, disableGeneric, disableSpecific))
             {
-                if (rule.Exception && rule.Matches(host)) exceptions.Add(rule.Selector);
+                if (rule.Exception && rule.Matches(host))
+                {
+                    exceptions ??= new HashSet<string>(StringComparer.Ordinal);
+                    exceptions.Add(rule.Selector);
+                }
             }
 
             var css = new StringBuilder();
             var seenSelectors = new HashSet<string>(StringComparer.Ordinal);
             var count = 0;
-            foreach (var rule in GetCandidates(host))
+            foreach (var rule in GetCandidates(host, disableGeneric, disableSpecific))
             {
                 if (rule.Exception
                     || !rule.Matches(host)
-                    || exceptions.Contains(rule.Selector)
-                    || (rule.IsGeneric && disableGeneric)
-                    || (!rule.IsGeneric && disableSpecific)
+                    || (exceptions is not null && exceptions.Contains(rule.Selector))
                     || !seenSelectors.Add(rule.Selector))
                 {
                     continue;
@@ -2036,18 +2066,23 @@ internal sealed class AdBlockEngine
             return css.ToString();
         }
 
-        private IEnumerable<CosmeticRule> GetCandidates(string host)
+        private IEnumerable<CosmeticRule> GetCandidates(string host, bool disableGeneric, bool disableSpecific)
         {
             // Specific selectors are more valuable than the generic tail and
             // must not be pushed past the per-page CSS safety budget.
-            var labels = host.TrimEnd('.').Split('.', StringSplitOptions.RemoveEmptyEntries);
-            for (var index = 0; index < labels.Length; index++)
+            if (!disableSpecific && !string.IsNullOrEmpty(host))
             {
-                var domain = string.Join('.', labels.Skip(index));
-                if (!domainRules.TryGetValue(domain, out var rules)) continue;
-                foreach (var rule in rules) yield return rule;
+                var suffixes = GetCachedHostSuffixes(host);
+                foreach (var domain in suffixes)
+                {
+                    if (!domainRules.TryGetValue(domain, out var rules)) continue;
+                    foreach (var rule in rules) yield return rule;
+                }
             }
-            foreach (var rule in genericRules) yield return rule;
+            if (!disableGeneric)
+            {
+                foreach (var rule in genericRules) yield return rule;
+            }
         }
     }
 
@@ -2754,6 +2789,16 @@ internal sealed class AdBlockEngine
             var longestStart = -1;
             var longestLength = 0;
             var index = 0;
+            var schemePrefixLength = 0;
+            if (pattern.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                schemePrefixLength = 5; // "https"
+            }
+            else if (pattern.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+            {
+                schemePrefixLength = 4; // "http"
+            }
+
             while (index < pattern.Length)
             {
                 if (!IsIndexLiteralCharacter(pattern[index]))
@@ -2764,12 +2809,21 @@ internal sealed class AdBlockEngine
 
                 var start = index++;
                 while (index < pattern.Length && IsIndexLiteralCharacter(pattern[index])) index++;
+                if (start == 0 && schemePrefixLength > 0 && index - start == schemePrefixLength)
+                {
+                    continue;
+                }
                 var length = index - start;
                 if (length >= 3 && length > longestLength)
                 {
                     longestStart = start;
                     longestLength = length;
                 }
+            }
+
+            if (longestStart < 0 && schemePrefixLength >= 3)
+            {
+                return PackIndexKey(pattern, 0);
             }
 
             return longestStart < 0 ? null : PackIndexKey(pattern, longestStart);
@@ -2816,7 +2870,6 @@ internal sealed class AdBlockEngine
                     inCharacterClass = true;
                     continue;
                 }
-                if (value == '|') return false;
                 if (value == '(')
                 {
                     if (groupDepth == 0) BreakCurrent();
@@ -2834,6 +2887,7 @@ internal sealed class AdBlockEngine
                     if (value == '\\' && index + 1 < pattern.Length) index++;
                     continue;
                 }
+                if (value == '|') return false;
 
                 if (value == '\\')
                 {

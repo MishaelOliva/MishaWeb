@@ -19,9 +19,10 @@ internal static class StartPageArtwork
     private static readonly Color Coral = NativeUiTheme.BrandCoral;
     private static readonly Color Orchid = NativeUiTheme.Lavender;
     private static readonly Color Glyph = NativeUiTheme.Text;
-    private static readonly Lazy<Bitmap?> BackdropImage = new(
-        LoadBackdropImage,
-        LazyThreadSafetyMode.ExecutionAndPublication);
+    // Loaded inside BackdropFrameSync while backdropFrameLeases > 0 (released
+    // together with backdropFrame when the last start-page tab closes/hides).
+    private static Bitmap? backdropSource;
+    private static bool backdropSourceAttempted;
 
     // One process-wide frame is enough because only the visible native start page
     // paints. It is intentionally capped to the embedded artwork dimensions: a 4K
@@ -116,14 +117,27 @@ internal static class StartPageArtwork
                     clippedSlice.Height * destinationScaleY));
             }
 
+            var previousCompositingMode = graphics.CompositingMode;
             var previousCompositing = graphics.CompositingQuality;
             var previousInterpolation = graphics.InterpolationMode;
             var previousPixelOffset = graphics.PixelOffsetMode;
             try
             {
+                var isUnscaledOneToOneCopy = renderedFrameSize == viewportSize
+                    && adjustedDestination.Width == clippedSlice.Width
+                    && adjustedDestination.Height == clippedSlice.Height
+                    && Math.Abs(source.X - clippedSlice.X) < 0.01f
+                    && Math.Abs(source.Y - clippedSlice.Y) < 0.01f;
+                // backdropFrame is 100% opaque 24bpp RGB, so SourceCopy avoids alpha
+                // blending on every start-page and child slice paint.
+                graphics.CompositingMode = CompositingMode.SourceCopy;
                 graphics.CompositingQuality = CompositingQuality.HighSpeed;
-                graphics.InterpolationMode = InterpolationMode.HighQualityBilinear;
-                graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                graphics.InterpolationMode = isUnscaledOneToOneCopy
+                    ? InterpolationMode.NearestNeighbor
+                    : InterpolationMode.HighQualityBilinear;
+                graphics.PixelOffsetMode = isUnscaledOneToOneCopy
+                    ? PixelOffsetMode.None
+                    : PixelOffsetMode.HighQuality;
                 graphics.DrawImage(
                     backdropFrame,
                     adjustedDestination,
@@ -135,6 +149,7 @@ internal static class StartPageArtwork
             }
             finally
             {
+                graphics.CompositingMode = previousCompositingMode;
                 graphics.CompositingQuality = previousCompositing;
                 graphics.InterpolationMode = previousInterpolation;
                 graphics.PixelOffsetMode = previousPixelOffset;
@@ -171,6 +186,9 @@ internal static class StartPageArtwork
             renderedFrameSize = Size.Empty;
             renderedFrameKey = default;
             hasRenderedFrame = false;
+            backdropSource?.Dispose();
+            backdropSource = null;
+            backdropSourceAttempted = false;
         }
     }
 
@@ -209,6 +227,13 @@ internal static class StartPageArtwork
         renderedFrameSize = frameSize;
         renderedFrameKey = key;
         hasRenderedFrame = true;
+
+        if (SystemResourceInfo.CaptureMemory().IsLowSpecMachine && backdropSource is not null)
+        {
+            backdropSource.Dispose();
+            backdropSource = null;
+            backdropSourceAttempted = false;
+        }
     }
 
     private static void EnsureBackdropFrameCapacity(Size requiredSize, float dpiX, float dpiY)
@@ -252,10 +277,20 @@ internal static class StartPageArtwork
 
     private static Size GetFrameLimit()
     {
-        var backdrop = BackdropImage.Value;
+        var backdrop = GetCachedBackdropSource();
         return backdrop is null
             ? new Size(FallbackFrameWidth, FallbackFrameHeight)
             : backdrop.Size;
+    }
+
+    private static Bitmap? GetCachedBackdropSource()
+    {
+        if (!backdropSourceAttempted)
+        {
+            backdropSourceAttempted = true;
+            backdropSource = LoadBackdropImage();
+        }
+        return backdropSource;
     }
 
     private static int RoundUp(int value, int quantum)
@@ -274,62 +309,72 @@ internal static class StartPageArtwork
         var previousPixelOffset = graphics.PixelOffsetMode;
         graphics.SmoothingMode = SmoothingMode.AntiAlias;
         graphics.CompositingQuality = CompositingQuality.HighSpeed;
-        var backdrop = BackdropImage.Value;
-        if (backdrop is not null)
+        Bitmap? onDemandBackdrop = null;
+        var backdrop = backdropFrameLeases > 0
+            ? GetCachedBackdropSource()
+            : (onDemandBackdrop = LoadBackdropImage());
+        try
         {
-            graphics.InterpolationMode = InterpolationMode.HighQualityBilinear;
-            graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            var source = CalculateCoverSource(backdrop.Size, destination.Size);
-            graphics.DrawImage(
-                backdrop,
-                destination,
-                source.X,
-                source.Y,
-                source.Width,
-                source.Height,
-                GraphicsUnit.Pixel);
-
-            // A restrained center veil keeps labels crisp without hiding the
-            // edge bunnies, flowers, and v1-inspired light trails.
-            using var readabilityVeil = new LinearGradientBrush(
-                destination,
-                Color.FromArgb(3, NativeUiTheme.Window),
-                Color.FromArgb(16, NativeUiTheme.Window),
-                LinearGradientMode.Vertical);
-            graphics.FillRectangle(readabilityVeil, destination);
-        }
-        else
-        {
-            // Packaging failures still get a branded, renderer-free page.
-            using var background = new LinearGradientBrush(
-                destination,
-                BackdropTop,
-                BackdropBottom,
-                LinearGradientMode.Vertical);
-            background.InterpolationColors = new ColorBlend
+            if (backdrop is not null)
             {
-                Colors =
-                [
-                    Color.FromArgb(34, 13, 31),
-                    Color.FromArgb(55, 21, 48),
-                    Color.FromArgb(36, 14, 34),
-                    Color.FromArgb(24, 10, 25)
-                ],
-                Positions = [0f, 0.37f, 0.72f, 1f]
-            };
-            graphics.FillRectangle(background, destination);
+                graphics.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                var source = CalculateCoverSource(backdrop.Size, destination.Size);
+                graphics.DrawImage(
+                    backdrop,
+                    destination,
+                    source.X,
+                    source.Y,
+                    source.Width,
+                    source.Height,
+                    GraphicsUnit.Pixel);
 
-            var fallbackScale = Math.Max(1f, graphics.DpiX / 96f);
-            DrawSparkle(
-                graphics,
-                new PointF(destination.Left + (destination.Width * 0.16f), destination.Top + (destination.Height * 0.22f)),
-                6f * fallbackScale,
-                Color.FromArgb(88, NativeUiTheme.Focus));
-            DrawSparkle(
-                graphics,
-                new PointF(destination.Left + (destination.Width * 0.84f), destination.Top + (destination.Height * 0.28f)),
-                4f * fallbackScale,
-                Color.FromArgb(74, Orchid));
+                // A restrained center veil keeps labels crisp without hiding the
+                // edge bunnies, flowers, and v1-inspired light trails.
+                using var readabilityVeil = new LinearGradientBrush(
+                    destination,
+                    Color.FromArgb(3, NativeUiTheme.Window),
+                    Color.FromArgb(16, NativeUiTheme.Window),
+                    LinearGradientMode.Vertical);
+                graphics.FillRectangle(readabilityVeil, destination);
+            }
+            else
+            {
+                // Packaging failures still get a branded, renderer-free page.
+                using var background = new LinearGradientBrush(
+                    destination,
+                    BackdropTop,
+                    BackdropBottom,
+                    LinearGradientMode.Vertical);
+                background.InterpolationColors = new ColorBlend
+                {
+                    Colors =
+                    [
+                        Color.FromArgb(34, 13, 31),
+                        Color.FromArgb(55, 21, 48),
+                        Color.FromArgb(36, 14, 34),
+                        Color.FromArgb(24, 10, 25)
+                    ],
+                    Positions = [0f, 0.37f, 0.72f, 1f]
+                };
+                graphics.FillRectangle(background, destination);
+
+                var fallbackScale = Math.Max(1f, graphics.DpiX / 96f);
+                DrawSparkle(
+                    graphics,
+                    new PointF(destination.Left + (destination.Width * 0.16f), destination.Top + (destination.Height * 0.22f)),
+                    6f * fallbackScale,
+                    Color.FromArgb(88, NativeUiTheme.Focus));
+                DrawSparkle(
+                    graphics,
+                    new PointF(destination.Left + (destination.Width * 0.84f), destination.Top + (destination.Height * 0.28f)),
+                    4f * fallbackScale,
+                    Color.FromArgb(74, Orchid));
+            }
+        }
+        finally
+        {
+            onDemandBackdrop?.Dispose();
         }
 
         graphics.SmoothingMode = previousSmoothing;
@@ -354,8 +399,13 @@ internal static class StartPageArtwork
             using var decoded = Image.FromStream(
                 embedded,
                 useEmbeddedColorManagement: false,
-                validateImageData: true);
-            return new Bitmap(decoded);
+                validateImageData: false);
+            var rgb = new Bitmap(decoded.Width, decoded.Height, PixelFormat.Format24bppRgb);
+            rgb.SetResolution(decoded.HorizontalResolution, decoded.VerticalResolution);
+            using var graphics = Graphics.FromImage(rgb);
+            graphics.CompositingMode = CompositingMode.SourceCopy;
+            graphics.DrawImageUnscaledAndClipped(decoded, new Rectangle(Point.Empty, decoded.Size));
+            return rgb;
         }
         catch
         {

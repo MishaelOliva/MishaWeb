@@ -120,6 +120,7 @@ try {
             -p:DebugType=None `
             -p:DebugSymbols=false `
             -p:ContinuousIntegrationBuild=true `
+            -p:RestoreLockedMode=false `
             -p:Deterministic=true
 
         if ($LASTEXITCODE -ne 0 -or (-not (Test-Path -LiteralPath $targetExe))) {
