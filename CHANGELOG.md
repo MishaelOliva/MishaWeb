@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.4.1 - 2026-11-14
+
+### Downloads and notifications
+
+- Added `DownloadNotificationForm` (`NativeFeatureSurfaces.cs`), a non-activating toast popup anchored below the toolbar Downloads button that appears when downloads start, displays live progress, offers **Open**, **Show in folder**, **Cancel**, and **Downloads** quick actions, and auto-hides 5 seconds after completion (pausing while hovered).
+- Added an active indicator dot on the toolbar Downloads icon (`ChromeIconKind.Downloads`) while downloads are running, and persisted up to 50 `RecentDownloads` entries in `BrowserState.cs`.
+
+### UI, tabs, and suggestions
+
+- Expanded `NativeUiTheme.cs` with dark window frames, dark scrollbars, custom list-row rendering (`ModernListRowVisual`), glass tooltips, and `NativeAlertDialog` support across utility dialogs (`ExtensionsManagerForm.cs`, `SavedItemsDialog.cs`, `VoiceAudioSettingsDialog.cs`).
+- Added tab favicon rendering and clickable audio toggle indicators on `TabHeader` (`MainForm.cs`), plus `CleanShutdown` tracking and per-host `DarkModeExcludedHosts` support (`WebsiteThemePolicy.cs`).
+- Updated `AddressSuggestionEngine.cs` and `AddressSuggestionPopup.cs` to surface non-selected open tabs as switchable suggestions and deduplicate matching bookmarks.
+
+### Ad blocking and reader mode
+
+- Extended `AdBlockEngine.cs` with `AdBlockMatchResult` request attribution (`EvaluateRequest`), alongside updates in `AdBlockDocumentScript.cs`, `ReaderModeScript.cs`, `NativeStartPage.cs`, and `StartPageArtwork.cs`.
+
 ## 2.4.0 - 2026-11-13
 
 ### Start page, chrome UI, and artwork

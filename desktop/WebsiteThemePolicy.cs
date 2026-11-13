@@ -45,4 +45,60 @@ internal static class WebsiteThemePolicy
             AutoDarkModeCommand,
             GetAutoDarkModeParameters(darkModeEnabled));
     }
+
+    internal static bool IsHostExcluded(string? url, IReadOnlyCollection<string>? excludedHosts)
+    {
+        if (excludedHosts is null || excludedHosts.Count == 0)
+        {
+            return false;
+        }
+
+        var targetHost = NormalizeHttpHostOrHostname(url);
+        if (targetHost is null)
+        {
+            return false;
+        }
+
+        foreach (var entry in excludedHosts)
+        {
+            var normalizedEntry = BrowserPolicy.NormalizeExactHost(entry);
+            if (normalizedEntry is not null
+                && string.Equals(targetHost, normalizedEntry, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    internal static bool ShouldApplyAutoDark(
+        bool globalDarkModeEnabled,
+        string? url,
+        IReadOnlyCollection<string>? excludedHosts)
+    {
+        return globalDarkModeEnabled && !IsHostExcluded(url, excludedHosts);
+    }
+
+    private static string? NormalizeHttpHostOrHostname(string? urlOrHost)
+    {
+        if (string.IsNullOrWhiteSpace(urlOrHost))
+        {
+            return null;
+        }
+
+        var trimmed = urlOrHost.Trim();
+        if (trimmed.Contains("://", StringComparison.Ordinal))
+        {
+            if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri)
+                || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+            {
+                return null;
+            }
+
+            return BrowserPolicy.NormalizeExactHost(uri.IdnHost);
+        }
+
+        return BrowserPolicy.NormalizeExactHost(trimmed);
+    }
 }

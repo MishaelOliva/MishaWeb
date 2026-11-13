@@ -23,9 +23,8 @@ internal static class AdBlockDocumentScript
             const remoteStyleId = '__misha_adblock_remote_style';
             const controlChannel = '__MISHA_ADBLOCK_CONTROL_CHANNEL__';
             let enabledForDocument = window.__mishaAdBlockEnabled !== false;
-            let stopCleanup = () => {};
-            let stopRecovery = () => {};
-            let stopPristineFrameHook = () => {};
+            let stopYouTubeRuntime = () => {};
+            let syncYouTubeRecoveryMask = () => {};
             const bootstrapObservers = [];
             const stopBootstrapObservers = () => {
                 for (const observer of bootstrapObservers) observer.disconnect();
@@ -35,9 +34,7 @@ internal static class AdBlockDocumentScript
             const disableForDocument = () => {
                 enabledForDocument = false;
                 stopBootstrapObservers();
-                stopCleanup();
-                stopRecovery();
-                stopPristineFrameHook();
+                stopYouTubeRuntime();
                 document.getElementById(styleId)?.remove();
                 document.getElementById(remoteStyleId)?.remove();
             };
@@ -64,58 +61,9 @@ internal static class AdBlockDocumentScript
                 || value === 'youtubekids.com'
                 || value.endsWith('.youtubekids.com');
             const host = location.hostname.toLowerCase();
-            const isYouTube = isYouTubeHost(host);
-            const isYouTubeWatch = () => host === 'www.youtube.com'
-                && location.pathname === '/watch';
-            // The player loop re-reads the watch query several times per tick.
-            // Cache the parsed form and invalidate it on the exact string the
-            // browser exposes, so a single-page navigation can never reuse a
-            // stale video id or start offset.
-            let watchQueryKey = null;
-            let watchQueryCache = null;
-            const watchQuery = () => {
-                const search = location.search;
-                if (search !== watchQueryKey) {
-                    watchQueryKey = search;
-                    watchQueryCache = new URLSearchParams(search);
-                }
-                return watchQueryCache;
-            };
+            const isYouTube = /(^|\.)(youtube\.com|youtu\.be|youtube-nocookie\.com|googlevideo\.com)$/i.test(location.hostname)
+                || isYouTubeHost(host);
             const recoveryMaskAttribute = 'data-misha-youtube-recovery';
-            let recoveryMaskActive = false;
-            let recoveryMaskVerified = false;
-            let recoveryMaskTimer = 0;
-            const syncRecoveryMask = () => {
-                if (!document.documentElement) return;
-                if (!recoveryMaskActive) {
-                    document.documentElement.removeAttribute?.(recoveryMaskAttribute);
-                    return;
-                }
-                document.documentElement.setAttribute?.(
-                    recoveryMaskAttribute,
-                    recoveryMaskVerified ? 'verified' : '');
-            };
-            const clearRecoveryMask = () => {
-                recoveryMaskActive = false;
-                recoveryMaskVerified = false;
-                window.clearTimeout(recoveryMaskTimer);
-                recoveryMaskTimer = 0;
-                syncRecoveryMask();
-            };
-            const armRecoveryMask = (verified = false) => {
-                if (!isEnabled() || !isYouTubeWatch()) return;
-                const becameVerified = verified && !recoveryMaskVerified;
-                recoveryMaskActive = true;
-                recoveryMaskVerified ||= verified;
-                syncRecoveryMask();
-                if (becameVerified) {
-                    window.clearTimeout(recoveryMaskTimer);
-                    recoveryMaskTimer = 0;
-                }
-                if (recoveryMaskTimer) return;
-                // Fail open if YouTube never delivers a follow-up player response.
-                recoveryMaskTimer = window.setTimeout(clearRecoveryMask, 15_000);
-            };
 
             // Curated list rules and the audited selectors below cover YouTube.
             // Keep these broad fallback heuristics off its application shell so
@@ -193,8 +141,8 @@ internal static class AdBlockDocumentScript
                             + '{display:none !important; visibility:hidden !important; pointer-events:none !important;}'
                         : '');
                 document.documentElement.appendChild(style);
-                if (recoveryMaskActive) {
-                    syncRecoveryMask();
+                if (isYouTube) {
+                    syncYouTubeRecoveryMask();
                 }
             };
             installStyle();
@@ -213,6 +161,72 @@ internal static class AdBlockDocumentScript
             }
 
             if (!isYouTube || !isEnabled()) return;
+
+            const installYouTubeRuntime = () => {
+                if (!isYouTube || !isEnabled()) return;
+                let stopCleanup = () => {};
+                let stopRecovery = () => {};
+                let stopPristineFrameHook = () => {};
+                stopYouTubeRuntime = () => {
+                    stopCleanup();
+                    stopRecovery();
+                    stopPristineFrameHook();
+                };
+                const isYouTubeWatch = () => host === 'www.youtube.com'
+                    && location.pathname === '/watch';
+                // The player loop re-reads the watch query several times per tick.
+                // Cache the parsed form and invalidate it on the exact string the
+                // browser exposes, so a single-page navigation can never reuse a
+                // stale video id or start offset.
+                let watchQueryKey = null;
+                let watchQueryCache = null;
+                const watchQuery = () => {
+                    const search = location.search;
+                    if (search !== watchQueryKey) {
+                        watchQueryKey = search;
+                        watchQueryCache = new URLSearchParams(search);
+                    }
+                    return watchQueryCache;
+                };
+                let recoveryMaskActive = false;
+                let recoveryMaskVerified = false;
+                let recoveryMaskTimer = 0;
+                const syncRecoveryMask = () => {
+                    if (!document.documentElement) return;
+                    if (!recoveryMaskActive) {
+                        document.documentElement.removeAttribute?.(recoveryMaskAttribute);
+                        return;
+                    }
+                    document.documentElement.setAttribute?.(
+                        recoveryMaskAttribute,
+                        recoveryMaskVerified ? 'verified' : '');
+                };
+                syncYouTubeRecoveryMask = () => {
+                    if (recoveryMaskActive) {
+                        syncRecoveryMask();
+                    }
+                };
+                const clearRecoveryMask = () => {
+                    recoveryMaskActive = false;
+                    recoveryMaskVerified = false;
+                    window.clearTimeout(recoveryMaskTimer);
+                    recoveryMaskTimer = 0;
+                    syncRecoveryMask();
+                };
+                const armRecoveryMask = (verified = false) => {
+                    if (!isEnabled() || !isYouTubeWatch()) return;
+                    const becameVerified = verified && !recoveryMaskVerified;
+                    recoveryMaskActive = true;
+                    recoveryMaskVerified ||= verified;
+                    syncRecoveryMask();
+                    if (becameVerified) {
+                        window.clearTimeout(recoveryMaskTimer);
+                        recoveryMaskTimer = 0;
+                    }
+                    if (recoveryMaskTimer) return;
+                    // Fail open if YouTube never delivers a follow-up player response.
+                    recoveryMaskTimer = window.setTimeout(clearRecoveryMask, 15_000);
+                };
 
             // Avoid wrapping and traversing ordinary browse, search, comments,
             // and account responses. Player-bearing endpoints are the only
@@ -2094,6 +2108,8 @@ internal static class AdBlockDocumentScript
             if (!cleanupStarted && document.readyState === 'loading') {
                 document.addEventListener('DOMContentLoaded', startCleanup, { once: true });
             }
+            };
+            installYouTubeRuntime();
 
             // Keep the remotely compiled cosmetic style independently removable.
             void remoteStyleId;

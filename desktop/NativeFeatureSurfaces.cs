@@ -1,3 +1,5 @@
+using System.Drawing.Drawing2D;
+
 namespace MishaWeb;
 
 /// <summary>
@@ -102,13 +104,16 @@ internal sealed class CommandPaletteForm : Form
         queryBox.Font = NativeDialogLayout.QueryFont;
         resultList.Dock = DockStyle.Fill;
         resultList.IntegralHeight = false;
-        resultList.HorizontalScrollbar = true;
         resultList.Font = NativeDialogLayout.ListFont;
         resultList.AccessibleName = "Command palette results";
         root.Controls.Add(queryBox, 0, 0);
         root.Controls.Add(resultList, 0, 1);
         Controls.Add(root);
         NativeUiTheme.Apply(this);
+        NativeUiTheme.ConfigureModernListBox(
+            resultList,
+            50,
+            (index, _) => BuildPaletteVisual(index));
 
         queryBox.TextChanged += (_, _) => QueueRefresh();
         queryBox.KeyDown += OnKeyDown;
@@ -251,6 +256,33 @@ internal sealed class CommandPaletteForm : Form
         queryBox.Clear();
     }
 
+    private ModernListRowVisual BuildPaletteVisual(int index)
+    {
+        if (index < 0 || index >= rows.Count)
+        {
+            return new ModernListRowVisual(string.Empty, string.Empty, string.Empty);
+        }
+
+        var candidate = rows[index].Candidate;
+        var (category, glyph, accent) = candidate.Source switch
+        {
+            CommandSource.BrowserCommand => ("Command", ">", NativeUiTheme.Accent),
+            CommandSource.OpenTab => ("Open tab", "T", NativeUiTheme.Positive),
+            CommandSource.Favorite => ("Favorite", "*", NativeUiTheme.BrandCoral),
+            CommandSource.Session => ("Session", "S", NativeUiTheme.Lavender),
+            CommandSource.RecentlyClosed => ("Closed", "R", NativeUiTheme.Focus),
+            _ => ("History", "H", NativeUiTheme.Muted)
+        };
+        return new ModernListRowVisual(
+            candidate.Title,
+            candidate.Detail,
+            glyph,
+            accent,
+            StatusText: category,
+            StatusColor: accent,
+            ShortcutText: string.IsNullOrWhiteSpace(candidate.Shortcut) ? null : candidate.Shortcut);
+    }
+
     private sealed record PaletteRowDisplay(string Text, string AccessibleName)
     {
         public override string ToString() => Text;
@@ -279,7 +311,7 @@ internal sealed class MruSwitcherForm : Form
         MaximizeBox = false;
         ShowInTaskbar = false;
         KeyPreview = true;
-        ClientSize = new Size(420, 250);
+        ClientSize = new Size(460, 310);
         MinimumSize = new Size(360, 220);
         AccessibleRole = AccessibleRole.Dialog;
         AccessibleName = "Recent tabs";
@@ -290,6 +322,23 @@ internal sealed class MruSwitcherForm : Form
         itemList.AccessibleName = "Recent tabs list";
         Controls.Add(itemList);
         NativeUiTheme.Apply(this);
+        NativeUiTheme.ConfigureModernListBox(
+            itemList,
+            46,
+            (index, _) =>
+            {
+                if (index < 0 || index >= labels.Count)
+                {
+                    return new ModernListRowVisual(string.Empty, string.Empty, string.Empty);
+                }
+                var raw = labels[index];
+                var parts = raw.Split(" \u2014 ", 2, StringSplitOptions.None);
+                return new ModernListRowVisual(
+                    parts[0],
+                    parts.Length > 1 ? parts[1] : "Recent browser tab",
+                    "T",
+                    NativeUiTheme.Accent);
+            });
         KeyUp += (_, e) =>
         {
             if (e.KeyCode == Keys.Control && Visible) CommitSelection();
@@ -451,6 +500,28 @@ internal sealed class SessionManagerForm : Form
         root.Controls.Add(actions, 0, 1);
         Controls.Add(root);
         NativeUiTheme.Apply(this, openButton);
+        NativeUiTheme.ConfigureModernListBox(
+            sessionList,
+            50,
+            (index, _) =>
+            {
+                if (index < 0 || index >= sessions.Count)
+                {
+                    return new ModernListRowVisual(string.Empty, string.Empty, string.Empty);
+                }
+                var session = sessions[index];
+                var age = session.UpdatedUtc == DateTimeOffset.UnixEpoch
+                    ? "not dated"
+                    : session.UpdatedUtc.ToLocalTime().ToString("g");
+                var tabCount = session.Tabs.Count;
+                return new ModernListRowVisual(
+                    session.Name,
+                    $"Updated {age}",
+                    "S",
+                    NativeUiTheme.Lavender,
+                    StatusText: tabCount == 1 ? "1 tab" : $"{tabCount} tabs",
+                    StatusColor: NativeUiTheme.Accent);
+            });
 
         sessionList.SelectedIndexChanged += (_, _) => UpdateButtons();
         sessionList.DoubleClick += (_, _) => Raise(SessionManagerAction.Open);
@@ -710,6 +781,33 @@ internal sealed class PermissionManagerForm : Form
         root.Controls.Add(actions, 0, 1);
         Controls.Add(root);
         NativeUiTheme.Apply(this);
+        NativeUiTheme.ConfigureModernListBox(
+            settingList,
+            50,
+            (index, _) =>
+            {
+                if (index < 0 || index >= rows.Count)
+                {
+                    return new ModernListRowVisual(string.Empty, string.Empty, string.Empty);
+                }
+                var row = rows[index];
+                var statusColor = row.State.Contains("Allow", StringComparison.OrdinalIgnoreCase)
+                    ? NativeUiTheme.Positive
+                    : row.State.Contains("Block", StringComparison.OrdinalIgnoreCase)
+                        || row.State.Contains("Deny", StringComparison.OrdinalIgnoreCase)
+                        ? NativeUiTheme.Negative
+                        : NativeUiTheme.Muted;
+                var glyph = string.IsNullOrWhiteSpace(row.Permission)
+                    ? "P"
+                    : char.ToUpperInvariant(row.Permission.TrimStart()[0]).ToString();
+                return new ModernListRowVisual(
+                    row.Origin,
+                    row.Permission,
+                    glyph,
+                    statusColor,
+                    StatusText: row.State,
+                    StatusColor: statusColor);
+            });
         settingList.SelectedIndexChanged += (_, _) => UpdateButtons();
         resetButton.Click += (_, _) => Raise(PermissionManagerAction.ResetSelected);
         resetAllButton.Click += (_, _) => Raise(PermissionManagerAction.ResetAll);
@@ -849,7 +947,6 @@ internal sealed class DownloadsPopupForm : Form
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, NativeDialogLayout.WrappedActionRowHeight));
         downloadList.Dock = DockStyle.Fill;
         downloadList.IntegralHeight = false;
-        downloadList.HorizontalScrollbar = true;
         downloadList.Font = NativeDialogLayout.CompactListFont;
         downloadList.AccessibleName = "Downloads list";
         root.Controls.Add(downloadList, 0, 0);
@@ -865,6 +962,35 @@ internal sealed class DownloadsPopupForm : Form
         root.Controls.Add(actions, 0, 1);
         Controls.Add(root);
         NativeUiTheme.Apply(this, openButton);
+        NativeUiTheme.ConfigureModernListBox(
+            downloadList,
+            52,
+            (index, _) =>
+            {
+                if (index < 0 || index >= rows.Count)
+                {
+                    return new ModernListRowVisual(string.Empty, string.Empty, string.Empty);
+                }
+                var row = rows[index];
+                var stateColor = row.State.Equals("Complete", StringComparison.OrdinalIgnoreCase)
+                    ? NativeUiTheme.Positive
+                    : row.State.Equals("Interrupted", StringComparison.OrdinalIgnoreCase)
+                        || row.State.Equals("Canceled", StringComparison.OrdinalIgnoreCase)
+                        ? NativeUiTheme.Negative
+                        : row.State.Equals("Paused", StringComparison.OrdinalIgnoreCase)
+                            ? NativeUiTheme.SecondaryText
+                            : NativeUiTheme.Accent;
+                var detail = string.IsNullOrWhiteSpace(row.Detail)
+                    ? row.Progress
+                    : $"{row.Progress} \u00B7 {row.Detail}";
+                return new ModernListRowVisual(
+                    row.FileName,
+                    detail,
+                    "D",
+                    stateColor,
+                    StatusText: row.State,
+                    StatusColor: stateColor);
+            });
 
         downloadList.SelectedIndexChanged += (_, _) => UpdateButtons();
         downloadList.DoubleClick += (_, _) => Raise(DownloadPopupAction.Open);
@@ -996,5 +1122,614 @@ internal sealed class DownloadsPopupForm : Form
         rows = [];
         downloadList.Items.Clear();
         UpdateButtons();
+    }
+}
+
+internal sealed record DownloadNotificationState(
+    string FileName,
+    string State,
+    string ProgressText,
+    string DetailText,
+    int? Percent,
+    int ActiveCount,
+    bool CanOpen,
+    bool CanShowInFolder,
+    bool CanCancel,
+    object Token);
+
+/// <summary>
+/// Non-activating toast anchored beneath the toolbar Downloads button so users
+/// get immediate visual confirmation and quick actions as soon as a download starts.
+/// </summary>
+internal sealed class DownloadNotificationForm : Form
+{
+    private const int WsExNoActivate = 0x08000000;
+    private const int WsExToolWindow = 0x00000080;
+    private const int CompletionAutoHideMs = 5_000;
+    private const int HoverRecheckMs = 1_200;
+
+    private static readonly Font HeaderFont = new("Segoe UI Semibold", 9f);
+    private static readonly Font FileNameFont = new("Segoe UI Semibold", 9.5f);
+    private static readonly Font DetailFont = new("Segoe UI", 8.25f);
+    private static readonly Font DismissFont = new("Segoe UI", 9.5f);
+
+    private readonly Action<DownloadPopupAction, object> action;
+    private readonly Action openDownloadsList;
+    private readonly Label statusLabel = new();
+    private readonly Button dismissButton = new();
+    private readonly Label fileNameLabel = new();
+    private readonly Label detailLabel = new();
+    private readonly Panel progressTrack = new();
+    private readonly Button openButton = new();
+    private readonly Button folderButton = new();
+    private readonly Button cancelButton = new();
+    private readonly Button allDownloadsButton = new();
+    private readonly System.Windows.Forms.Timer autoHideTimer = new() { Interval = CompletionAutoHideMs };
+    private DownloadNotificationState? currentState;
+
+    public DownloadNotificationForm(
+        Action<DownloadPopupAction, object> action,
+        Action openDownloadsList)
+    {
+        this.action = action ?? throw new ArgumentNullException(nameof(action));
+        this.openDownloadsList = openDownloadsList ?? throw new ArgumentNullException(nameof(openDownloadsList));
+        NativeDialogLayout.EnableDpiScaling(this);
+        DoubleBuffered = true;
+        Text = "Download notification";
+        StartPosition = FormStartPosition.Manual;
+        FormBorderStyle = FormBorderStyle.None;
+        MinimizeBox = false;
+        MaximizeBox = false;
+        ShowInTaskbar = false;
+        KeyPreview = true;
+        ClientSize = new Size(376, 136);
+        Padding = new Padding(1);
+        AccessibleRole = AccessibleRole.Alert;
+        AccessibleName = "Download notification";
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Padding = new Padding(11, 9, 11, 9),
+            RowCount = 5,
+            ColumnCount = 1
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 18));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 12));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+
+        var headerRow = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Margin = Padding.Empty,
+            RowCount = 1,
+            ColumnCount = 2
+        };
+        headerRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        headerRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 24));
+
+        statusLabel.Dock = DockStyle.Fill;
+        statusLabel.Font = HeaderFont;
+        statusLabel.TextAlign = ContentAlignment.MiddleLeft;
+        statusLabel.AutoEllipsis = true;
+        statusLabel.AccessibleName = "Download status";
+
+        dismissButton.Dock = DockStyle.Fill;
+        dismissButton.Margin = Padding.Empty;
+        dismissButton.Text = "\u00D7";
+        dismissButton.Font = DismissFont;
+        dismissButton.TabStop = false;
+        dismissButton.AccessibleName = "Dismiss download notification";
+        dismissButton.AccessibleDescription = "Hide this download notification";
+
+        headerRow.Controls.Add(statusLabel, 0, 0);
+        headerRow.Controls.Add(dismissButton, 1, 0);
+
+        fileNameLabel.Dock = DockStyle.Fill;
+        fileNameLabel.Font = FileNameFont;
+        fileNameLabel.TextAlign = ContentAlignment.MiddleLeft;
+        fileNameLabel.AutoEllipsis = true;
+        fileNameLabel.AccessibleName = "Downloading file name";
+
+        detailLabel.Dock = DockStyle.Fill;
+        detailLabel.Font = DetailFont;
+        detailLabel.TextAlign = ContentAlignment.MiddleLeft;
+        detailLabel.AutoEllipsis = true;
+        detailLabel.AccessibleName = "Download progress";
+
+        progressTrack.Dock = DockStyle.Fill;
+        progressTrack.Margin = new Padding(0, 3, 0, 3);
+        progressTrack.Paint += OnProgressTrackPaint;
+
+        var actions = NativeDialogLayout.CreateActionBar(wrap: false);
+        ConfigureCompactButton(openButton, "Open", "Open the downloaded file");
+        ConfigureCompactButton(folderButton, "Show in folder", "Show the downloaded file in its folder");
+        ConfigureCompactButton(cancelButton, "Cancel", "Cancel the download");
+        ConfigureCompactButton(allDownloadsButton, "Downloads", "Show all downloads");
+        actions.Controls.AddRange([openButton, folderButton, cancelButton, allDownloadsButton]);
+
+        root.Controls.Add(headerRow, 0, 0);
+        root.Controls.Add(fileNameLabel, 0, 1);
+        root.Controls.Add(detailLabel, 0, 2);
+        root.Controls.Add(progressTrack, 0, 3);
+        root.Controls.Add(actions, 0, 4);
+        Controls.Add(root);
+
+        NativeUiTheme.Apply(this, openButton);
+        ApplyToastBackdropColors(root, headerRow, actions);
+        StyleDismissButton();
+
+        dismissButton.Click += (_, _) => Dismiss();
+        openButton.Click += (_, _) => InvokeTokenAction(DownloadPopupAction.Open);
+        folderButton.Click += (_, _) => InvokeTokenAction(DownloadPopupAction.ShowInFolder);
+        cancelButton.Click += (_, _) => InvokeTokenAction(DownloadPopupAction.Cancel);
+        allDownloadsButton.Click += (_, _) =>
+        {
+            Dismiss();
+            openDownloadsList();
+        };
+        autoHideTimer.Tick += (_, _) =>
+        {
+            if (IsDisposed || !Visible)
+            {
+                autoHideTimer.Stop();
+                return;
+            }
+            if (Bounds.Contains(Cursor.Position))
+            {
+                autoHideTimer.Interval = HoverRecheckMs;
+                return;
+            }
+            Dismiss();
+        };
+        FormClosing += (_, e) =>
+        {
+            if (e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                Dismiss();
+            }
+        };
+        SystemColorsChanged += (_, _) =>
+        {
+            ApplyToastBackdropColors(root, headerRow, actions);
+            StyleDismissButton();
+            ApplySemanticColors();
+        };
+    }
+
+    internal DownloadNotificationState? CurrentStateForTesting => currentState;
+
+    internal bool AutoHideArmedForTesting => autoHideTimer.Enabled;
+
+    protected override bool ShowWithoutActivation => true;
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ExStyle |= WsExNoActivate | WsExToolWindow;
+            return cp;
+        }
+    }
+
+    public void ShowOrUpdate(IWin32Window owner, Control? anchor, DownloadNotificationState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        ApplyState(state);
+        PositionNearAnchor(anchor);
+        if (!Visible)
+        {
+            Show(owner);
+        }
+        UpdateAutoHideSchedule(state);
+    }
+
+    public void UpdateIfVisible(Control? anchor, DownloadNotificationState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        ApplyState(state);
+        if (!Visible) return;
+        PositionNearAnchor(anchor);
+        UpdateAutoHideSchedule(state);
+    }
+
+    public void Reposition(Control? anchor)
+    {
+        if (!Visible) return;
+        PositionNearAnchor(anchor);
+    }
+
+    public void Dismiss()
+    {
+        autoHideTimer.Stop();
+        if (Visible) Hide();
+    }
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (keyData == Keys.Escape)
+        {
+            Dismiss();
+            return true;
+        }
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        if (ClientSize.Width <= 2 || ClientSize.Height <= 2) return;
+
+        var g = e.Graphics;
+        var highContrast = SystemInformation.HighContrast;
+        var bounds = new RectangleF(0.5f, 0.5f, ClientSize.Width - 1f, ClientSize.Height - 1f);
+        var dpi = Math.Max(96, DeviceDpi);
+        var radius = Math.Clamp((float)(8f * (dpi / 96f)), 4f, 14f);
+        using var outline = NativeUiTheme.CreateRoundedPath(bounds, radius);
+
+        if (highContrast)
+        {
+            using var borderPen = new Pen(SystemColors.WindowText, 1f);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.DrawPath(borderPen, outline);
+            return;
+        }
+
+        g.Clear(NativeUiTheme.Window);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var fill = new LinearGradientBrush(
+            bounds,
+            Color.FromArgb(255, 50, 22, 46),
+            NativeUiTheme.Window,
+            LinearGradientMode.Vertical))
+        {
+            g.FillPath(fill, outline);
+        }
+
+        var clipState = g.Save();
+        try
+        {
+            g.SetClip(outline, CombineMode.Intersect);
+            var sheenRect = new RectangleF(bounds.X, bounds.Y, bounds.Width, Math.Max(6f, 16f * (dpi / 96f)));
+            using var sheen = new LinearGradientBrush(
+                sheenRect,
+                Color.FromArgb(36, 255, 240, 250),
+                Color.FromArgb(0, NativeUiTheme.Window),
+                LinearGradientMode.Vertical);
+            g.FillRectangle(sheen, sheenRect);
+        }
+        finally
+        {
+            g.Restore(clipState);
+        }
+
+        using var rimBrush = new LinearGradientBrush(
+            bounds,
+            Color.FromArgb(190, 255, 224, 246),
+            Color.FromArgb(125, NativeUiTheme.Border),
+            LinearGradientMode.Vertical);
+        using var rimPen = new Pen(rimBrush, 1f);
+        g.DrawPath(rimPen, outline);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            autoHideTimer.Stop();
+            autoHideTimer.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+
+    private void ApplyState(DownloadNotificationState state)
+    {
+        currentState = state;
+        statusLabel.Text = BuildHeaderText(state);
+        fileNameLabel.Text = state.FileName;
+        detailLabel.Text = string.IsNullOrWhiteSpace(state.DetailText)
+            ? state.ProgressText
+            : $"{state.ProgressText} \u00B7 {state.DetailText}";
+        AccessibleDescription = $"{statusLabel.Text}: {state.FileName}. {detailLabel.Text}";
+
+        openButton.Visible = state.CanOpen;
+        openButton.Enabled = state.CanOpen;
+        folderButton.Visible = state.CanShowInFolder;
+        folderButton.Enabled = state.CanShowInFolder;
+        cancelButton.Visible = state.CanCancel;
+        cancelButton.Enabled = state.CanCancel;
+        allDownloadsButton.Visible = true;
+        allDownloadsButton.Enabled = true;
+
+        ApplySemanticColors();
+        progressTrack.Invalidate();
+    }
+
+    private void UpdateAutoHideSchedule(DownloadNotificationState state)
+    {
+        var isActive = state.ActiveCount > 0
+            || state.State.Equals("Downloading", StringComparison.OrdinalIgnoreCase);
+        autoHideTimer.Stop();
+        if (!isActive)
+        {
+            autoHideTimer.Interval = CompletionAutoHideMs;
+            autoHideTimer.Start();
+        }
+    }
+
+    private void PositionNearAnchor(Control? anchor)
+    {
+        if (anchor is null || !anchor.IsHandleCreated) return;
+        var bounds = anchor.RectangleToScreen(anchor.ClientRectangle);
+        Location = NativeDialogLayout.ClampToWorkingArea(
+            this,
+            new Point(bounds.Right - Width, bounds.Bottom + 6));
+    }
+
+    private void InvokeTokenAction(DownloadPopupAction requestedAction)
+    {
+        var state = currentState;
+        if (state is null) return;
+        if (requestedAction != DownloadPopupAction.Cancel)
+        {
+            Dismiss();
+        }
+        action(requestedAction, state.Token);
+    }
+
+    private void OnProgressTrackPaint(object? sender, PaintEventArgs e)
+    {
+        var width = progressTrack.ClientSize.Width;
+        var height = progressTrack.ClientSize.Height;
+        if (width <= 2 || height <= 2) return;
+
+        var g = e.Graphics;
+        var highContrast = SystemInformation.HighContrast;
+        g.Clear(highContrast ? SystemColors.Window : NativeUiTheme.Window);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+
+        var trackRect = new RectangleF(0.5f, 0.5f, width - 1f, height - 1f);
+        var radius = Math.Max(1.5f, trackRect.Height / 2f);
+        using var trackPath = NativeUiTheme.CreateRoundedPath(trackRect, radius);
+        using (var trackBrush = new SolidBrush(highContrast ? SystemColors.ControlDark : NativeUiTheme.Surface))
+        {
+            g.FillPath(trackBrush, trackPath);
+        }
+
+        var state = currentState;
+        if (state is not null)
+        {
+            var fillColor = GetStatusColor(state.State, highContrast);
+            var fraction = state.State.Equals("Complete", StringComparison.OrdinalIgnoreCase)
+                ? 1f
+                : state.Percent is { } pct
+                    ? Math.Clamp(pct / 100f, 0.04f, 1f)
+                    : state.State.Equals("Downloading", StringComparison.OrdinalIgnoreCase)
+                        ? 0.35f
+                        : 1f;
+            var fillWidth = Math.Max(trackRect.Height, trackRect.Width * fraction);
+            var fillRect = new RectangleF(trackRect.X, trackRect.Y, Math.Min(trackRect.Width, fillWidth), trackRect.Height);
+            var clipState = g.Save();
+            try
+            {
+                g.SetClip(trackPath, CombineMode.Intersect);
+                using var fillPath = NativeUiTheme.CreateRoundedPath(fillRect, Math.Min(radius, fillRect.Width / 2f));
+                using var fillBrush = new SolidBrush(fillColor);
+                g.FillPath(fillBrush, fillPath);
+            }
+            finally
+            {
+                g.Restore(clipState);
+            }
+        }
+
+        using var rimPen = new Pen(
+            highContrast ? SystemColors.WindowText : Color.FromArgb(90, NativeUiTheme.Border),
+            1f);
+        g.DrawPath(rimPen, trackPath);
+    }
+
+    private static void ApplyToastBackdropColors(params Control[] containers)
+    {
+        var backColor = SystemInformation.HighContrast ? SystemColors.Window : Color.Transparent;
+        foreach (var container in containers)
+        {
+            container.BackColor = backColor;
+        }
+    }
+
+    private void ApplySemanticColors()
+    {
+        var highContrast = SystemInformation.HighContrast;
+        statusLabel.ForeColor = currentState is null
+            ? (highContrast ? SystemColors.WindowText : NativeUiTheme.Text)
+            : GetStatusColor(currentState.State, highContrast);
+        fileNameLabel.ForeColor = highContrast ? SystemColors.WindowText : NativeUiTheme.Text;
+        detailLabel.ForeColor = NativeUiTheme.MutedText;
+    }
+
+    private void StyleDismissButton()
+    {
+        if (SystemInformation.HighContrast)
+        {
+            dismissButton.FlatStyle = FlatStyle.System;
+            dismissButton.BackColor = SystemColors.Control;
+            dismissButton.ForeColor = SystemColors.ControlText;
+            return;
+        }
+        dismissButton.FlatStyle = FlatStyle.Flat;
+        dismissButton.BackColor = Color.Transparent;
+        dismissButton.ForeColor = NativeUiTheme.Muted;
+        dismissButton.FlatAppearance.BorderSize = 0;
+        dismissButton.FlatAppearance.MouseOverBackColor = NativeUiTheme.Hover;
+        dismissButton.FlatAppearance.MouseDownBackColor = NativeUiTheme.Pressed;
+    }
+
+    private static string BuildHeaderText(DownloadNotificationState state)
+    {
+        if (state.State.Equals("Downloading", StringComparison.OrdinalIgnoreCase))
+        {
+            return state.ActiveCount > 1
+                ? $"Downloading ({state.ActiveCount} files)"
+                : "Downloading\u2026";
+        }
+        if (state.State.Equals("Complete", StringComparison.OrdinalIgnoreCase))
+        {
+            return state.ActiveCount > 0
+                ? $"Download complete ({state.ActiveCount} still downloading)"
+                : "Download complete";
+        }
+        if (state.State.Equals("Paused", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Download paused";
+        }
+        return "Download interrupted";
+    }
+
+    private static Color GetStatusColor(string state, bool highContrast)
+    {
+        if (highContrast) return SystemColors.WindowText;
+        if (state.Equals("Complete", StringComparison.OrdinalIgnoreCase)) return NativeUiTheme.Positive;
+        if (state.Equals("Interrupted", StringComparison.OrdinalIgnoreCase)) return NativeUiTheme.Negative;
+        if (state.Equals("Paused", StringComparison.OrdinalIgnoreCase)) return NativeUiTheme.SecondaryText;
+        return NativeUiTheme.Accent;
+    }
+
+    private static void ConfigureCompactButton(Button button, string text, string description)
+    {
+        button.AutoSize = true;
+        button.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        button.MinimumSize = new Size(64, 28);
+        button.Padding = new Padding(8, 0, 8, 0);
+        button.Margin = new Padding(6, 4, 0, 4);
+        button.Text = text;
+        button.AccessibleName = text;
+        button.AccessibleDescription = description;
+    }
+}
+
+internal sealed class NativeAlertDialog : Form
+{
+    private static readonly Font MessageFont = new("Segoe UI", 9.5f);
+    private static readonly Font BadgeFont = new("Segoe UI Semibold", 11.5f);
+
+    private NativeAlertDialog(
+        string title,
+        string message,
+        bool isConfirmation,
+        string primaryText,
+        string? secondaryText,
+        bool hasOwner)
+    {
+        NativeDialogLayout.EnableDpiScaling(this);
+        Text = title;
+        StartPosition = hasOwner ? FormStartPosition.CenterParent : FormStartPosition.CenterScreen;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MinimizeBox = false;
+        MaximizeBox = false;
+        ShowInTaskbar = false;
+        AutoSize = true;
+        AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        MinimumSize = new Size(380, 150);
+        AccessibleRole = AccessibleRole.Dialog;
+        AccessibleName = title;
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Padding = new Padding(16),
+            ColumnCount = 2,
+            RowCount = 2
+        };
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 42));
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, NativeDialogLayout.ActionRowHeight));
+
+        var badge = new Panel
+        {
+            Size = new Size(32, 32),
+            Margin = new Padding(0, 2, 10, 0),
+            TabStop = false
+        };
+        badge.Paint += (_, e) =>
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            var highContrast = SystemInformation.HighContrast;
+            var accent = isConfirmation ? NativeUiTheme.BrandCoral : NativeUiTheme.Accent;
+            var rect = new RectangleF(1f, 1f, badge.Width - 2f, badge.Height - 2f);
+            using var bgBrush = new SolidBrush(highContrast ? SystemColors.Highlight : Color.FromArgb(42, accent));
+            using var rimPen = new Pen(highContrast ? SystemColors.WindowText : accent, 1.25f);
+            g.FillEllipse(bgBrush, rect);
+            g.DrawEllipse(rimPen, rect);
+            TextRenderer.DrawText(
+                g,
+                isConfirmation ? "!" : "i",
+                BadgeFont,
+                badge.ClientRectangle,
+                highContrast ? SystemColors.HighlightText : accent,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+        };
+
+        var messageLabel = new Label
+        {
+            AutoSize = true,
+            MaximumSize = new Size(360, 0),
+            Margin = new Padding(0, 4, 0, 14),
+            Font = MessageFont,
+            Text = message,
+            AccessibleName = message
+        };
+
+        var primaryButton = new Button { DialogResult = DialogResult.OK };
+        NativeDialogLayout.ConfigureButton(primaryButton, primaryText, primaryText);
+
+        var actions = NativeDialogLayout.CreateActionBar();
+        if (!string.IsNullOrWhiteSpace(secondaryText))
+        {
+            var cancelButton = new Button { DialogResult = DialogResult.Cancel };
+            NativeDialogLayout.ConfigureButton(cancelButton, secondaryText, secondaryText);
+            actions.Controls.AddRange([cancelButton, primaryButton]);
+            CancelButton = cancelButton;
+        }
+        else
+        {
+            actions.Controls.Add(primaryButton);
+            CancelButton = primaryButton;
+        }
+
+        root.Controls.Add(badge, 0, 0);
+        root.Controls.Add(messageLabel, 1, 0);
+        root.Controls.Add(actions, 0, 1);
+        root.SetColumnSpan(actions, 2);
+
+        Controls.Add(root);
+        NativeUiTheme.Apply(this, primaryButton);
+        badge.BackColor = SystemInformation.HighContrast ? SystemColors.Window : NativeUiTheme.Window;
+        AcceptButton = primaryButton;
+    }
+
+    internal static void ShowInfo(IWin32Window? owner, string title, string message, string okText = "OK")
+    {
+        using var dialog = new NativeAlertDialog(title, message, isConfirmation: false, okText, secondaryText: null, hasOwner: owner is not null);
+        _ = dialog.ShowDialog(owner);
+    }
+
+    internal static bool Confirm(
+        IWin32Window? owner,
+        string title,
+        string message,
+        string confirmText = "Continue",
+        string cancelText = "Cancel")
+    {
+        using var dialog = new NativeAlertDialog(title, message, isConfirmation: true, confirmText, cancelText, hasOwner: owner is not null);
+        return dialog.ShowDialog(owner) == DialogResult.OK;
     }
 }

@@ -18,7 +18,8 @@ internal sealed record StartPageStatus(string ResourceMode, string Tabs)
 internal enum StartPageAction
 {
     CycleResourceMode,
-    ShowTabs
+    ShowTabs,
+    ManageQuickLinks
 }
 
 internal sealed class NativeStartPage : UserControl
@@ -54,6 +55,7 @@ internal sealed class NativeStartPage : UserControl
     private static readonly Font FeatureDetailFont = new("Segoe UI", 8.2f, FontStyle.Regular);
     private static readonly Font LinkTitleFont = new("Segoe UI Semibold", 9.1f, FontStyle.Regular);
     private static readonly Font LinkDetailFont = new("Segoe UI", 8f, FontStyle.Regular);
+    private static readonly Font ManageButtonFont = new("Segoe UI Semibold", 8.2f, FontStyle.Regular);
     private static readonly Font LinkMonogramFont = new("Segoe UI Semibold", 10.5f, FontStyle.Regular);
     private static readonly Font LinkSiteLetterFont = new("Segoe UI", 22f, FontStyle.Bold);
 
@@ -65,8 +67,11 @@ internal sealed class NativeStartPage : UserControl
     private readonly SmartSearchBar searchBar = new();
     private readonly TransparentPanel featureHost = new();
     private readonly FeatureChip[] featureChips;
+    private readonly TransparentPanel quickLinksHeader = new();
     private readonly SectionHeaderLabel quickLinksTitle = new();
+    private readonly ManageQuickLinksButton manageQuickLinksButton = new();
     private readonly TransparentPanel quickLinksHost = new();
+    private readonly ToolTip quickLinkToolTip = new();
     private bool arranging = true;
     private bool backdropFrameLeaseHeld;
     private bool disposingBackdropFrameLease;
@@ -179,7 +184,16 @@ internal sealed class NativeStartPage : UserControl
         featureHost.Controls.AddRange(featureChips);
         featureHost.Enabled = false;
 
-        quickLinksTitle.Dock = DockStyle.Fill;
+        NativeUiTheme.ConfigureGlassToolTip(quickLinkToolTip);
+
+        quickLinksHeader.Dock = DockStyle.Fill;
+        quickLinksHeader.Margin = Padding.Empty;
+        quickLinksHeader.TabStop = false;
+        quickLinksHeader.AccessibleName = "Quick links header";
+        quickLinksHeader.AccessibleRole = AccessibleRole.Grouping;
+        quickLinksHeader.Resize += (_, _) => ArrangeQuickLinksHeader();
+
+        quickLinksTitle.Dock = DockStyle.None;
         quickLinksTitle.Margin = Padding.Empty;
         TrySetTransparentBackColor(quickLinksTitle);
         quickLinksTitle.ForeColor = SecondaryTextColor;
@@ -188,6 +202,12 @@ internal sealed class NativeStartPage : UserControl
         quickLinksTitle.TextAlign = ContentAlignment.MiddleLeft;
         quickLinksTitle.TabStop = false;
         quickLinksTitle.AccessibleRole = AccessibleRole.StaticText;
+
+        manageQuickLinksButton.Click += (_, _) => ActionRequested?.Invoke(this, StartPageAction.ManageQuickLinks);
+        quickLinkToolTip.SetToolTip(manageQuickLinksButton, "Add, edit, or reorder Start Page quick links");
+
+        quickLinksHeader.Controls.Add(quickLinksTitle);
+        quickLinksHeader.Controls.Add(manageQuickLinksButton);
 
         quickLinksHost.Dock = DockStyle.Fill;
         quickLinksHost.Margin = Padding.Empty;
@@ -201,7 +221,7 @@ internal sealed class NativeStartPage : UserControl
         contentLayout.Controls.Add(taglineLabel, 0, 2);
         contentLayout.Controls.Add(searchBar, 0, 3);
         contentLayout.Controls.Add(featureHost, 0, 5);
-        contentLayout.Controls.Add(quickLinksTitle, 0, 6);
+        contentLayout.Controls.Add(quickLinksHeader, 0, 6);
         contentLayout.Controls.Add(quickLinksHost, 0, 7);
         card.Controls.Add(contentLayout);
         Controls.Add(card);
@@ -250,7 +270,9 @@ internal sealed class NativeStartPage : UserControl
             taglineLabel.Visible = true;
             taglineLabel.AccessibleDescription = "Incognito browsing is isolated from MishaWeb saved items";
             badge.AccessibleName = "Incognito browsing";
+            quickLinksHeader.Visible = false;
             quickLinksTitle.Visible = false;
+            manageQuickLinksButton.Visible = false;
             quickLinksHost.Visible = false;
         }
         else
@@ -264,7 +286,9 @@ internal sealed class NativeStartPage : UserControl
             taglineLabel.Visible = false;
             taglineLabel.AccessibleDescription = string.Empty;
             badge.AccessibleName = "MishaWeb logo";
+            quickLinksHeader.Visible = true;
             quickLinksTitle.Visible = true;
+            manageQuickLinksButton.Visible = true;
             quickLinksHost.Visible = currentQuickLinks.Length > 0;
         }
         AccessibleDescription = enabled
@@ -315,6 +339,7 @@ internal sealed class NativeStartPage : UserControl
             {
                 var control = quickLinksHost.Controls[0];
                 quickLinksHost.Controls.RemoveAt(0);
+                quickLinkToolTip.SetToolTip(control, string.Empty);
                 control.Dispose();
             }
 
@@ -367,6 +392,12 @@ internal sealed class NativeStartPage : UserControl
 
     internal bool ActivateActionForTesting(StartPageAction action)
     {
+        if (action == StartPageAction.ManageQuickLinks)
+        {
+            manageQuickLinksButton.PerformClickForTesting();
+            return true;
+        }
+
         var chip = featureChips.FirstOrDefault(item => item.Action == action);
         if (chip is null) return false;
         chip.PerformClickForTesting();
@@ -398,6 +429,7 @@ internal sealed class NativeStartPage : UserControl
                 backdropFrameLeaseHeld = false;
                 StartPageArtwork.ReleaseBackdropFrame();
             }
+            quickLinkToolTip.Dispose();
         }
         base.Dispose(disposing);
     }
@@ -469,6 +501,7 @@ internal sealed class NativeStartPage : UserControl
             contentLayout.Bounds = new Rectangle(0, 0, contentWidth, desiredHeight);
             card.PerformLayout();
             ArrangeFeatureChips();
+            ArrangeQuickLinksHeader();
             ArrangeQuickLinks();
         }
         finally
@@ -538,6 +571,12 @@ internal sealed class NativeStartPage : UserControl
         };
         button.Click += QuickLinkClicked;
         button.ContextRequested += (_, args) => QuickLinkContextRequested?.Invoke(this, args);
+        var tooltipTitle = TextSafety.SanitizeSingleLine(link.Title, 96);
+        if (tooltipTitle.Length == 0) tooltipTitle = "Quick link";
+        var tooltipUrl = TextSafety.FormatUrlForDisplay(link.Url, 160);
+        quickLinkToolTip.SetToolTip(
+            button,
+            tooltipUrl.Length > 0 ? $"{tooltipTitle} \u2014 {tooltipUrl}" : tooltipTitle);
         return button;
     }
 
@@ -606,6 +645,7 @@ internal sealed class NativeStartPage : UserControl
         quickLinksTitle.ForeColor = highContrast ? SystemColors.WindowText : FocusColor;
         card.Invalidate(true);
         foreach (var chip in featureChips) chip.Invalidate();
+        manageQuickLinksButton.Invalidate();
         quickLinksHost.Invalidate(true);
         Invalidate(true);
     }
@@ -636,12 +676,14 @@ internal sealed class NativeStartPage : UserControl
         {
             SetRowHeight(6, 0);
             contentLayout.RowStyles[7].Height = 0;
+            quickLinksHeader.Visible = false;
             quickLinksTitle.Visible = false;
+            manageQuickLinksButton.Visible = false;
             quickLinksHost.Visible = false;
         }
         else
         {
-            SetRowHeight(6, compact ? 26 : 32);
+            SetRowHeight(6, compact ? 28 : 34);
             if (hasQuickLinks)
             {
                 var columns = DetermineQuickLinkColumns(quickLinksHost.Controls.Count, contentWidth);
@@ -659,7 +701,9 @@ internal sealed class NativeStartPage : UserControl
                 ? "Quick links"
                 : "Quick links \u00B7 Add favorites to see them here";
             quickLinksTitle.AccessibleName = quickLinksTitle.Text;
+            quickLinksHeader.Visible = true;
             quickLinksTitle.Visible = true;
+            manageQuickLinksButton.Visible = true;
             quickLinksHost.Visible = hasQuickLinks;
         }
 
@@ -711,6 +755,37 @@ internal sealed class NativeStartPage : UserControl
         if (availableWidth < ScaleLogical(430)) return 1;
         if (availableWidth < ScaleLogical(660)) return 2;
         return featureChips.Length;
+    }
+
+    private void ArrangeQuickLinksHeader()
+    {
+        if (quickLinksHeader.ClientSize.Width <= 0 || quickLinksHeader.ClientSize.Height <= 0) return;
+
+        var headerWidth = quickLinksHeader.ClientSize.Width;
+        var headerHeight = quickLinksHeader.ClientSize.Height;
+        var gap = ScaleLogical(8);
+        var measuredText = TextRenderer.MeasureText(
+            "Manage",
+            ManageButtonFont,
+            Size.Empty,
+            TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+        var pillWidth = Math.Min(
+            Math.Max(1, headerWidth / 2),
+            Math.Max(ScaleLogical(74), measuredText.Width + ScaleLogical(34)));
+        var pillHeight = Math.Max(
+            Math.Min(headerHeight, ScaleLogical(20)),
+            Math.Min(headerHeight - Math.Max(2, ScaleLogical(4)), ScaleLogical(compactLayout ? 22 : 25)));
+
+        manageQuickLinksButton.Bounds = new Rectangle(
+            Math.Max(0, headerWidth - pillWidth),
+            Math.Max(0, (headerHeight - pillHeight) / 2),
+            pillWidth,
+            pillHeight);
+        quickLinksTitle.Bounds = new Rectangle(
+            0,
+            0,
+            Math.Max(1, manageQuickLinksButton.Left - gap),
+            headerHeight);
     }
 
     private void ArrangeQuickLinks()
@@ -1991,6 +2066,146 @@ internal sealed class NativeStartPage : UserControl
         }
     }
 
+    private sealed class ManageQuickLinksButton : Control
+    {
+        private bool hovered;
+        private bool pressed;
+
+        public ManageQuickLinksButton()
+        {
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint
+                | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.ResizeRedraw
+                | ControlStyles.Selectable
+                | ControlStyles.SupportsTransparentBackColor
+                | ControlStyles.UserPaint,
+                true);
+            NativeStartPage.TrySetTransparentBackColor(this);
+            ForeColor = SecondaryTextColor;
+            Cursor = Cursors.Hand;
+            TabStop = true;
+            AccessibleName = "Manage quick links";
+            AccessibleDescription = "Add, edit, or reorder quick links";
+            AccessibleRole = AccessibleRole.PushButton;
+            Text = "Manage";
+        }
+
+        public void PerformClickForTesting()
+        {
+            OnClick(EventArgs.Empty);
+        }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            hovered = true;
+            Invalidate();
+            base.OnMouseEnter(e);
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            hovered = false;
+            pressed = false;
+            Invalidate();
+            base.OnMouseLeave(e);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left) pressed = true;
+            Focus();
+            Invalidate();
+            base.OnMouseDown(e);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            pressed = false;
+            Invalidate();
+            base.OnMouseUp(e);
+        }
+
+        protected override void OnGotFocus(EventArgs e)
+        {
+            base.OnGotFocus(e);
+            Invalidate();
+        }
+
+        protected override void OnLostFocus(EventArgs e)
+        {
+            base.OnLostFocus(e);
+            pressed = false;
+            Invalidate();
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode is Keys.Enter or Keys.Space)
+            {
+                OnClick(EventArgs.Empty);
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+            }
+            base.OnKeyDown(e);
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            if (!PaintBackdropSlice(this, e)) base.OnPaintBackground(e);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var highContrastSelection = SystemInformation.HighContrast && (pressed || hovered || Focused);
+            var cardBounds = new RectangleF(0.5f, 0.5f, Math.Max(1f, Width - 1f), Math.Max(1f, Height - 1f));
+            var radius = Math.Max(6f, (Height - 1f) / 2f);
+            PaintLiquidGlassCard(e.Graphics, cardBounds, radius, hovered, pressed, Focused);
+
+            var scale = Math.Max(1f, DeviceDpi / 96f);
+            var textColor = SystemInformation.HighContrast
+                ? highContrastSelection ? SystemColors.HighlightText : SystemColors.WindowText
+                : hovered || Focused ? PrimaryTextColor : SecondaryTextColor;
+
+            var iconSize = Math.Max(7f, 8.5f * scale);
+            var iconLeft = Math.Max(7f, 9f * scale);
+            var iconTop = (Height - iconSize) / 2f;
+            var tile = Math.Max(2f, (iconSize - (2f * scale)) / 2f);
+            var step = tile + (2f * scale);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using var iconBrush = new SolidBrush(
+                SystemInformation.HighContrast ? textColor : hovered || Focused ? AccentColor : FocusColor);
+            for (var row = 0; row < 2; row++)
+            {
+                for (var col = 0; col < 2; col++)
+                {
+                    var rect = new RectangleF(iconLeft + (col * step), iconTop + (row * step), tile, tile);
+                    using var tilePath = CreateRoundedPath(rect, Math.Max(0.8f, 1.1f * scale));
+                    e.Graphics.FillPath(iconBrush, tilePath);
+                }
+            }
+
+            var textLeft = (int)Math.Ceiling(iconLeft + iconSize + (5f * scale));
+            var textBounds = new Rectangle(
+                textLeft,
+                0,
+                Math.Max(1, Width - textLeft - Math.Max(5, (int)Math.Round(7f * scale))),
+                Height);
+            TextRenderer.DrawText(
+                e.Graphics,
+                "Manage",
+                ManageButtonFont,
+                textBounds,
+                textColor,
+                TextFormatFlags.HorizontalCenter
+                | TextFormatFlags.VerticalCenter
+                | TextFormatFlags.EndEllipsis
+                | TextFormatFlags.NoPadding
+                | TextFormatFlags.NoPrefix
+                | TextFormatFlags.SingleLine);
+        }
+    }
+
     private sealed class SectionHeaderLabel : Label
     {
         public SectionHeaderLabel()
@@ -2103,27 +2318,14 @@ internal sealed class NativeStartPage : UserControl
             StartPageArtwork.DrawBrandMark(e.Graphics, markBounds);
             if (!IsPrivateMode) return;
 
-            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            var badgeSize = Math.Max(10, Math.Min(markBounds.Width, markBounds.Height) / 3);
-            var badgeBounds = new Rectangle(
-                markBounds.Right - badgeSize - 1,
-                markBounds.Bottom - badgeSize - 1,
-                badgeSize,
-                badgeSize);
-            using var fill = new SolidBrush(NativeUiTheme.Lavender);
-            using var border = new Pen(Color.FromArgb(120, 60, 148), 1f);
-            e.Graphics.FillEllipse(fill, badgeBounds);
-            e.Graphics.DrawEllipse(border, badgeBounds);
-            TextRenderer.DrawText(
-                e.Graphics,
-                "I",
-                Font,
-                badgeBounds,
-                NativeUiTheme.AccentText,
-                TextFormatFlags.HorizontalCenter
-                | TextFormatFlags.VerticalCenter
-                | TextFormatFlags.NoPadding
-                | TextFormatFlags.SingleLine);
+            var badgeWidth = Math.Max(22f, markBounds.Width * 0.50f);
+            var badgeHeight = Math.Max(14f, markBounds.Height * 0.30f);
+            var badgeBounds = new RectangleF(
+                markBounds.Right - badgeWidth,
+                markBounds.Bottom - badgeHeight,
+                badgeWidth,
+                badgeHeight);
+            StartPageArtwork.DrawIncognitoBadge(e.Graphics, badgeBounds);
         }
     }
 }

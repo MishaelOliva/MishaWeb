@@ -12,7 +12,7 @@ internal sealed class AddressSuggestionPopup : Control
     private static readonly Color AccentColor = NativeUiTheme.Accent;
     private static readonly Font PrimaryFont = new("Segoe UI Semibold", 9.5f);
     private static readonly Font SecondaryFont = new("Segoe UI", 8.25f);
-    private static readonly Font IconFont = new("Segoe UI Symbol", 10f);
+    private static readonly Font PillFont = new("Segoe UI Semibold", 8f);
 
     private IReadOnlyList<AddressSuggestion> allSuggestions = Array.Empty<AddressSuggestion>();
     private IReadOnlyList<AddressSuggestion> suggestions = Array.Empty<AddressSuggestion>();
@@ -21,8 +21,6 @@ internal sealed class AddressSuggestionPopup : Control
     private int removeHoverIndex = -1;
     private int pressedIndex = -1;
     private bool pressedRemove;
-    private Size lastRegionSize;
-    private int lastRegionRadius;
 
     public AddressSuggestionPopup()
     {
@@ -33,7 +31,7 @@ internal sealed class AddressSuggestionPopup : Control
             | ControlStyles.UserPaint,
             true);
         SetStyle(ControlStyles.Selectable, false);
-        BackColor = SystemInformation.HighContrast ? SystemColors.Window : SurfaceColor;
+        BackColor = SystemInformation.HighContrast ? SystemColors.Window : NativeUiTheme.Window;
         Visible = false;
         TabStop = false;
         AccessibleRole = AccessibleRole.List;
@@ -190,22 +188,18 @@ internal sealed class AddressSuggestionPopup : Control
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
-        if (Width <= 1 || Height <= 1) return;
-        var currentSize = new Size(Width, Height);
-        var radius = Scale(10);
-        if (lastRegionSize == currentSize && lastRegionRadius == radius && Region is not null) return;
-        lastRegionSize = currentSize;
-        lastRegionRadius = radius;
-        using var path = CreateRoundedPath(new Rectangle(0, 0, Width, Height), radius);
-        var previous = Region;
-        Region = new Region(path);
-        previous?.Dispose();
+        if (Region is not null)
+        {
+            var previous = Region;
+            Region = null;
+            previous.Dispose();
+        }
     }
 
     protected override void OnSystemColorsChanged(EventArgs e)
     {
         base.OnSystemColorsChanged(e);
-        BackColor = SystemInformation.HighContrast ? SystemColors.Window : SurfaceColor;
+        BackColor = SystemInformation.HighContrast ? SystemColors.Window : NativeUiTheme.Window;
         Invalidate();
     }
 
@@ -229,7 +223,7 @@ internal sealed class AddressSuggestionPopup : Control
         }
         var nextRemoveHover = index >= 0
             && index < suggestions.Count
-            && !suggestions[index].IsSearch
+            && CanRemoveSuggestion(suggestions[index])
             && GetRemoveButtonBounds(index).Contains(e.Location)
                 ? index
                 : -1;
@@ -260,7 +254,7 @@ internal sealed class AddressSuggestionPopup : Control
         if (index < 0 || index >= suggestions.Count) return;
         SelectedIndex = index;
         pressedIndex = index;
-        pressedRemove = !suggestions[index].IsSearch && GetRemoveButtonBounds(index).Contains(e.Location);
+        pressedRemove = CanRemoveSuggestion(suggestions[index]) && GetRemoveButtonBounds(index).Contains(e.Location);
         Invalidate();
     }
 
@@ -274,11 +268,11 @@ internal sealed class AddressSuggestionPopup : Control
             && index < suggestions.Count;
         var remove = activate
             && pressedRemove
+            && CanRemoveSuggestion(suggestions[index])
             && GetRemoveButtonBounds(index).Contains(e.Location);
         if (activate)
         {
             if (remove) SuggestionRemoved?.Invoke(suggestions[index]);
-            else if (!suggestions[index].IsSearch) SuggestionAccepted?.Invoke(suggestions[index]);
             else SuggestionAccepted?.Invoke(suggestions[index]);
         }
         pressedIndex = -1;
@@ -289,46 +283,114 @@ internal sealed class AddressSuggestionPopup : Control
     protected override void OnPaint(PaintEventArgs e)
     {
         if (Width <= 1 || Height <= 1) return;
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        e.Graphics.Clear(SystemInformation.HighContrast ? SystemColors.Window : SurfaceColor);
 
-        var rowHeight = ScaledRowHeight;
-        for (var index = 0; index < suggestions.Count; index++)
+        var g = e.Graphics;
+        var highContrast = SystemInformation.HighContrast;
+        g.Clear(highContrast ? SystemColors.Window : NativeUiTheme.Window);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+
+        var radius = Scale(12);
+        var containerRect = new RectangleF(0.5f, 0.5f, Math.Max(2f, Width - 1f), Math.Max(2f, Height - 1f));
+        using var outline = NativeUiTheme.CreateRoundedPath(containerRect, radius);
+
+        if (highContrast)
         {
-            var row = new Rectangle(1, 1 + (index * rowHeight), Math.Max(0, Width - 2), rowHeight);
-            var highlighted = index == selectedIndex || index == hoverIndex;
-            if (highlighted)
-            {
-                using var selectedBrush = new SolidBrush(
-                    SystemInformation.HighContrast ? SystemColors.Highlight : SelectedColor);
-                e.Graphics.FillRectangle(selectedBrush, row);
-                if (!SystemInformation.HighContrast && index == selectedIndex)
-                {
-                    using var selectionCue = new SolidBrush(AccentColor);
-                    e.Graphics.FillRectangle(
-                        selectionCue,
-                        row.Left,
-                        row.Top + Scale(4),
-                        Math.Max(2, Scale(3)),
-                        Math.Max(1, row.Height - Scale(8)));
-                }
-            }
-
-            DrawSuggestion(e.Graphics, suggestions[index], row);
-            if (!suggestions[index].IsSearch) DrawRemoveButton(e.Graphics, index);
-            if (index < suggestions.Count - 1)
-            {
-                using var separator = new Pen(
-                    SystemInformation.HighContrast
-                        ? highlighted ? SystemColors.HighlightText : SystemColors.WindowText
-                        : Color.FromArgb(128, NativeUiTheme.Border));
-                e.Graphics.DrawLine(separator, Scale(42), row.Bottom - 1, Width - Scale(12), row.Bottom - 1);
-            }
+            using var hcFill = new SolidBrush(SystemColors.Window);
+            g.FillPath(hcFill, outline);
+        }
+        else
+        {
+            using var glassFill = new LinearGradientBrush(
+                containerRect,
+                Color.FromArgb(255, 52, 22, 47),
+                Color.FromArgb(255, 29, 12, 26),
+                LinearGradientMode.Vertical);
+            g.FillPath(glassFill, outline);
         }
 
-        using var border = new Pen(SystemInformation.HighContrast ? SystemColors.WindowText : BorderColor);
-        using var outline = CreateRoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), Scale(10));
-        e.Graphics.DrawPath(border, outline);
+        var clipState = g.Save();
+        try
+        {
+            g.SetClip(outline, CombineMode.Intersect);
+            if (!highContrast)
+            {
+                var topSheenRect = new RectangleF(containerRect.X, containerRect.Y, containerRect.Width, Scale(16));
+                using var topSheen = new LinearGradientBrush(
+                    topSheenRect,
+                    Color.FromArgb(44, 255, 240, 250),
+                    Color.FromArgb(0, SurfaceColor),
+                    LinearGradientMode.Vertical);
+                g.FillRectangle(topSheen, topSheenRect);
+
+                var bottomGlowRect = new RectangleF(containerRect.X, containerRect.Bottom - Scale(12), containerRect.Width, Scale(12));
+                using var bottomGlow = new LinearGradientBrush(
+                    bottomGlowRect,
+                    Color.FromArgb(0, SurfaceColor),
+                    Color.FromArgb(28, AccentColor),
+                    LinearGradientMode.Vertical);
+                g.FillRectangle(bottomGlow, bottomGlowRect);
+            }
+
+            var rowHeight = ScaledRowHeight;
+            for (var index = 0; index < suggestions.Count; index++)
+            {
+                var row = new Rectangle(1, 1 + (index * rowHeight), Math.Max(0, Width - 2), rowHeight);
+                var isSelected = index == selectedIndex;
+                var isHovered = index == hoverIndex;
+                var highlighted = isSelected || isHovered;
+                if (highlighted)
+                {
+                    DrawRowHighlight(g, row, suggestions[index], isSelected, highContrast);
+                }
+
+                DrawSuggestion(g, suggestions[index], row);
+                if (CanRemoveSuggestion(suggestions[index])) DrawRemoveButton(g, index);
+
+                var nextHighlighted = (index + 1) == selectedIndex || (index + 1) == hoverIndex;
+                if (index < suggestions.Count - 1 && !highlighted && !nextHighlighted)
+                {
+                    using var separator = new Pen(
+                        highContrast
+                            ? SystemColors.WindowText
+                            : Color.FromArgb(46, BorderColor));
+                    g.DrawLine(separator, Scale(55), row.Bottom - 1, Width - Scale(14), row.Bottom - 1);
+                }
+            }
+        }
+        finally
+        {
+            g.Restore(clipState);
+        }
+
+        if (highContrast)
+        {
+            using var border = new Pen(SystemColors.WindowText, 1f);
+            g.DrawPath(border, outline);
+        }
+        else
+        {
+            using var rimBrush = new LinearGradientBrush(
+                containerRect,
+                Color.FromArgb(185, 255, 224, 246),
+                Color.FromArgb(120, AccentColor),
+                LinearGradientMode.Vertical);
+            using var border = new Pen(rimBrush, 1.1f);
+            g.DrawPath(border, outline);
+
+            var innerRect = containerRect;
+            innerRect.Inflate(-1f, -1f);
+            if (innerRect.Width > 6f && innerRect.Height > 6f)
+            {
+                using var innerPath = NativeUiTheme.CreateRoundedPath(innerRect, Math.Max(2f, radius - 1f));
+                using var innerRimBrush = new LinearGradientBrush(
+                    innerRect,
+                    Color.FromArgb(52, 255, 255, 255),
+                    Color.FromArgb(14, NativeUiTheme.Focus),
+                    LinearGradientMode.Vertical);
+                using var innerRimPen = new Pen(innerRimBrush, 1f);
+                g.DrawPath(innerRimPen, innerPath);
+            }
+        }
     }
 
     protected override AccessibleObject CreateAccessibilityInstance()
@@ -412,36 +474,127 @@ internal sealed class AddressSuggestionPopup : Control
         }
     }
 
+    private static bool CanRemoveSuggestion(AddressSuggestion suggestion) =>
+        suggestion.Source is AddressSuggestionSource.Bookmark or AddressSuggestionSource.History;
+
+    private void DrawRowHighlight(
+        Graphics graphics,
+        Rectangle row,
+        AddressSuggestion suggestion,
+        bool isSelected,
+        bool highContrast)
+    {
+        var pillBounds = new RectangleF(
+            row.Left + Scale(6),
+            row.Top + Scale(3),
+            Math.Max(4f, row.Width - Scale(12)),
+            Math.Max(4f, row.Height - Scale(6)));
+        var radius = Scale(8);
+        using var pillPath = NativeUiTheme.CreateRoundedPath(pillBounds, radius);
+
+        if (highContrast)
+        {
+            using var hcBrush = new SolidBrush(isSelected ? SystemColors.Highlight : SystemColors.Control);
+            graphics.FillPath(hcBrush, pillPath);
+            if (isSelected)
+            {
+                using var hcPen = new Pen(SystemColors.HighlightText, 1f);
+                graphics.DrawPath(hcPen, pillPath);
+            }
+            return;
+        }
+
+        if (isSelected)
+        {
+            using var pillFill = new LinearGradientBrush(
+                pillBounds,
+                NativeUiTheme.SurfaceRaised,
+                SelectedColor,
+                LinearGradientMode.Vertical);
+            graphics.FillPath(pillFill, pillPath);
+
+            var sheenRect = new RectangleF(
+                pillBounds.X + 1f,
+                pillBounds.Y + 1f,
+                Math.Max(2f, pillBounds.Width - 2f),
+                Math.Max(3f, pillBounds.Height * 0.36f));
+            using var sheen = new LinearGradientBrush(
+                sheenRect,
+                Color.FromArgb(38, 255, 240, 250),
+                Color.FromArgb(0, NativeUiTheme.SurfaceRaised),
+                LinearGradientMode.Vertical);
+            graphics.FillRectangle(sheen, sheenRect);
+
+            using var rim = new Pen(Color.FromArgb(190, NativeUiTheme.Focus), 1f);
+            graphics.DrawPath(rim, pillPath);
+
+            var cueWidth = Math.Max(2.5f, Scale(3));
+            var cueColor = suggestion.Source == AddressSuggestionSource.OpenTab
+                ? NativeUiTheme.Positive
+                : AccentColor;
+            var cueRect = new RectangleF(
+                pillBounds.X + Scale(3),
+                pillBounds.Y + Scale(7),
+                cueWidth,
+                Math.Max(4f, pillBounds.Height - Scale(14)));
+            using var cuePath = NativeUiTheme.CreateRoundedPath(cueRect, cueWidth / 2f);
+            using var cueBrush = new SolidBrush(cueColor);
+            graphics.FillPath(cueBrush, cuePath);
+            return;
+        }
+
+        using var hoverFill = new SolidBrush(Color.FromArgb(150, NativeUiTheme.Hover));
+        graphics.FillPath(hoverFill, pillPath);
+        using var hoverRim = new Pen(Color.FromArgb(95, BorderColor), 1f);
+        graphics.DrawPath(hoverRim, pillPath);
+    }
+
     private void DrawSuggestion(Graphics graphics, AddressSuggestion suggestion, Rectangle row)
     {
-        var iconBounds = new Rectangle(Scale(12), row.Top + ((row.Height - Scale(26)) / 2), Scale(26), Scale(26));
+        var iconSize = Scale(28);
+        var iconBounds = new Rectangle(Scale(17), row.Top + ((row.Height - iconSize) / 2), iconSize, iconSize);
+        var iconBoundsF = new RectangleF(iconBounds.X, iconBounds.Y, iconBounds.Width, iconBounds.Height);
         var index = (row.Top - 1) / ScaledRowHeight;
         var selected = index == selectedIndex || index == hoverIndex;
-        using var iconBackground = new SolidBrush(
-            SystemInformation.HighContrast
-                ? selected ? SystemColors.Highlight : SystemColors.Window
-                : NativeUiTheme.SurfaceRaised);
-        graphics.FillEllipse(iconBackground, iconBounds);
-        var icon = suggestion.Source switch
+        var highContrast = SystemInformation.HighContrast;
+        var iconAccent = suggestion.Source switch
         {
-            AddressSuggestionSource.Bookmark => "\u2605",
-            AddressSuggestionSource.History when suggestion.IsSearchHistory => "\u21BB",
-            AddressSuggestionSource.History => "\u29C9",
-            _ => "\u2315"
+            AddressSuggestionSource.OpenTab => NativeUiTheme.Positive,
+            AddressSuggestionSource.Bookmark => NativeUiTheme.BrandCoral,
+            AddressSuggestionSource.History => NativeUiTheme.Lavender,
+            _ => AccentColor
         };
-        TextRenderer.DrawText(
-            graphics,
-            icon,
-            IconFont,
-            iconBounds,
-            SystemInformation.HighContrast
-                ? selected ? SystemColors.HighlightText : SystemColors.WindowText
-                : AccentColor,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
 
+        using (var iconPath = NativeUiTheme.CreateRoundedPath(iconBoundsF, Scale(8)))
+        {
+            using var iconBackground = new SolidBrush(
+                highContrast
+                    ? (selected ? SystemColors.Highlight : SystemColors.Window)
+                    : Color.FromArgb(selected ? 68 : 42, iconAccent));
+            graphics.FillPath(iconBackground, iconPath);
+
+            using var iconBorder = new Pen(
+                highContrast
+                    ? (selected ? SystemColors.HighlightText : SystemColors.WindowText)
+                    : Color.FromArgb(selected ? 190 : 120, iconAccent),
+                1f);
+            graphics.DrawPath(iconBorder, iconPath);
+        }
+
+        var glyphColor = highContrast
+            ? (selected ? SystemColors.HighlightText : SystemColors.WindowText)
+            : (selected ? PrimaryTextColor : iconAccent);
+        DrawSuggestionGlyph(graphics, suggestion, iconBoundsF, glyphColor);
+
+        var pillText = suggestion.Source == AddressSuggestionSource.OpenTab
+            ? "Switch to tab"
+            : suggestion.IsTopMatch ? "Top match" : null;
+        var badgeWidth = pillText is null
+            ? 0
+            : suggestion.Source == AddressSuggestionSource.OpenTab ? Scale(92) : Scale(74);
+        var rightMargin = Scale(42);
         var textLeft = iconBounds.Right + Scale(10);
-        var badgeWidth = suggestion.IsTopMatch ? Scale(74) : 0;
-        var textWidth = Math.Max(10, row.Right - textLeft - Scale(42) - badgeWidth);
+        var textWidth = Math.Max(10, row.Right - textLeft - rightMargin - badgeWidth);
         var titleBounds = new Rectangle(textLeft, row.Top + Scale(7), textWidth, Scale(18));
         var detailBounds = new Rectangle(textLeft, titleBounds.Bottom, textWidth, Scale(16));
         TextRenderer.DrawText(
@@ -449,9 +602,9 @@ internal sealed class AddressSuggestionPopup : Control
             suggestion.Title,
             PrimaryFont,
             titleBounds,
-            SystemInformation.HighContrast && selected
+            highContrast && selected
                 ? SystemColors.HighlightText
-                : SystemInformation.HighContrast
+                : highContrast
                     ? SystemColors.WindowText
                     : suggestion.IsSearch && !selected ? AccentColor : PrimaryTextColor,
             TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
@@ -460,59 +613,194 @@ internal sealed class AddressSuggestionPopup : Control
             suggestion.Detail,
             SecondaryFont,
             detailBounds,
-            SystemInformation.HighContrast && selected ? SystemColors.HighlightText : SystemInformation.HighContrast ? SystemColors.WindowText : SecondaryTextColor,
+            highContrast && selected
+                ? SystemColors.HighlightText
+                : highContrast ? SystemColors.WindowText : SecondaryTextColor,
             TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
 
-        if (suggestion.IsTopMatch)
+        if (pillText is not null)
         {
+            var pillAccent = suggestion.Source == AddressSuggestionSource.OpenTab
+                ? NativeUiTheme.Positive
+                : AccentColor;
             var badgeBounds = new Rectangle(
-                row.Right - Scale(40) - badgeWidth,
-                row.Top + ((row.Height - Scale(18)) / 2),
+                row.Right - rightMargin - badgeWidth,
+                row.Top + ((row.Height - Scale(20)) / 2),
                 badgeWidth - Scale(6),
-                Scale(18));
-            using var badgeBrush = new SolidBrush(
-                SystemInformation.HighContrast
-                    ? selected ? SystemColors.Highlight : SystemColors.Window
-                    : Color.FromArgb(32, AccentColor));
-            using var badgePath = CreateRoundedPath(badgeBounds, Scale(4));
-            if (!SystemInformation.HighContrast)
+                Scale(20));
+            var badgeBoundsF = new RectangleF(badgeBounds.X, badgeBounds.Y, badgeBounds.Width, badgeBounds.Height);
+            using var badgePath = NativeUiTheme.CreateRoundedPath(badgeBoundsF, badgeBoundsF.Height / 2f);
+            if (!highContrast)
             {
+                using var badgeBrush = new SolidBrush(Color.FromArgb(40, pillAccent));
                 graphics.FillPath(badgeBrush, badgePath);
+                using var badgeRim = new Pen(Color.FromArgb(145, pillAccent), 1f);
+                graphics.DrawPath(badgeRim, badgePath);
             }
+            else if (selected)
+            {
+                using var hcRim = new Pen(SystemColors.HighlightText, 1f);
+                graphics.DrawPath(hcRim, badgePath);
+            }
+
             TextRenderer.DrawText(
                 graphics,
-                "Top match",
-                SecondaryFont,
+                pillText,
+                PillFont,
                 badgeBounds,
-                SystemInformation.HighContrast
-                    ? selected ? SystemColors.HighlightText : SystemColors.WindowText
-                    : AccentColor,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                highContrast
+                    ? (selected ? SystemColors.HighlightText : SystemColors.WindowText)
+                    : pillAccent,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
         }
+    }
+
+    private void DrawSuggestionGlyph(
+        Graphics graphics,
+        AddressSuggestion suggestion,
+        RectangleF iconBounds,
+        Color color)
+    {
+        var pad = Math.Max(4f, iconBounds.Width * 0.25f);
+        var area = RectangleF.Inflate(iconBounds, -pad, -pad);
+        var strokeWidth = Math.Max(1.35f, Scale(14) / 10f);
+
+        switch (suggestion.Source)
+        {
+            case AddressSuggestionSource.Bookmark:
+                DrawBookmarkStar(graphics, area, color);
+                break;
+            case AddressSuggestionSource.History when suggestion.IsSearchHistory:
+                DrawHistoryArrow(graphics, area, color, strokeWidth);
+                break;
+            case AddressSuggestionSource.History:
+                DrawClockIcon(graphics, area, color, strokeWidth);
+                break;
+            case AddressSuggestionSource.OpenTab:
+                DrawOpenTabIcon(graphics, area, color, strokeWidth);
+                break;
+            default:
+                DrawSearchMagnifier(graphics, area, color, strokeWidth);
+                break;
+        }
+    }
+
+    private static void DrawBookmarkStar(Graphics graphics, RectangleF area, Color color)
+    {
+        var cx = area.X + (area.Width / 2f);
+        var cy = area.Y + (area.Height / 2f);
+        var outerR = Math.Min(area.Width, area.Height) * 0.52f;
+        var innerR = outerR * 0.44f;
+        var points = new PointF[10];
+        for (var i = 0; i < 10; i++)
+        {
+            var angle = (-MathF.PI / 2f) + (i * MathF.PI / 5f);
+            var r = (i % 2 == 0) ? outerR : innerR;
+            points[i] = new PointF(cx + (r * MathF.Cos(angle)), cy + (r * MathF.Sin(angle)));
+        }
+
+        using var brush = new SolidBrush(color);
+        graphics.FillPolygon(brush, points);
+    }
+
+    private static void DrawHistoryArrow(Graphics graphics, RectangleF area, Color color, float strokeWidth)
+    {
+        using var pen = new Pen(color, strokeWidth)
+        {
+            StartCap = LineCap.Round,
+            EndCap = LineCap.Round,
+            LineJoin = LineJoin.Round
+        };
+        var ring = RectangleF.Inflate(area, -0.8f, -0.8f);
+        graphics.DrawArc(pen, ring, 35f, 265f);
+
+        var tipX = ring.X + (ring.Width * 0.20f);
+        var tipY = ring.Y + (ring.Height * 0.25f);
+        var barb = Math.Max(2.4f, area.Width * 0.24f);
+        graphics.DrawLine(pen, tipX, tipY, tipX + barb, tipY);
+        graphics.DrawLine(pen, tipX, tipY, tipX, tipY - barb);
+    }
+
+    private static void DrawClockIcon(Graphics graphics, RectangleF area, Color color, float strokeWidth)
+    {
+        using var pen = new Pen(color, strokeWidth)
+        {
+            StartCap = LineCap.Round,
+            EndCap = LineCap.Round
+        };
+        var ring = RectangleF.Inflate(area, -0.8f, -0.8f);
+        graphics.DrawEllipse(pen, ring);
+        var cx = ring.X + (ring.Width / 2f);
+        var cy = ring.Y + (ring.Height / 2f);
+        graphics.DrawLine(pen, cx, cy, cx, ring.Top + (ring.Height * 0.26f));
+        graphics.DrawLine(pen, cx, cy, ring.Right - (ring.Width * 0.26f), cy + (ring.Height * 0.08f));
+    }
+
+    private static void DrawOpenTabIcon(Graphics graphics, RectangleF area, Color color, float strokeWidth)
+    {
+        using var pen = new Pen(color, strokeWidth)
+        {
+            StartCap = LineCap.Round,
+            EndCap = LineCap.Round,
+            LineJoin = LineJoin.Round
+        };
+        var card = new RectangleF(area.X + 0.5f, area.Y + (area.Height * 0.14f), area.Width * 0.72f, area.Height * 0.74f);
+        using var cardPath = NativeUiTheme.CreateRoundedPath(card, 2.2f);
+        graphics.DrawPath(pen, cardPath);
+
+        var midY = area.Y + (area.Height * 0.52f);
+        var arrowStart = area.X + (area.Width * 0.42f);
+        var arrowEnd = area.Right - 0.5f;
+        var barb = Math.Max(2.2f, area.Width * 0.22f);
+        graphics.DrawLine(pen, arrowStart, midY, arrowEnd, midY);
+        graphics.DrawLine(pen, arrowEnd - barb, midY - barb, arrowEnd, midY);
+        graphics.DrawLine(pen, arrowEnd - barb, midY + barb, arrowEnd, midY);
+    }
+
+    private static void DrawSearchMagnifier(Graphics graphics, RectangleF area, Color color, float strokeWidth)
+    {
+        using var pen = new Pen(color, strokeWidth)
+        {
+            StartCap = LineCap.Round,
+            EndCap = LineCap.Round
+        };
+        var lensSize = Math.Min(area.Width, area.Height) * 0.64f;
+        var lens = new RectangleF(area.X + 0.5f, area.Y + 0.5f, lensSize, lensSize);
+        graphics.DrawEllipse(pen, lens);
+        var handleStart = new PointF(lens.Right - (lensSize * 0.16f), lens.Bottom - (lensSize * 0.16f));
+        var handleEnd = new PointF(area.Right - 0.6f, area.Bottom - 0.6f);
+        graphics.DrawLine(pen, handleStart, handleEnd);
     }
 
     private void DrawRemoveButton(Graphics graphics, int index)
     {
         var bounds = GetRemoveButtonBounds(index);
         var selected = index == selectedIndex;
+        var highContrast = SystemInformation.HighContrast;
         if (index == removeHoverIndex)
         {
             using var hoverBrush = new SolidBrush(
-                SystemInformation.HighContrast ? SystemColors.Highlight : NativeUiTheme.Hover);
+                highContrast ? SystemColors.Highlight : NativeUiTheme.Hover);
             graphics.FillEllipse(hoverBrush, bounds);
+            if (!highContrast)
+            {
+                using var hoverRim = new Pen(Color.FromArgb(140, BorderColor), 1f);
+                graphics.DrawEllipse(hoverRim, bounds);
+            }
         }
 
-        TextRenderer.DrawText(
-            graphics,
-            "\u00D7",
-            IconFont,
-            bounds,
-            SystemInformation.HighContrast
-                ? selected || index == removeHoverIndex
-                    ? SystemColors.HighlightText
-                    : SystemColors.WindowText
-                : index == removeHoverIndex ? PrimaryTextColor : SecondaryTextColor,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+        var color = highContrast
+            ? (selected || index == removeHoverIndex ? SystemColors.HighlightText : SystemColors.WindowText)
+            : (index == removeHoverIndex ? PrimaryTextColor : SecondaryTextColor);
+        var inset = Scale(8);
+        var stroke = Math.Max(1.35f, Scale(13) / 10f);
+        using var pen = new Pen(color, stroke)
+        {
+            StartCap = LineCap.Round,
+            EndCap = LineCap.Round
+        };
+        graphics.DrawLine(pen, bounds.Left + inset, bounds.Top + inset, bounds.Right - inset, bounds.Bottom - inset);
+        graphics.DrawLine(pen, bounds.Right - inset, bounds.Top + inset, bounds.Left + inset, bounds.Bottom - inset);
     }
 
     private Rectangle GetRemoveButtonBounds(int index)
@@ -535,16 +823,4 @@ internal sealed class AddressSuggestionPopup : Control
     }
 
     private int Scale(int value) => Math.Max(1, (int)Math.Round(value * DeviceDpi / 96f));
-
-    private static GraphicsPath CreateRoundedPath(Rectangle bounds, int radius)
-    {
-        var diameter = Math.Max(2, radius * 2);
-        var path = new GraphicsPath();
-        path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
-        path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
-        path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
-        path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
-        path.CloseFigure();
-        return path;
-    }
 }

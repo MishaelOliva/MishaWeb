@@ -196,6 +196,7 @@ internal sealed class SmartSearchBar : UserControl
         surface.Controls.Add(layout);
         Controls.Add(surface);
 
+        NativeUiTheme.ConfigureGlassToolTip(toolTip);
         ApplyDpiMetrics();
         UpdatePresentation();
         ApplyResponsiveLayout();

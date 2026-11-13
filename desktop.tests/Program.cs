@@ -3965,9 +3965,9 @@ var informationalVersion = System.Reflection.CustomAttributeExtensions
     .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(productAssembly)
     ?.InformationalVersion;
 Check(
-    "release assemblies carry the 2.4.0 product version",
-    productAssembly.GetName().Version == new Version(2, 4, 0, 0)
-        && informationalVersion == "2.4.0");
+    "release assemblies carry the 2.4.1 product version",
+    productAssembly.GetName().Version == new Version(2, 4, 1, 0)
+        && informationalVersion == "2.4.1");
 Check(
     "new sessions default to standard memory saver",
     new BrowserState().MemorySaverEnabled && new BrowserState().UltraLightModeEnabled == false);
@@ -4239,6 +4239,17 @@ Check(
     "native downloads suppress WebView2's duplicate default download dialog",
     normalDownloadHandledIndex >= 0
         && normalDownloadHandledIndex > normalDownloadBranchStart);
+var downloadNotificationLifecycle = VerifyDownloadNotificationLifecycle();
+Check(
+    "starting a download triggers the non-activating download notification popup",
+    downloadStartingSource.Contains("ShowDownloadNotification(entry);", StringComparison.Ordinal)
+        && downloadNotificationLifecycle.ShownWithoutActivation);
+Check(
+    "download notification keeps auto-hide paused while downloading and enables Open on completion",
+    downloadNotificationLifecycle.LifecycleTransitions);
+Check(
+    "opening the full Downloads list dismisses the transient download notification popup",
+    downloadNotificationLifecycle.DismissedByDownloadsList);
 Check(
     "context-menu event arguments are dereferenced only inside callback containment",
     contextMenuSource.IndexOf("try", StringComparison.Ordinal)
@@ -6422,6 +6433,121 @@ Check(
     "SearchSuggestionService cache miss probe returns false synchronously",
     !SearchSuggestionService.Instance.TryGetCachedSuggestions("uncached_weak_laptop_probe", out _));
 
+var attributionEngine = new AdBlockEngine(initialRules:
+[
+    "||ads.example.net^",
+    "||tracker.example.net^$ping",
+    "||script.example.net^$script",
+    "||allowed.example.net^",
+    "@@||allowed.example.net^"
+]);
+var adMatch = attributionEngine.EvaluateRequest(
+    "https://ads.example.net/banner.js",
+    "https://publisher.example/",
+    "script");
+var trackerMatch = attributionEngine.EvaluateRequest(
+    "https://tracker.example.net/collect",
+    "https://publisher.example/",
+    "ping");
+var scriptMatch = attributionEngine.EvaluateRequest(
+    "https://script.example.net/bundle.js",
+    "https://publisher.example/",
+    "script");
+var exceptionMatch = attributionEngine.EvaluateRequest(
+    "https://allowed.example.net/safe.js",
+    "https://publisher.example/",
+    "script");
+var cleanMatch = attributionEngine.EvaluateRequest(
+    "https://clean.example.com/app.js",
+    "https://publisher.example/",
+    "script");
+Check(
+    "AdBlockEngine.EvaluateRequest classifies blocked categories, rule kinds, and exceptions",
+    adMatch == new AdBlockMatchResult(true, "Ad", "ads.example.net", "HostAnchored")
+        && trackerMatch == new AdBlockMatchResult(true, "Tracker", "tracker.example.net", "HostAnchored")
+        && scriptMatch == new AdBlockMatchResult(true, "Script", "script.example.net", "HostAnchored")
+        && exceptionMatch == new AdBlockMatchResult(false, "None", "allowed.example.net", "Exception")
+        && cleanMatch == new AdBlockMatchResult(false, "None", "clean.example.com", "None"));
+
+Check(
+    "WebsiteThemePolicy.ShouldApplyAutoDark honors global setting and exact-host exclusions",
+    WebsiteThemePolicy.ShouldApplyAutoDark(true, "https://docs.example.com/guide", ["other.example.com"])
+        && !WebsiteThemePolicy.ShouldApplyAutoDark(true, "https://EXAMPLE.com/page", ["example.com"])
+        && WebsiteThemePolicy.ShouldApplyAutoDark(true, "https://sub.example.com/page", ["example.com"])
+        && !WebsiteThemePolicy.ShouldApplyAutoDark(false, "https://docs.example.com/guide", [])
+        && WebsiteThemePolicy.IsHostExcluded("https://EXAMPLE.com:443/path", ["example.com"])
+        && !WebsiteThemePolicy.IsHostExcluded("javascript:alert(1)", ["example.com"]));
+
+var openTabSuggestionState = new BrowserState
+{
+    Bookmarks = [new BookmarkEntry("GitHub", "https://github.com/")]
+};
+var openTabsForSuggestions = new OpenTabCandidate[]
+{
+    new("GitHub", "https://github.com/", IsSelected: false),
+    new("Active Tab", "https://active.example/", IsSelected: true)
+};
+var openTabResults = AddressSuggestionEngine.GetSuggestions(
+    "github",
+    openTabSuggestionState,
+    openTabsForSuggestions);
+var selectedTabResults = AddressSuggestionEngine.GetSuggestions(
+    "active",
+    openTabSuggestionState,
+    openTabsForSuggestions);
+Check(
+    "AddressSuggestionEngine prioritizes non-selected open tabs and deduplicates identical bookmarks",
+    openTabResults.Count >= 2
+        && openTabResults[0].Source == AddressSuggestionSource.OpenTab
+        && openTabResults[0].Detail.StartsWith("Switch to tab \u00B7 ", StringComparison.Ordinal)
+        && openTabResults[0].NavigationTarget == "https://github.com/"
+        && openTabResults.All(item => item.Source != AddressSuggestionSource.Bookmark)
+        && selectedTabResults.All(item => item.Source != AddressSuggestionSource.OpenTab));
+
+var modernPersistenceState = new BrowserState
+{
+    CleanShutdown = false,
+    DarkModeExcludedHosts =
+    [
+        "EXAMPLE.com",
+        "example.com",
+        "javascript:alert(1)",
+        "docs.example.org"
+    ],
+    RecentDownloads = Enumerable.Range(0, 55)
+        .Select(index => new RecentDownloadEntry(
+            $"report-{index}.pdf",
+            index == 0 ? "javascript:alert(1)" : $"https://files.example.com/report-{index}.pdf",
+            $"C:\\Downloads\\report-{index}.pdf",
+            index == 0 ? string.Empty : "Complete",
+            DateTimeOffset.UtcNow.AddMinutes(-index)))
+        .Prepend(new RecentDownloadEntry("   ", "https://files.example.com/blank.pdf", string.Empty, "Complete", DateTimeOffset.UtcNow))
+        .ToList()
+};
+BrowserStateStore.NormalizeForPersistence(modernPersistenceState);
+Check(
+    "BrowserStateStore normalizes RecentDownloads, DarkModeExcludedHosts, and CleanShutdown",
+    new BrowserState().CleanShutdown
+        && !modernPersistenceState.CleanShutdown
+        && modernPersistenceState.DarkModeExcludedHosts.SequenceEqual(["example.com", "docs.example.org"])
+        && modernPersistenceState.RecentDownloads.Count == BrowserStateStore.MaximumRecentDownloads
+        && modernPersistenceState.RecentDownloads[0].FileName == "report-0.pdf"
+        && modernPersistenceState.RecentDownloads[0].SourceUrl == string.Empty
+        && modernPersistenceState.RecentDownloads[0].State == "Complete"
+        && modernPersistenceState.RecentDownloads[1].SourceUrl == "https://files.example.com/report-1.pdf");
+
+Check(
+    "NativeAlertDialog constructs info and confirmation dialogs and disposes cleanly",
+    VerifyNativeAlertDialogLifecycle());
+
+var tabFaviconAndAudioToggle = VerifyTabFaviconAndAudioToggle();
+Check(
+    "TabHeader emits AudioToggleRequested on clicking the audio indicator",
+    tabFaviconAndAudioToggle.AudioToggled);
+Check(
+    "TabHeader renders favicons, swaps owned bitmaps cleanly, and disposes replaced icons",
+    tabFaviconAndAudioToggle.FaviconHandled);
+
 if (failures.Count > 0)
 {
     Console.Error.WriteLine($"{failures.Count} smoke test(s) failed:");
@@ -8601,6 +8727,162 @@ bool CanRenderHighContrastChrome()
     thread.Join();
     if (error is not null) Console.Error.WriteLine($"Chrome theme round-trip probe failed: {error}");
     return error is null ? (restored, distinct, rendered) : (false, false, false);
+}
+
+(bool ShownWithoutActivation, bool LifecycleTransitions, bool DismissedByDownloadsList) VerifyDownloadNotificationLifecycle()
+{
+    Exception? error = null;
+    var shownWithoutActivation = false;
+    var lifecycleTransitions = false;
+    var dismissedByDownloadsList = false;
+    var thread = new Thread(() =>
+    {
+        try
+        {
+            using var form = new MainForm(startBrowserOnShown: false)
+            {
+                StartPosition = FormStartPosition.Manual,
+                Location = new Point(-20_000, -20_000),
+                ShowInTaskbar = false
+            };
+            form.Show();
+            form.PrepareChromePreviewForTesting();
+            form.PerformLayout();
+            Application.DoEvents();
+
+            DownloadPopupAction? lastAction = null;
+            object? lastToken = null;
+            var openedDownloadsList = false;
+            using var notification = new DownloadNotificationForm(
+                (action, token) =>
+                {
+                    lastAction = action;
+                    lastToken = token;
+                },
+                () => openedDownloadsList = true);
+
+            var tokenObject = new object();
+            var anchor = typeof(MainForm)
+                .GetField("downloadsButton", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+                ?.GetValue(form) as Control;
+
+            notification.ShowOrUpdate(
+                form,
+                anchor,
+                new DownloadNotificationState(
+                    "05_Laboratory_Exercise_1(45).pdf",
+                    "Downloading",
+                    "24.0 KB / 58.2 KB (41%)",
+                    "ETA 9:16 PM",
+                    41,
+                    1,
+                    CanOpen: false,
+                    CanShowInFolder: true,
+                    CanCancel: true,
+                    tokenObject));
+            Application.DoEvents();
+
+            var activeButtons = GetDescendants(notification).OfType<Button>().ToArray();
+            var openBtn = activeButtons.Single(b => b.Text == "Open");
+            var cancelBtn = activeButtons.Single(b => b.Text == "Cancel");
+            var downloadsBtn = activeButtons.Single(b => b.Text == "Downloads");
+            shownWithoutActivation = notification.Visible
+                && !notification.Focused
+                && !notification.AutoHideArmedForTesting
+                && !openBtn.Visible
+                && cancelBtn.Visible
+                && cancelBtn.Enabled;
+
+            notification.UpdateIfVisible(
+                anchor,
+                new DownloadNotificationState(
+                    "05_Laboratory_Exercise_1(45).pdf",
+                    "Complete",
+                    "58.2 KB / 58.2 KB (100%)",
+                    string.Empty,
+                    100,
+                    0,
+                    CanOpen: true,
+                    CanShowInFolder: true,
+                    CanCancel: false,
+                    tokenObject));
+            Application.DoEvents();
+
+            var transitionsOk = notification.Visible
+                && notification.AutoHideArmedForTesting
+                && openBtn.Visible
+                && openBtn.Enabled
+                && !cancelBtn.Visible
+                && notification.CurrentStateForTesting?.State == "Complete";
+
+            openBtn.PerformClick();
+            Application.DoEvents();
+            var openActionOk = !notification.Visible
+                && lastAction == DownloadPopupAction.Open
+                && ReferenceEquals(lastToken, tokenObject);
+
+            notification.ShowOrUpdate(
+                form,
+                anchor,
+                new DownloadNotificationState(
+                    "05_Laboratory_Exercise_1(45).pdf",
+                    "Complete",
+                    "58.2 KB / 58.2 KB (100%)",
+                    string.Empty,
+                    100,
+                    0,
+                    CanOpen: true,
+                    CanShowInFolder: true,
+                    CanCancel: false,
+                    tokenObject));
+            downloadsBtn.PerformClick();
+            Application.DoEvents();
+
+            lifecycleTransitions = transitionsOk && openActionOk && openedDownloadsList && !notification.Visible;
+
+            const System.Reflection.BindingFlags flags =
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var entryType = typeof(MainForm).GetNestedType("DownloadEntry", flags);
+            var entry = entryType is null
+                ? null
+                : Activator.CreateInstance(
+                    entryType,
+                    "05_Laboratory_Exercise_1(45).pdf",
+                    "C:\\Downloads\\05_Laboratory_Exercise_1(45).pdf",
+                    "https://example.com/file.pdf",
+                    DateTime.Now,
+                    "Downloading");
+            var showNotificationMethod = typeof(MainForm).GetMethod("ShowDownloadNotification", flags);
+            var showDownloadsPopupMethod = typeof(MainForm).GetMethod("ShowDownloadsPopup", flags);
+            var notificationField = typeof(MainForm).GetField("downloadNotification", flags);
+            var downloadsPopupField = typeof(MainForm).GetField("downloadsPopup", flags);
+            if (entry is not null && showNotificationMethod is not null && showDownloadsPopupMethod is not null)
+            {
+                showNotificationMethod.Invoke(form, [entry]);
+                Application.DoEvents();
+                var mainNotification = notificationField?.GetValue(form) as DownloadNotificationForm;
+                var visibleBeforePopup = mainNotification?.Visible == true;
+
+                showDownloadsPopupMethod.Invoke(form, null);
+                Application.DoEvents();
+                var mainPopup = downloadsPopupField?.GetValue(form) as DownloadsPopupForm;
+                var hiddenAfterPopup = mainNotification?.Visible == false;
+                mainPopup?.Hide();
+                dismissedByDownloadsList = visibleBeforePopup && hiddenAfterPopup;
+            }
+        }
+        catch (Exception caught)
+        {
+            error = caught;
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+    if (error is not null) Console.Error.WriteLine($"Download notification lifecycle probe failed: {error}");
+    return error is null
+        ? (shownWithoutActivation, lifecycleTransitions, dismissedByDownloadsList)
+        : (false, false, false);
 }
 
 bool FrontendSourcesAreEncodingClean()
@@ -11293,4 +11575,179 @@ void DeleteMediaCaptureProbeFolder(string probeFolder)
             Thread.Sleep(100);
         }
     }
+}
+
+bool VerifyNativeAlertDialogLifecycle()
+{
+    Exception? error = null;
+    var ok = false;
+    var thread = new Thread(() =>
+    {
+        try
+        {
+            const System.Reflection.BindingFlags ctorFlags =
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            using var infoDialog = Activator.CreateInstance(
+                typeof(NativeAlertDialog),
+                ctorFlags,
+                binder: null,
+                ["Info title", "Info body", false, "OK", null, false],
+                culture: null) as NativeAlertDialog;
+            using var confirmDialog = Activator.CreateInstance(
+                typeof(NativeAlertDialog),
+                ctorFlags,
+                binder: null,
+                ["Confirm title", "Confirm body", true, "Continue", "Cancel", false],
+                culture: null) as NativeAlertDialog;
+            if (infoDialog is null || confirmDialog is null) return;
+
+            infoDialog.CreateControl();
+            confirmDialog.CreateControl();
+            ok = infoDialog.AccessibleName == "Info title"
+                && confirmDialog.AccessibleName == "Confirm title"
+                && infoDialog.Controls.Count > 0
+                && confirmDialog.Controls.Count > 0
+                && ReferenceEquals(infoDialog.AcceptButton, infoDialog.CancelButton)
+                && !ReferenceEquals(confirmDialog.AcceptButton, confirmDialog.CancelButton);
+        }
+        catch (Exception caught)
+        {
+            error = caught;
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+    if (error is not null) Console.Error.WriteLine($"NativeAlertDialog lifecycle probe failed: {error}");
+    return error is null && ok;
+}
+
+(bool AudioToggled, bool FaviconHandled) VerifyTabFaviconAndAudioToggle()
+{
+    Exception? error = null;
+    var audioToggled = false;
+    var faviconHandled = false;
+    var thread = new Thread(() =>
+    {
+        try
+        {
+            using var form = new MainForm(startBrowserOnShown: false)
+            {
+                StartPosition = FormStartPosition.Manual,
+                Location = new Point(-20_000, -20_000),
+                ShowInTaskbar = false
+            };
+            form.Show();
+            form.PrepareLoadedChromePreviewForTesting();
+            form.PerformLayout();
+            Application.DoEvents();
+
+            const System.Reflection.BindingFlags privateFlags =
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            const System.Reflection.BindingFlags publicFlags =
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public;
+            var tabStrip = typeof(MainForm).GetField("tabStrip", privateFlags)?.GetValue(form) as FlowLayoutPanel;
+            var header = tabStrip?.Controls.Cast<Control>().FirstOrDefault();
+            var headerType = header?.GetType();
+            var setState = headerType?.GetMethod("SetState", publicFlags);
+            var setFavicon = headerType?.GetMethod("SetFavicon", publicFlags);
+            var setFaviconMetadata = headerType?.GetMethod("SetFaviconMetadata", publicFlags);
+            var audioToggleEvent = headerType?.GetEvent("AudioToggleRequested", publicFlags);
+            var onMouseDown = typeof(Control).GetMethod("OnMouseDown", privateFlags);
+            var onMouseUp = typeof(Control).GetMethod("OnMouseUp", privateFlags);
+            if (header is null
+                || setState is null
+                || setFavicon is null
+                || setFaviconMetadata is null
+                || audioToggleEvent is null
+                || onMouseDown is null
+                || onMouseUp is null)
+            {
+                return;
+            }
+
+            var toggleCount = 0;
+            EventHandler handler = (_, _) => toggleCount++;
+            audioToggleEvent.AddEventHandler(header, handler);
+            try
+            {
+                setState.Invoke(
+                    header,
+                    ["Media Tab", true, false, false, false, false, true, false, false]);
+                header.PerformLayout();
+                Application.DoEvents();
+
+                var audioCenter = new Point(14, Math.Max(4, header.Height / 2));
+                var downArgs = new MouseEventArgs(MouseButtons.Left, 1, audioCenter.X, audioCenter.Y, 0);
+                var upArgs = new MouseEventArgs(MouseButtons.Left, 1, audioCenter.X, audioCenter.Y, 0);
+                onMouseDown.Invoke(header, [downArgs]);
+                onMouseUp.Invoke(header, [upArgs]);
+                Application.DoEvents();
+                audioToggled = toggleCount == 1;
+            }
+            finally
+            {
+                audioToggleEvent.RemoveEventHandler(header, handler);
+            }
+
+            var firstBitmap = new Bitmap(16, 16);
+            using (var g = Graphics.FromImage(firstBitmap))
+            {
+                g.Clear(Color.DeepPink);
+            }
+            var secondBitmap = new Bitmap(16, 16);
+            using (var g = Graphics.FromImage(secondBitmap))
+            {
+                g.Clear(Color.MediumPurple);
+            }
+
+            setFavicon.Invoke(header, [firstBitmap, "M", true]);
+            header.Invalidate();
+            header.Update();
+            Application.DoEvents();
+            using (var renderWithFirst = new Bitmap(header.Width, header.Height))
+            {
+                header.DrawToBitmap(renderWithFirst, header.ClientRectangle);
+            }
+
+            setFavicon.Invoke(header, [secondBitmap, "M", true]);
+            var previousDisposed = false;
+            try
+            {
+                _ = firstBitmap.Width;
+            }
+            catch (ArgumentException)
+            {
+                previousDisposed = true;
+            }
+
+            setFaviconMetadata.Invoke(header, ["N", true]);
+            setFavicon.Invoke(header, [null, null, false]);
+            using (var renderCleared = new Bitmap(header.Width, header.Height))
+            {
+                header.DrawToBitmap(renderCleared, header.ClientRectangle);
+            }
+
+            var replacedDisposed = false;
+            try
+            {
+                _ = secondBitmap.Width;
+            }
+            catch (ArgumentException)
+            {
+                replacedDisposed = true;
+            }
+
+            faviconHandled = previousDisposed && replacedDisposed;
+        }
+        catch (Exception caught)
+        {
+            error = caught;
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+    if (error is not null) Console.Error.WriteLine($"Tab favicon/audio-toggle probe failed: {error}");
+    return (error is null && audioToggled, error is null && faviconHandled);
 }

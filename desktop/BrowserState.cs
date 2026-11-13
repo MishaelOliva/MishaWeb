@@ -31,6 +31,9 @@ internal sealed class BrowserState
     public List<string> DismissedSuggestionUrls { get; set; } = [];
     public List<AddressSuggestionUsage> SuggestionUsage { get; set; } = [];
     public List<string> KeepAwakeHosts { get; set; } = [];
+    public List<RecentDownloadEntry> RecentDownloads { get; set; } = [];
+    public List<string> DarkModeExcludedHosts { get; set; } = [];
+    public bool CleanShutdown { get; set; } = true;
     public SavedWindowPlacement? WindowPlacement { get; set; }
 
     // Compatibility aliases keep the in-memory model discoverable without
@@ -74,6 +77,13 @@ internal sealed record SavedSessionTab(string Url, bool IsPinned);
 internal sealed record ClosedTabEntry(string Title, string Url, DateTimeOffset ClosedUtc);
 
 internal sealed record SiteZoomEntry(string Host, double ZoomFactor);
+
+internal sealed record RecentDownloadEntry(
+    string FileName,
+    string SourceUrl,
+    string TargetPath,
+    string State,
+    DateTimeOffset CompletedAtUtc);
 
 internal enum BrowserMode
 {
@@ -132,6 +142,8 @@ internal sealed class BrowserStateStore : IDisposable
     internal const int MaximumMutedHosts = 200;
     internal const int MaximumAudioHosts = 200;
     internal const int MaximumMicrophoneHosts = 200;
+    internal const int MaximumRecentDownloads = 50;
+    internal const int MaximumDarkModeExcludedHosts = 200;
     internal const double MinimumSiteZoom = 0.25;
     internal const double MaximumSiteZoom = 3.0;
     private readonly string settingsPath;
@@ -911,6 +923,57 @@ internal sealed class BrowserStateStore : IDisposable
         return NormalizeExactHostList(entries, MaximumMutedHosts);
     }
 
+    private static string NormalizeDownloadSourceUrl(string? value)
+    {
+        var candidate = NormalizeUrlCandidate(value);
+        if (candidate is null) return string.Empty;
+        if (IsHttpUrl(candidate)) return candidate;
+        if (candidate.StartsWith("blob:http://", StringComparison.OrdinalIgnoreCase)
+            || candidate.StartsWith("blob:https://", StringComparison.OrdinalIgnoreCase))
+        {
+            return candidate;
+        }
+        return string.Empty;
+    }
+
+    private static IEnumerable<RecentDownloadEntry> NormalizeRecentDownloads(
+        IEnumerable<RecentDownloadEntry>? entries)
+    {
+        if (entries is null) yield break;
+
+        foreach (var item in entries.OfType<RecentDownloadEntry>())
+        {
+            var targetPath = NormalizeUrlCandidate(item.TargetPath) ?? string.Empty;
+            var fileName = SanitizeTitle(item.FileName);
+            if (fileName.Length == 0 && targetPath.Length > 0)
+            {
+                try
+                {
+                    fileName = SanitizeTitle(Path.GetFileName(targetPath));
+                }
+                catch
+                {
+                    fileName = string.Empty;
+                }
+            }
+
+            if (fileName.Length == 0) continue;
+
+            var sourceUrl = NormalizeDownloadSourceUrl(item.SourceUrl);
+            var state = TextSafety.SanitizeSingleLine(item.State, 40);
+            if (state.Length == 0) state = "Complete";
+            var completedAt = NormalizeTimestamp(item.CompletedAtUtc);
+
+            yield return string.Equals(item.FileName, fileName, StringComparison.Ordinal)
+                && string.Equals(item.SourceUrl, sourceUrl, StringComparison.Ordinal)
+                && string.Equals(item.TargetPath, targetPath, StringComparison.Ordinal)
+                && string.Equals(item.State, state, StringComparison.Ordinal)
+                && item.CompletedAtUtc == completedAt
+                    ? item
+                    : new RecentDownloadEntry(fileName, sourceUrl, targetPath, state, completedAt);
+        }
+    }
+
     internal static void NormalizeForPersistence(BrowserState state)
     {
         ArgumentNullException.ThrowIfNull(state);
@@ -962,6 +1025,14 @@ internal sealed class BrowserStateStore : IDisposable
         state.KeepAwakeHosts = NormalizeKeepAwakeHosts(state.KeepAwakeHosts)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Take(MaximumKeepAwakeHosts)
+            .ToList();
+        state.RecentDownloads = NormalizeRecentDownloads(state.RecentDownloads)
+            .OrderByDescending(item => item.CompletedAtUtc)
+            .Take(MaximumRecentDownloads)
+            .ToList();
+        state.DarkModeExcludedHosts = NormalizeExactHostList(
+                state.DarkModeExcludedHosts,
+                MaximumDarkModeExcludedHosts)
             .ToList();
         state.WindowPlacement = NormalizeWindowPlacement(state.WindowPlacement);
     }
@@ -1042,6 +1113,7 @@ internal sealed class BrowserStateStore : IDisposable
                 && !RemoveOldestHalf(state.DismissedSuggestionUrls)
                 && !RemoveOldestHalf(state.SuggestionUsage)
                 && !RemoveOldestHalf(state.RecentlyClosed)
+                && !RemoveOldestHalf(state.RecentDownloads)
                 && !RemoveOldestHalf(state.Bookmarks)
                 && !RemoveOldestHalf(state.NamedSessions))
             {

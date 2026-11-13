@@ -111,7 +111,6 @@ internal sealed class SavedItemsDialog : Form
 
         itemList.Dock = DockStyle.Fill;
         itemList.IntegralHeight = false;
-        itemList.HorizontalScrollbar = true;
         itemList.Font = ListFont;
         itemList.AccessibleName = "Saved items list";
         itemList.SelectedIndexChanged += (_, _) => UpdateButtons();
@@ -152,7 +151,12 @@ internal sealed class SavedItemsDialog : Form
         root.SetColumnSpan(actions, 2);
         Controls.Add(root);
         NativeUiTheme.Apply(this, openButton);
+        NativeUiTheme.ConfigureModernListBox(
+            itemList,
+            50,
+            (index, _) => BuildRowVisual(index));
         emptyLabel.ForeColor = NativeUiTheme.MutedText;
+        SystemColorsChanged += (_, _) => emptyLabel.ForeColor = NativeUiTheme.MutedText;
 
         viewPicker.SelectedIndexChanged += (_, _) => RefreshItems();
         filterBox.TextChanged += (_, _) => RefreshItems();
@@ -212,6 +216,36 @@ internal sealed class SavedItemsDialog : Form
         return TextSafety.TruncateWithEllipsis(
             $"{title} \u2014 {detail}{pin} \u2014 {displayUrl}",
             MaximumDisplayRowCharacters);
+    }
+
+    private ModernListRowVisual BuildRowVisual(int index)
+    {
+        if (index < 0 || index >= visibleItems.Count)
+        {
+            return new ModernListRowVisual(string.Empty, string.Empty, string.Empty);
+        }
+
+        var item = visibleItems[index];
+        var title = TextSafety.SanitizeSingleLine(item.Title, MaximumDisplayTitleCharacters);
+        var detail = TextSafety.SanitizeSingleLine(item.Detail, MaximumDisplayDetailCharacters);
+        var displayUrl = TextSafety.FormatUrlForDisplay(item.Url, MaximumDisplayUrlCharacters);
+        var combinedDetail = string.IsNullOrWhiteSpace(detail)
+            ? displayUrl
+            : $"{detail} \u00B7 {displayUrl}";
+        var (glyph, accent) = SelectedView switch
+        {
+            SavedItemsView.Favorites => ("*", NativeUiTheme.BrandCoral),
+            SavedItemsView.History => ("H", NativeUiTheme.Lavender),
+            SavedItemsView.QuickLinks => ("Q", NativeUiTheme.Accent),
+            _ => ("R", NativeUiTheme.Focus)
+        };
+        return new ModernListRowVisual(
+            title,
+            combinedDetail,
+            glyph,
+            accent,
+            StatusText: item.IsPinned ? "Pinned" : null,
+            StatusColor: NativeUiTheme.Accent);
     }
 
     private void ConfigureButton(Button button, string text, string description)

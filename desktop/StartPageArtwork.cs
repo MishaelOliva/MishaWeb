@@ -592,12 +592,120 @@ internal static class StartPageArtwork
         {
             DrawTabsGlyph(graphics, iconBounds, glyph, scale);
         }
+        else if (action == StartPageAction.ManageQuickLinks)
+        {
+            DrawQuickLinksGlyph(graphics, iconBounds, glyph, scale);
+        }
         else
         {
             DrawGaugeGlyph(graphics, iconBounds, glyph, scale);
         }
 
         graphics.SmoothingMode = previousSmoothing;
+    }
+
+    public static void DrawIncognitoBadge(Graphics graphics, RectangleF bounds)
+    {
+        if (bounds.Width <= 4f || bounds.Height <= 4f) return;
+
+        var previousSmoothing = graphics.SmoothingMode;
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        var scale = Math.Max(1f, graphics.DpiX / 96f);
+        var pillBounds = new RectangleF(
+            bounds.Left + 0.5f,
+            bounds.Top + 0.5f,
+            Math.Max(2f, bounds.Width - 1f),
+            Math.Max(2f, bounds.Height - 1f));
+        var radius = Math.Min(pillBounds.Width, pillBounds.Height) * 0.45f;
+        using var path = CreateRoundedPath(pillBounds, radius);
+
+        if (SystemInformation.HighContrast)
+        {
+            using var fill = new SolidBrush(SystemColors.Highlight);
+            using var border = new Pen(SystemColors.WindowText, Math.Max(1f, scale));
+            graphics.FillPath(fill, path);
+            graphics.DrawPath(border, path);
+        }
+        else
+        {
+            using var fill = new LinearGradientBrush(
+                pillBounds,
+                Color.FromArgb(242, 64, 26, 80),
+                Color.FromArgb(248, 34, 12, 46),
+                LinearGradientMode.Vertical);
+            graphics.FillPath(fill, path);
+
+            var state = graphics.Save();
+            try
+            {
+                graphics.SetClip(path, CombineMode.Intersect);
+                var sheenRect = new RectangleF(
+                    pillBounds.Left,
+                    pillBounds.Top,
+                    pillBounds.Width,
+                    Math.Max(3f, pillBounds.Height * 0.46f));
+                using var sheen = new LinearGradientBrush(
+                    sheenRect,
+                    Color.FromArgb(74, 255, 232, 255),
+                    Color.FromArgb(0, 255, 232, 255),
+                    LinearGradientMode.Vertical);
+                graphics.FillRectangle(sheen, sheenRect);
+            }
+            finally
+            {
+                graphics.Restore(state);
+            }
+
+            using var border = new Pen(Color.FromArgb(228, Orchid), Math.Max(1.05f, 1.15f * scale));
+            graphics.DrawPath(border, path);
+        }
+
+        var lensDiameter = Math.Min(pillBounds.Height * 0.46f, pillBounds.Width * 0.28f);
+        var bridgeGap = Math.Max(1.5f * scale, lensDiameter * 0.34f);
+        var totalWidth = (lensDiameter * 2f) + bridgeGap;
+        var leftX = pillBounds.Left + ((pillBounds.Width - totalWidth) / 2f);
+        var lensY = pillBounds.Top + ((pillBounds.Height - lensDiameter) / 2f);
+        var bridgeY = lensY + (lensDiameter * 0.36f);
+        using var lensPen = new Pen(
+            SystemInformation.HighContrast ? SystemColors.HighlightText : Orchid,
+            Math.Max(1.3f, 1.45f * scale))
+        {
+            StartCap = LineCap.Round,
+            EndCap = LineCap.Round
+        };
+        graphics.DrawEllipse(lensPen, leftX, lensY, lensDiameter, lensDiameter);
+        graphics.DrawEllipse(lensPen, leftX + lensDiameter + bridgeGap, lensY, lensDiameter, lensDiameter);
+        graphics.DrawLine(
+            lensPen,
+            leftX + (lensDiameter * 0.85f),
+            bridgeY,
+            leftX + lensDiameter + bridgeGap + (lensDiameter * 0.15f),
+            bridgeY);
+
+        graphics.SmoothingMode = previousSmoothing;
+    }
+
+    private static void DrawQuickLinksGlyph(Graphics graphics, RectangleF bounds, Pen pen, float scale)
+    {
+        var padX = bounds.Width * 0.24f;
+        var padY = bounds.Height * 0.24f;
+        var gap = Math.Max(2f * scale, bounds.Width * 0.08f);
+        var tileW = (bounds.Width - (padX * 2f) - gap) / 2f;
+        var tileH = (bounds.Height - (padY * 2f) - gap) / 2f;
+        var radius = Math.Max(1.5f, 2.2f * scale);
+        for (var row = 0; row < 2; row++)
+        {
+            for (var col = 0; col < 2; col++)
+            {
+                var tile = new RectangleF(
+                    bounds.Left + padX + (col * (tileW + gap)),
+                    bounds.Top + padY + (row * (tileH + gap)),
+                    tileW,
+                    tileH);
+                using var tilePath = CreateRoundedPath(tile, radius);
+                graphics.DrawPath(pen, tilePath);
+            }
+        }
     }
 
     private static void DrawGaugeGlyph(Graphics graphics, RectangleF bounds, Pen pen, float scale)

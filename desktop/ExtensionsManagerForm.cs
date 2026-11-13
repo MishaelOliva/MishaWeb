@@ -242,6 +242,9 @@ internal sealed class ExtensionsManagerForm : Form
 
         Controls.Add(root);
         NativeUiTheme.Apply(this, installButton);
+        NativeUiTheme.ApplyDarkScrollbars(cardsContainer);
+        ApplyThemeAccents();
+        SystemColorsChanged += (_, _) => ApplyThemeAccents();
 
         // Event wiring
         installButton.Click += async (_, _) => await InstallStoreExtensionAsync();
@@ -368,14 +371,15 @@ internal sealed class ExtensionsManagerForm : Form
 
     internal async Task RemoveRowAsync(ExtensionManagerRow row)
     {
-        var confirmation = MessageBox.Show(
+        if (!NativeAlertDialog.Confirm(
             this,
-            $"Remove {row.Name}? Its MishaWeb-managed package files will also be deleted.",
             "Remove extension",
-            MessageBoxButtons.YesNo,
-            MessageBoxIcon.Warning,
-            MessageBoxDefaultButton.Button2);
-        if (confirmation != DialogResult.Yes) return;
+            $"Remove {row.Name}? Its MishaWeb-managed package files will also be deleted.",
+            confirmText: "Remove",
+            cancelText: "Cancel"))
+        {
+            return;
+        }
         await RunRowActionCoreAsync(ExtensionManagerAction.Remove, row);
     }
 
@@ -448,12 +452,10 @@ internal sealed class ExtensionsManagerForm : Form
                 if (!IsDisposed)
                 {
                     SetStatus(error.Message);
-                    MessageBox.Show(
+                    NativeAlertDialog.ShowInfo(
                         this,
-                        error.Message,
                         "Extension operation failed",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Error);
+                        error.Message);
                 }
             }
 
@@ -564,6 +566,15 @@ internal sealed class ExtensionsManagerForm : Form
         statusLabel.AccessibleName = text;
     }
 
+    private void ApplyThemeAccents()
+    {
+        var highContrast = SystemInformation.HighContrast;
+        cardsContainer.BackColor = highContrast ? SystemColors.Window : NativeUiTheme.Window;
+        cardsStack.BackColor = highContrast ? SystemColors.Window : NativeUiTheme.Window;
+        emptyLabel.ForeColor = NativeUiTheme.MutedText;
+        statusLabel.ForeColor = highContrast ? SystemColors.WindowText : NativeUiTheme.SecondaryText;
+    }
+
     private static void ConfigureButton(Button button, string text, string description)
     {
         NativeDialogLayout.ConfigureButton(button, text, description);
@@ -592,6 +603,9 @@ internal sealed class ExtensionsManagerForm : Form
         private readonly Button? optionsButton;
         private readonly Button? updateButton;
         private readonly Button? removeButton;
+        private readonly PillBadgeLabel versionBadge;
+        private readonly PillBadgeLabel sourceBadge;
+        private readonly PillBadgeLabel statusBadge;
         private Image? iconImage;
 
         public ExtensionCard(
@@ -600,13 +614,19 @@ internal sealed class ExtensionsManagerForm : Form
         {
             Row = row;
             this.parentForm = parentForm;
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint
+                | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.ResizeRedraw
+                | ControlStyles.UserPaint,
+                true);
             Dock = DockStyle.Top;
             AutoSize = true;
             AutoSizeMode = AutoSizeMode.GrowAndShrink;
             Margin = new Padding(0, 0, 0, 10);
             Padding = new Padding(12);
-            BackColor = NativeUiTheme.Surface;
-            ForeColor = NativeUiTheme.Text;
+            BackColor = SystemInformation.HighContrast ? SystemColors.Window : NativeUiTheme.Surface;
+            ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : NativeUiTheme.Text;
 
             var layout = new TableLayoutPanel
             {
@@ -614,7 +634,8 @@ internal sealed class ExtensionsManagerForm : Form
                 AutoSize = true,
                 ColumnCount = 1,
                 Margin = Padding.Empty,
-                Padding = Padding.Empty
+                Padding = Padding.Empty,
+                BackColor = Color.Transparent
             };
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
 
@@ -624,7 +645,8 @@ internal sealed class ExtensionsManagerForm : Form
                 Dock = DockStyle.Top,
                 AutoSize = true,
                 ColumnCount = 2,
-                Margin = new Padding(0, 0, 0, 6)
+                Margin = new Padding(0, 0, 0, 6),
+                BackColor = Color.Transparent
             };
             header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 46));
             header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
@@ -645,50 +667,44 @@ internal sealed class ExtensionsManagerForm : Form
                 AutoSize = true,
                 FlowDirection = FlowDirection.LeftToRight,
                 WrapContents = true,
-                Margin = Padding.Empty
+                Margin = Padding.Empty,
+                BackColor = Color.Transparent
             };
 
             var nameLabel = new Label
             {
                 AutoSize = true,
                 Font = CardNameFont,
-                ForeColor = NativeUiTheme.Text,
+                ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : NativeUiTheme.Text,
+                BackColor = Color.Transparent,
                 Text = row.Name,
-                Margin = new Padding(0, 0, 6, 2)
+                Margin = new Padding(0, 2, 8, 2)
             };
 
-            var versionBadge = new Label
+            versionBadge = new PillBadgeLabel(NativeUiTheme.Accent)
             {
-                AutoSize = true,
                 Font = CardBadgeFont,
-                BackColor = NativeUiTheme.SurfaceRaised,
-                ForeColor = NativeUiTheme.SecondaryText,
-                Text = $"v{row.Version}",
-                Padding = new Padding(4, 1, 4, 1),
-                Margin = new Padding(0, 2, 6, 2)
+                ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : NativeUiTheme.Accent,
+                Text = $"v{row.Version}"
             };
 
             var sourceText = row.StoreId is not null
                 ? "Chrome Web Store"
                 : row.FolderPath is not null ? "Local / Unpacked" : "System";
-            var sourceBadge = new Label
+            var sourceTint = row.StoreId is not null ? NativeUiTheme.Lavender : NativeUiTheme.Muted;
+            sourceBadge = new PillBadgeLabel(sourceTint)
             {
-                AutoSize = true,
                 Font = CardBadgeFont,
-                BackColor = NativeUiTheme.SurfaceRaised,
-                ForeColor = NativeUiTheme.MutedText,
-                Text = sourceText,
-                Padding = new Padding(4, 1, 4, 1),
-                Margin = new Padding(0, 2, 6, 2)
+                ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : NativeUiTheme.SecondaryText,
+                Text = sourceText
             };
 
-            var statusBadge = new Label
+            var statusTint = row.IsEnabled ? NativeUiTheme.Positive : NativeUiTheme.Muted;
+            statusBadge = new PillBadgeLabel(statusTint)
             {
-                AutoSize = true,
                 Font = CardStatusFont,
-                ForeColor = row.IsEnabled ? NativeUiTheme.Positive : NativeUiTheme.MutedText,
-                Text = row.IsEnabled ? "Enabled" : "Disabled",
-                Margin = new Padding(0, 2, 0, 2)
+                ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : statusTint,
+                Text = row.IsEnabled ? "Enabled" : "Disabled"
             };
 
             titleFlow.Controls.AddRange([nameLabel, versionBadge, sourceBadge, statusBadge]);
@@ -704,7 +720,8 @@ internal sealed class ExtensionsManagerForm : Form
                 Dock = DockStyle.Top,
                 AutoSize = true,
                 Font = BodyFont,
-                ForeColor = NativeUiTheme.SecondaryText,
+                ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : NativeUiTheme.SecondaryText,
+                BackColor = Color.Transparent,
                 Text = descText,
                 Margin = new Padding(0, 0, 0, 4)
             };
@@ -716,6 +733,7 @@ internal sealed class ExtensionsManagerForm : Form
                 AutoSize = true,
                 Font = CardIdFont,
                 ForeColor = NativeUiTheme.MutedText,
+                BackColor = Color.Transparent,
                 Text = $"ID: {row.Id}",
                 Margin = new Padding(0, 0, 0, 8)
             };
@@ -728,7 +746,8 @@ internal sealed class ExtensionsManagerForm : Form
                 AutoSize = true,
                 FlowDirection = FlowDirection.LeftToRight,
                 WrapContents = true,
-                Margin = Padding.Empty
+                Margin = Padding.Empty,
+                BackColor = Color.Transparent
             };
 
             var hasPopup = row.PopupPath is not null || row.LaunchPath is not null;
@@ -770,11 +789,11 @@ internal sealed class ExtensionsManagerForm : Form
                 actions.Controls.Add(removeButton);
             }
 
-            ConfigureButton(detailsButton, "Details ▾", "View extension details, folder, and permissions");
+            ConfigureButton(detailsButton, "Details \u25BE", "View extension details, folder, and permissions");
             detailsButton.Click += (_, _) =>
             {
                 detailsPanel.Visible = !detailsPanel.Visible;
-                detailsButton.Text = detailsPanel.Visible ? "Details ▴" : "Details ▾";
+                detailsButton.Text = detailsPanel.Visible ? "Details \u25B4" : "Details \u25BE";
             };
             actions.Controls.Add(detailsButton);
             layout.Controls.Add(actions, 0, 3);
@@ -783,16 +802,18 @@ internal sealed class ExtensionsManagerForm : Form
             detailsPanel.Dock = DockStyle.Top;
             detailsPanel.AutoSize = true;
             detailsPanel.Visible = false;
-            detailsPanel.BackColor = NativeUiTheme.SurfaceRaised;
-            detailsPanel.Padding = new Padding(10);
+            detailsPanel.BackColor = SystemInformation.HighContrast ? SystemColors.Control : NativeUiTheme.SurfaceRaised;
+            detailsPanel.Padding = new Padding(12);
             detailsPanel.Margin = new Padding(0, 8, 0, 0);
+            detailsPanel.Paint += OnDetailsPanelPaint;
 
             var detailsLayout = new TableLayoutPanel
             {
                 Dock = DockStyle.Top,
                 AutoSize = true,
                 ColumnCount = 1,
-                Margin = Padding.Empty
+                Margin = Padding.Empty,
+                BackColor = Color.Transparent
             };
             detailsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
 
@@ -803,7 +824,8 @@ internal sealed class ExtensionsManagerForm : Form
                     Dock = DockStyle.Top,
                     AutoSize = true,
                     Font = CardDetailFont,
-                    ForeColor = NativeUiTheme.SecondaryText,
+                    ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : NativeUiTheme.SecondaryText,
+                    BackColor = Color.Transparent,
                     Text = $"Package folder: {row.FolderPath}",
                     Margin = new Padding(0, 0, 0, 4)
                 };
@@ -817,7 +839,8 @@ internal sealed class ExtensionsManagerForm : Form
                     Dock = DockStyle.Top,
                     AutoSize = true,
                     Font = CardDetailFont,
-                    ForeColor = NativeUiTheme.Accent,
+                    ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : NativeUiTheme.Accent,
+                    BackColor = Color.Transparent,
                     Text = $"Chrome Web Store: https://chromewebstore.google.com/detail/{row.StoreId}",
                     Margin = new Padding(0, 0, 0, 6)
                 };
@@ -827,13 +850,14 @@ internal sealed class ExtensionsManagerForm : Form
             var capList = row.Capabilities ?? [];
             var capText = capList.Count == 0
                 ? "No special permissions or site access declared in manifest."
-                : "Declared permissions and site access:" + Environment.NewLine + string.Join(Environment.NewLine, capList.Select(c => "  • " + c));
+                : "Declared permissions and site access:" + Environment.NewLine + string.Join(Environment.NewLine, capList.Select(c => "  \u00B7 " + c));
             var capLabel = new Label
             {
                 Dock = DockStyle.Top,
                 AutoSize = true,
                 Font = CardDetailFont,
-                ForeColor = NativeUiTheme.SecondaryText,
+                ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : NativeUiTheme.SecondaryText,
+                BackColor = Color.Transparent,
                 Text = capText,
                 Margin = new Padding(0, 0, 0, 4)
             };
@@ -843,7 +867,43 @@ internal sealed class ExtensionsManagerForm : Form
             layout.Controls.Add(detailsPanel, 0, 4);
 
             Controls.Add(layout);
+            ApplyCardButtonsTheme();
+        }
+
+        protected override void OnSystemColorsChanged(EventArgs e)
+        {
+            base.OnSystemColorsChanged(e);
+            var highContrast = SystemInformation.HighContrast;
+            BackColor = highContrast ? SystemColors.Window : NativeUiTheme.Surface;
+            ForeColor = highContrast ? SystemColors.WindowText : NativeUiTheme.Text;
+            detailsPanel.BackColor = highContrast ? SystemColors.Control : NativeUiTheme.SurfaceRaised;
+            ApplyCardButtonsTheme();
+            Invalidate(true);
+        }
+
+        private void ApplyCardButtonsTheme()
+        {
+            NativeUiTheme.ApplySecondaryButton(toggleButton);
+            NativeUiTheme.ApplySecondaryButton(detailsButton);
+            if (optionsButton is not null) NativeUiTheme.ApplySecondaryButton(optionsButton);
+            if (updateButton is not null) NativeUiTheme.ApplySecondaryButton(updateButton);
+            if (removeButton is not null) NativeUiTheme.ApplySecondaryButton(removeButton);
             if (openPopupButton is not null) NativeUiTheme.ApplyAccentButton(openPopupButton);
+        }
+
+        private void OnDetailsPanelPaint(object? sender, PaintEventArgs e)
+        {
+            if (detailsPanel.Width <= 2 || detailsPanel.Height <= 2) return;
+            var g = e.Graphics;
+            var highContrast = SystemInformation.HighContrast;
+            g.Clear(highContrast ? SystemColors.Window : NativeUiTheme.Surface);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            var rect = new RectangleF(0.5f, 0.5f, detailsPanel.Width - 1f, detailsPanel.Height - 1f);
+            using var path = NativeUiTheme.CreateRoundedPath(rect, 8f);
+            using var fill = new SolidBrush(highContrast ? SystemColors.Control : NativeUiTheme.SurfaceRaised);
+            using var pen = new Pen(highContrast ? SystemColors.WindowText : Color.FromArgb(120, NativeUiTheme.Border), 1f);
+            g.FillPath(fill, path);
+            g.DrawPath(pen, path);
         }
 
         private static Bitmap? TryLoadUnlockedBitmap(string filePath)
@@ -873,11 +933,68 @@ internal sealed class ExtensionsManagerForm : Form
             detailsButton.Enabled = !busy;
         }
 
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            if (Width <= 2 || Height <= 2)
+            {
+                base.OnPaintBackground(e);
+                return;
+            }
+
+            var g = e.Graphics;
+            var highContrast = SystemInformation.HighContrast;
+            g.Clear(highContrast ? SystemColors.Window : NativeUiTheme.Window);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            var rect = new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f);
+            using var path = NativeUiTheme.CreateRoundedPath(rect, 11f);
+            using (var fill = new SolidBrush(highContrast ? SystemColors.Window : NativeUiTheme.Surface))
+            {
+                g.FillPath(fill, path);
+            }
+
+            if (!highContrast)
+            {
+                var clipState = g.Save();
+                try
+                {
+                    g.SetClip(path, CombineMode.Intersect);
+                    var sheenRect = new RectangleF(rect.X, rect.Y, rect.Width, 14f);
+                    using var sheen = new LinearGradientBrush(
+                        sheenRect,
+                        Color.FromArgb(28, 255, 240, 250),
+                        Color.FromArgb(0, NativeUiTheme.Surface),
+                        LinearGradientMode.Vertical);
+                    g.FillRectangle(sheen, sheenRect);
+                }
+                finally
+                {
+                    g.Restore(clipState);
+                }
+            }
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
-            using var pen = new Pen(NativeUiTheme.Border, 1);
-            e.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+            if (Width <= 2 || Height <= 2) return;
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            var rect = new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f);
+            using var path = NativeUiTheme.CreateRoundedPath(rect, 11f);
+            if (SystemInformation.HighContrast)
+            {
+                using var hcPen = new Pen(SystemColors.WindowText, 1f);
+                g.DrawPath(hcPen, path);
+                return;
+            }
+
+            using var rimBrush = new LinearGradientBrush(
+                rect,
+                Color.FromArgb(165, 255, 224, 246),
+                Color.FromArgb(150, NativeUiTheme.Border),
+                LinearGradientMode.Vertical);
+            using var pen = new Pen(rimBrush, 1f);
+            g.DrawPath(pen, path);
         }
 
         protected override void Dispose(bool disposing)
@@ -888,6 +1005,56 @@ internal sealed class ExtensionsManagerForm : Form
                 iconImage = null;
             }
             base.Dispose(disposing);
+        }
+    }
+
+    private sealed class PillBadgeLabel : Label
+    {
+        private readonly Color accentTint;
+
+        public PillBadgeLabel(Color accentTint)
+        {
+            this.accentTint = accentTint;
+            AutoSize = true;
+            Padding = new Padding(8, 2, 8, 2);
+            Margin = new Padding(0, 2, 6, 2);
+            BackColor = Color.Transparent;
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs pevent)
+        {
+            var g = pevent.Graphics;
+            var highContrast = SystemInformation.HighContrast;
+            g.Clear(highContrast ? SystemColors.Window : NativeUiTheme.Surface);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            if (Width <= 2 || Height <= 2) return;
+            var g = e.Graphics;
+            var highContrast = SystemInformation.HighContrast;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            var rect = new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f);
+            var radius = Math.Max(4f, rect.Height / 2f);
+            using var path = NativeUiTheme.CreateRoundedPath(rect, radius);
+
+            using (var bg = new SolidBrush(highContrast ? SystemColors.Control : Color.FromArgb(42, accentTint)))
+            {
+                g.FillPath(bg, path);
+            }
+
+            using (var pen = new Pen(highContrast ? SystemColors.WindowText : Color.FromArgb(145, accentTint), 1f))
+            {
+                g.DrawPath(pen, path);
+            }
+
+            TextRenderer.DrawText(
+                g,
+                Text,
+                Font,
+                ClientRectangle,
+                highContrast ? SystemColors.ControlText : ForeColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
         }
     }
 
@@ -911,21 +1078,45 @@ internal sealed class ExtensionsManagerForm : Form
         protected override void OnPaint(PaintEventArgs e)
         {
             var g = e.Graphics;
+            var highContrast = SystemInformation.HighContrast;
+            g.Clear(highContrast ? SystemColors.Window : NativeUiTheme.Surface);
             g.SmoothingMode = SmoothingMode.AntiAlias;
+            var rect = new RectangleF(1f, 1f, Math.Max(2f, Width - 2f), Math.Max(2f, Height - 2f));
+            using var squircle = NativeUiTheme.CreateRoundedPath(rect, Math.Max(6f, rect.Width * 0.26f));
+
             if (iconImage is not null)
             {
-                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                g.DrawImage(iconImage, ClientRectangle);
+                var clipState = g.Save();
+                try
+                {
+                    g.SetClip(squircle, CombineMode.Intersect);
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.DrawImage(iconImage, rect);
+                }
+                finally
+                {
+                    g.Restore(clipState);
+                }
+
+                using var imageRim = new Pen(
+                    highContrast ? SystemColors.WindowText : Color.FromArgb(130, NativeUiTheme.Border),
+                    1f);
+                g.DrawPath(imageRim, squircle);
                 return;
             }
 
-            using var bgBrush = new SolidBrush(NativeUiTheme.SurfaceRaised);
-            g.FillEllipse(bgBrush, 1, 1, Width - 2, Height - 2);
-            using var borderPen = new Pen(NativeUiTheme.Border, 1);
-            g.DrawEllipse(borderPen, 1, 1, Width - 2, Height - 2);
+            using (var bgBrush = new SolidBrush(highContrast ? SystemColors.Control : NativeUiTheme.SurfaceRaised))
+            {
+                g.FillPath(bgBrush, squircle);
+            }
+
+            using (var borderPen = new Pen(highContrast ? SystemColors.WindowText : NativeUiTheme.Border, 1f))
+            {
+                g.DrawPath(borderPen, squircle);
+            }
 
             var letter = string.IsNullOrWhiteSpace(name) ? "E" : name.TrimStart()[0].ToString().ToUpperInvariant();
-            using var textBrush = new SolidBrush(NativeUiTheme.Accent);
+            using var textBrush = new SolidBrush(highContrast ? SystemColors.ControlText : NativeUiTheme.Accent);
             using var sf = new StringFormat
             {
                 Alignment = StringAlignment.Center,

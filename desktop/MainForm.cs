@@ -153,6 +153,7 @@ public sealed class MainForm : Form
     private readonly TabDragGhost tabDragGhost = new();
     private readonly RoundedPanel omniboxPanel = new();
     private readonly AddressSuggestionPopup addressSuggestionPopup = new();
+    private readonly RoundedPanel findOmniboxPanel = new();
     private readonly TableLayoutPanel findBar = new();
     private readonly TransparentPanelHost pageHost = new();
     private readonly FirstClickSelectTextBox addressBar = new();
@@ -171,9 +172,10 @@ public sealed class MainForm : Form
     private readonly WindowCaptionButton minimizeButton = new();
     private readonly WindowCaptionButton maximizeButton = new();
     private readonly WindowCaptionButton closeWindowButton = new();
-    private readonly Button findPreviousButton = new();
-    private readonly Button findNextButton = new();
-    private readonly Button closeFindButton = new();
+    private readonly ChromeButton findCaseSensitiveButton = new();
+    private readonly ChromeButton findPreviousButton = new();
+    private readonly ChromeButton findNextButton = new();
+    private readonly ChromeButton closeFindButton = new();
     private readonly AnnouncingStatusLabel statusLabel = new();
     private readonly ToolTip toolTip = new() { AutoPopDelay = 7000, InitialDelay = 450, ReshowDelay = 100 };
     private readonly IncognitoBadgeControl incognitoBadge;
@@ -310,6 +312,8 @@ public sealed class MainForm : Form
     private PermissionManagerForm? permissionManager;
     private PermissionRequest? activePermissionRequest;
     private DownloadsPopupForm? downloadsPopup;
+    private DownloadNotificationForm? downloadNotification;
+    private DownloadEntry? notificationDownloadEntry;
     private ExtensionsManagerForm? extensionsManager;
     private CoreWebView2Controller? extensionProfileController;
     private bool openingExtensionsManager;
@@ -317,6 +321,17 @@ public sealed class MainForm : Form
     private bool browserRuntimeUpdateAvailable;
     private MruSwitcherSnapshot<BrowserTab>? mruSnapshot;
     private bool openingMruSwitcher;
+    private const int MaximumCachedFaviconHosts = 64;
+    private readonly Dictionary<string, LinkedListNode<(string Host, Bitmap Icon)>> faviconCacheMap =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly LinkedList<(string Host, Bitmap Icon)> faviconCacheOrder = new();
+    private long faviconCacheVersion = 1;
+    private bool findMatchCase;
+    private long findOpenGeneration;
+    private long findBoxEditGeneration;
+    private bool suppressFindEditTracking;
+    private readonly bool priorUncleanShutdown;
+    private bool markCleanShutdownOnSave;
     private Control? focusBeforeCommandPalette;
     private bool? highContrastOverrideForTesting;
 
@@ -338,6 +353,15 @@ public sealed class MainForm : Form
         browserStartupCompleted = !startBrowserOnShown;
         state = previewState ?? (!isPrivateMode && startBrowserOnShown ? stateStore.Load() : new BrowserState());
         BrowserStateStore.NormalizeForPersistence(state);
+        priorUncleanShutdown = !isPrivateMode
+            && startBrowserOnShown
+            && previewState is null
+            && !state.CleanShutdown
+            && state.OpenTabs.Any(BrowserPolicy.IsHttpUrl);
+        if (!isPrivateMode && startBrowserOnShown && previewState is null && state.RecentDownloads.Count > 0)
+        {
+            HydrateRecentDownloadsFromState();
+        }
         adBlockExceptionHosts = state.AdBlockExceptionHosts.ToHashSet(StringComparer.OrdinalIgnoreCase);
         foreach (var closed in state.RecentlyClosed)
         {
@@ -550,8 +574,16 @@ public sealed class MainForm : Form
     {
         if (isPrivateMode || !persistStateOnClose) return true;
         stateSaveTimer.Stop();
+        markCleanShutdownOnSave = true;
         var saved = SaveStateNow();
-        if (saved) browserProcessRestartStateSaved = true;
+        if (saved)
+        {
+            browserProcessRestartStateSaved = true;
+        }
+        else
+        {
+            markCleanShutdownOnSave = false;
+        }
         return saved;
     }
 
@@ -564,6 +596,7 @@ public sealed class MainForm : Form
     {
         browserProcessRestartApproved = false;
         browserProcessRestartStateSaved = false;
+        markCleanShutdownOnSave = false;
     }
 
     internal IDisposable BeginExtensionMutationForTesting() => BeginExtensionMutation();
@@ -681,7 +714,8 @@ public sealed class MainForm : Form
     {
         base.OnHandleCreated(e);
         NativeMethods.ApplyBorderlessResizableStyle(Handle);
-        var palette = ResolveChromeColorPolicy(IsHighContrastActive);
+        NativeUiTheme.ApplyWindowFrame(this);
+        var palette = ResolveChromeColorPolicy(IsHighContrastActive, isPrivateMode);
         NativeMethods.TryEnableModernWindowFrame(
             Handle,
             palette.ChromeSurface,
@@ -1127,7 +1161,7 @@ public sealed class MainForm : Form
         {
             ApplyButtonPalette(button, palette.FieldSurface, palette.FieldText, palette);
         }
-        foreach (var button in new[] { findPreviousButton, findNextButton, closeFindButton })
+        foreach (var button in new ChromeButton[] { findCaseSensitiveButton, findPreviousButton, findNextButton, closeFindButton })
         {
             ApplyButtonPalette(button, palette.ToolbarSurface, palette.ChromeText, palette);
         }
@@ -1142,6 +1176,11 @@ public sealed class MainForm : Form
             TrySetBackColor(control, Color.Transparent, palette.FieldSurface);
             control.ForeColor = palette.FieldText;
         }
+        findOmniboxPanel.HighContrast = palette.HighContrast;
+        findOmniboxPanel.BackColor = palette.FieldSurface;
+        findOmniboxPanel.FillColor = palette.FieldSurface;
+        findOmniboxPanel.BorderColor = palette.Border;
+        findOmniboxPanel.FocusBorderColor = palette.Focus;
         addressBar.BackColor = palette.FieldSurface;
         addressBar.ForeColor = palette.FieldText;
         findBox.BackColor = palette.FieldSurface;
@@ -1196,6 +1235,8 @@ public sealed class MainForm : Form
 
     private static void ApplyMenuPalette(ToolStripDropDown menu, ChromeColorPolicy palette)
     {
+        if (menu.IsDisposed) return;
+        NativeUiTheme.ApplyMenuWindowFrame(menu);
         menu.BackColor = palette.MenuSurface;
         menu.ForeColor = palette.MenuText;
         foreach (ToolStripItem item in menu.Items)
@@ -1281,6 +1322,9 @@ public sealed class MainForm : Form
         BuildToolbar();
         BuildFindBar();
         BuildMenus();
+        NativeUiTheme.ApplyWindowFrame(this);
+        NativeUiTheme.ConfigureGlassToolTip(toolTip);
+        NativeUiTheme.ApplyDarkScrollbars(tabStrip);
 
         pageHost.Dock = DockStyle.Fill;
         pageHost.Margin = Padding.Empty;
@@ -1447,6 +1491,7 @@ public sealed class MainForm : Form
         addressBar.AccessibleDescription = "Enter a website address or search terms";
         addressContextMenu.ShowImageMargin = false;
         addressContextMenu.Renderer = menuRenderer;
+        NativeUiTheme.ApplyMenuWindowFrame(addressContextMenu);
         var undoAddressEdit = new ToolStripMenuItem("Undo");
         undoAddressEdit.Click += (_, _) => addressBar.Undo();
         var cutAddressText = new ToolStripMenuItem("Cut");
@@ -1561,21 +1606,32 @@ public sealed class MainForm : Form
         findBar.Padding = new Padding(12, 5, 10, 5);
         findBar.BackColor = ToolbarColor;
         findBar.RowCount = 1;
-        findBar.ColumnCount = 5;
+        findBar.ColumnCount = 6;
         findBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         findBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
         findBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 36));
         findBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 36));
         findBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 36));
+        findBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 36));
+
+        findOmniboxPanel.Dock = DockStyle.Fill;
+        findOmniboxPanel.Margin = new Padding(0, 1, 8, 1);
+        findOmniboxPanel.FillColor = OmniboxColor;
+        findOmniboxPanel.BorderColor = NativeUiTheme.Border;
+        findOmniboxPanel.FocusBorderColor = OmniboxFocusColor;
+        findOmniboxPanel.CornerRadius = 14;
+        findOmniboxPanel.Padding = new Padding(10, 1, 10, 1);
 
         findBox.Dock = DockStyle.Fill;
-        findBox.Margin = new Padding(0, 0, 6, 0);
-        findBox.BorderStyle = BorderStyle.FixedSingle;
+        findBox.Margin = new Padding(2, 5, 2, 4);
+        findBox.AutoSize = false;
+        findBox.BorderStyle = BorderStyle.None;
         findBox.BackColor = OmniboxColor;
         findBox.ForeColor = PageTextColor;
         findBox.Font = new Font("Segoe UI", 10f);
         findBox.PlaceholderText = "Find on this page";
         findBox.AccessibleName = "Find on page";
+        findOmniboxPanel.Controls.Add(findBox);
 
         findMatchLabel.Dock = DockStyle.Fill;
         findMatchLabel.TextAlign = ContentAlignment.MiddleCenter;
@@ -1584,15 +1640,26 @@ public sealed class MainForm : Form
         findMatchLabel.Text = string.Empty;
         findMatchLabel.AccessibleName = "Find match count";
 
-        ConfigureToolbarButton(findPreviousButton, "\u2191", "Previous match (Shift+F3)", "Previous match", 11f);
-        ConfigureToolbarButton(findNextButton, "\u2193", "Next match (F3)", "Next match", 11f);
-        ConfigureToolbarButton(closeFindButton, "\u00D7", "Close find", "Close find", 13f);
+        ConfigureToolbarButton(findCaseSensitiveButton, string.Empty, "Match case", "Match case", 10f);
+        ConfigureToolbarButton(findPreviousButton, string.Empty, "Previous match (\u2191, Shift+F3)", "Previous match", 11f);
+        ConfigureToolbarButton(findNextButton, string.Empty, "Next match (\u2193, F3)", "Next match", 11f);
+        ConfigureToolbarButton(closeFindButton, string.Empty, "Close find (Esc)", "Close find", 13f);
+        findCaseSensitiveButton.IconKind = ChromeIconKind.MatchCase;
+        findCaseSensitiveButton.CornerRadius = 9;
+        findCaseSensitiveButton.AccessibleDescription = "Case-insensitive search";
+        findPreviousButton.IconKind = ChromeIconKind.FindPrevious;
+        findPreviousButton.CornerRadius = 9;
+        findNextButton.IconKind = ChromeIconKind.FindNext;
+        findNextButton.CornerRadius = 9;
+        closeFindButton.IconKind = ChromeIconKind.FindClose;
+        closeFindButton.CornerRadius = 9;
 
-        findBar.Controls.Add(findBox, 0, 0);
+        findBar.Controls.Add(findOmniboxPanel, 0, 0);
         findBar.Controls.Add(findMatchLabel, 1, 0);
-        findBar.Controls.Add(findPreviousButton, 2, 0);
-        findBar.Controls.Add(findNextButton, 3, 0);
-        findBar.Controls.Add(closeFindButton, 4, 0);
+        findBar.Controls.Add(findCaseSensitiveButton, 2, 0);
+        findBar.Controls.Add(findPreviousButton, 3, 0);
+        findBar.Controls.Add(findNextButton, 4, 0);
+        findBar.Controls.Add(closeFindButton, 5, 0);
         findBar.Resize += (_, _) => UpdateFindBarLayout();
         findBar.Visible = false;
     }
@@ -1603,6 +1670,7 @@ public sealed class MainForm : Form
         appMenu.Renderer = menuRenderer;
         appMenu.BackColor = ToolbarColor;
         appMenu.ForeColor = PageTextColor;
+        NativeUiTheme.ApplyMenuWindowFrame(appMenu);
         appMenu.Opening += (_, _) => PopulateAppMenu();
 
         AddMenuItem(appMenu, "Command palette", "Ctrl+Shift+P", ShowCommandPalette);
@@ -1614,7 +1682,7 @@ public sealed class MainForm : Form
         appMenu.Items.Add(historyMenu);
         appMenu.Items.Add(downloadsMenu);
         appMenu.Items.Add(searchProviderMenu);
-        AddMenuItem(appMenu, "Saved items\u2026", string.Empty, ShowSavedItemsDialog);
+        AddMenuItem(appMenu, "Saved items\u2026", "Ctrl+Shift+O", ShowSavedItemsDialog);
         AddMenuItem(appMenu, "Saved sessions\u2026", string.Empty, ShowSessionManager);
         AddMenuItem(appMenu, "Voice and audio settings\u2026", string.Empty, ShowVoiceAudioSettingsDialog);
         extensionsMenuItem.Click += (_, _) => RunUiTask(
@@ -1632,6 +1700,8 @@ public sealed class MainForm : Form
         fullScreenMenuItem.Click += (_, _) => ToggleFullScreen();
         appMenu.Items.Add(siteThemeMenuItem);
         appMenu.Items.Add(fullScreenMenuItem);
+        AddMenuItem(appMenu, "Picture-in-Picture", string.Empty, () =>
+            RunUiTask(() => TogglePictureInPictureAsync(), "Picture-in-Picture is unavailable"));
         appMenu.Items.Add(new ToolStripSeparator());
         AddMenuItem(appMenu, "Downloads", "Ctrl+J", ShowDownloadsPopup);
         AddMenuItem(appMenu, "Find on page", "Ctrl+F", ShowFindBar);
@@ -1640,7 +1710,7 @@ public sealed class MainForm : Form
         AddMenuItem(appMenu, "Capture page as PNG\u2026", "Ctrl+Shift+S", () =>
             RunUiTask(CapturePageAsync, "Could not capture the page"));
         appMenu.Items.Add(new ToolStripSeparator());
-        AddMenuItem(appMenu, "Clear browsing data\u2026", string.Empty, () => RunUiTask(ClearBrowsingDataAsync, "Could not clear browsing data"));
+        AddMenuItem(appMenu, "Clear browsing data\u2026", "Ctrl+Shift+Del", () => RunUiTask(ClearBrowsingDataAsync, "Could not clear browsing data"));
         restartBrowserForUpdateMenuItem.Click += (_, _) => RunUiTask(
             RestartBrowserForUpdateAsync,
             "Could not restart the browser engine");
@@ -1652,14 +1722,30 @@ public sealed class MainForm : Form
         tabMenu.Renderer = menuRenderer;
         tabMenu.BackColor = ToolbarColor;
         tabMenu.ForeColor = PageTextColor;
+        NativeUiTheme.ApplyMenuWindowFrame(tabMenu);
         tabListMenu.ShowImageMargin = false;
         tabListMenu.Renderer = menuRenderer;
         tabListMenu.BackColor = ToolbarColor;
         tabListMenu.ForeColor = PageTextColor;
+        NativeUiTheme.ApplyMenuWindowFrame(tabListMenu);
         siteInfoMenu.ShowImageMargin = false;
         siteInfoMenu.Renderer = menuRenderer;
         siteInfoMenu.BackColor = ToolbarColor;
         siteInfoMenu.ForeColor = PageTextColor;
+        NativeUiTheme.ApplyMenuWindowFrame(siteInfoMenu);
+        foreach (var dropDown in new ToolStripDropDown[]
+        {
+            favoritesMenu.DropDown,
+            historyMenu.DropDown,
+            downloadsMenu.DropDown,
+            searchProviderMenu.DropDown,
+            resourceModeMenu.DropDown,
+            zoomMenu.DropDown,
+            extensionsMenuItem.DropDown
+        })
+        {
+            NativeUiTheme.ApplyMenuWindowFrame(dropDown);
+        }
     }
 
     private void BuildResourceModeMenu()
@@ -1681,8 +1767,38 @@ public sealed class MainForm : Form
 
     private void WireChromeEvents()
     {
-        backButton.Click += (_, _) => GoBack();
-        forwardButton.Click += (_, _) => GoForward();
+        backButton.Click += (_, _) =>
+        {
+            if (ModifierKeys.HasFlag(Keys.Shift))
+            {
+                RunUiTask(() => ShowNavigationHistoryMenuAsync(backButton, forward: false), "History unavailable");
+                return;
+            }
+            GoBack();
+        };
+        backButton.MouseUp += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Right && backButton.Enabled)
+            {
+                RunUiTask(() => ShowNavigationHistoryMenuAsync(backButton, forward: false), "History unavailable");
+            }
+        };
+        forwardButton.Click += (_, _) =>
+        {
+            if (ModifierKeys.HasFlag(Keys.Shift))
+            {
+                RunUiTask(() => ShowNavigationHistoryMenuAsync(forwardButton, forward: true), "History unavailable");
+                return;
+            }
+            GoForward();
+        };
+        forwardButton.MouseUp += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Right && forwardButton.Enabled)
+            {
+                RunUiTask(() => ShowNavigationHistoryMenuAsync(forwardButton, forward: true), "History unavailable");
+            }
+        };
         reloadButton.Click += (_, _) => ReloadOrStop();
         homeButton.Click += (_, _) => ShowStartPage(activeTab);
         siteInfoButton.Click += (_, _) => ShowSiteInformation();
@@ -1745,12 +1861,24 @@ public sealed class MainForm : Form
             UpdateAddressSuggestions();
         };
 
+        findBox.Enter += (_, _) => findOmniboxPanel.IsFocused = true;
+        findBox.Leave += (_, _) => findOmniboxPanel.IsFocused = false;
         findBox.KeyDown += FindBoxOnKeyDown;
         findBox.TextChanged += (_, _) =>
         {
+            if (!suppressFindEditTracking) findBoxEditGeneration++;
             if (!findBar.Visible) return;
             findDebounceTimer.Stop();
             findDebounceTimer.Start();
+        };
+        findCaseSensitiveButton.Click += (_, _) =>
+        {
+            findMatchCase = !findMatchCase;
+            findCaseSensitiveButton.IsActiveToggle = findMatchCase;
+            findCaseSensitiveButton.AccessibleDescription = findMatchCase
+                ? "Case-sensitive search enabled"
+                : "Case-insensitive search";
+            if (findBox.TextLength > 0) RunUiTask(StartFindSession, "Find failed");
         };
         findPreviousButton.Click += (_, _) => RunUiTask(() => FindOnPageAsync(true), "Find failed");
         findNextButton.Click += (_, _) => RunUiTask(() => FindOnPageAsync(false), "Find failed");
@@ -1804,10 +1932,16 @@ public sealed class MainForm : Form
         {
             UpdateWindowControls();
             PositionAddressSuggestions();
+            if (WindowState == FormWindowState.Minimized) downloadNotification?.Dismiss();
+            else RepositionDownloadNotification();
             TrackWindowPlacementChange();
             RunUiTask(HandleWindowStateChangeAsync, "Could not change tab power state");
         };
-        LocationChanged += (_, _) => TrackWindowPlacementChange();
+        LocationChanged += (_, _) =>
+        {
+            RepositionDownloadNotification();
+            TrackWindowPlacementChange();
+        };
         SystemEvents.UserPreferenceChanged += OnSystemPreferenceChanged;
     }
 
@@ -1816,6 +1950,30 @@ public sealed class MainForm : Form
         try
         {
             ShowTransientStatus("Starting browser\u2026", false);
+            if (priorUncleanShutdown)
+            {
+                var webTabCount = state.OpenTabs.Count(BrowserPolicy.IsHttpUrl);
+                var restorePrevious = NativeAlertDialog.Confirm(
+                    this,
+                    "Restore previous tabs?",
+                    webTabCount == 1
+                        ? "MishaWeb did not close cleanly last time. Restore your open tab from the previous session?"
+                        : $"MishaWeb did not close cleanly last time. Restore your {webTabCount} open tabs from the previous session?",
+                    "Restore tabs",
+                    "Start fresh");
+                if (!restorePrevious)
+                {
+                    foreach (var url in state.OpenTabs.Where(BrowserPolicy.IsHttpUrl).Reverse())
+                    {
+                        closedTabs.AddFirst(new ClosedTabEntry(HostFromUrl(url), url, DateTimeOffset.UtcNow));
+                    }
+                    while (closedTabs.Count > BrowserStateStore.MaximumRecentlyClosed) closedTabs.RemoveLast();
+                    state.OpenTabs.Clear();
+                    state.PinnedOpenTabCount = 0;
+                    state.ActiveTabIndex = null;
+                }
+            }
+
             var restoredTabs = await RestoreOpenTabsFromStateAsync();
             if (isClosing) return;
             if (!restoredTabs)
@@ -1835,16 +1993,23 @@ public sealed class MainForm : Form
                 if (isClosing) return;
             }
 
+            if (!isPrivateMode && persistStateOnClose)
+            {
+                markCleanShutdownOnSave = false;
+                PopulateStateFromPreferences();
+                state.CleanShutdown = false;
+                _ = stateStore.QueueSave(state);
+            }
+
             RefreshMemorySweepTimer();
         }
         catch (WebView2RuntimeNotFoundException error)
         {
             stateStore.Log("WebView2 Runtime was not found", error);
-            MessageBox.Show(
-                "MishaWeb needs the Microsoft Edge WebView2 Runtime. Install the Evergreen Runtime, then open MishaWeb again.",
+            NativeAlertDialog.ShowInfo(
+                this,
                 "WebView2 Runtime required",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
+                "MishaWeb needs the Microsoft Edge WebView2 Runtime. Install the Evergreen Runtime, then open MishaWeb again.");
             Close();
         }
         catch (Exception error)
@@ -1853,11 +2018,10 @@ public sealed class MainForm : Form
             var diagnosticNote = isPrivateMode
                 ? "Private-window diagnostics were not written to disk."
                 : "Details were saved to the MishaWeb diagnostics log.";
-            MessageBox.Show(
-                $"MishaWeb could not open its browser profile.\n\n{error.Message}\n\n{diagnosticNote}",
+            NativeAlertDialog.ShowInfo(
+                this,
                 "MishaWeb could not start",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
+                $"MishaWeb could not open its browser profile.\n\n{error.Message}\n\n{diagnosticNote}");
             Close();
         }
         finally
@@ -2160,7 +2324,8 @@ public sealed class MainForm : Form
         omniboxPanel.IsFocused = true;
         addressBar.Text = query;
         addressBar.SelectionStart = addressBar.TextLength;
-        addressSuggestionPopup.SetSuggestions(AddressSuggestionEngine.GetSuggestions(query, state));
+        addressSuggestionPopup.SetSuggestions(
+            AddressSuggestionEngine.GetSuggestions(query, state, BuildOpenTabCandidates()));
         PositionAddressSuggestions();
         addressSuggestionPopup.SelectedIndex = 0;
     }
@@ -2525,6 +2690,7 @@ public sealed class MainForm : Form
         };
 
         header.Activated += (_, _) => ActivateTab(tab);
+        header.AudioToggleRequested += (_, _) => ToggleTabAudioMute(tab);
         header.CloseRequested += (_, _) => CloseTab(tab);
         header.ContextRequested += (_, point) => ShowTabContextMenu(tab, point.ScreenLocation);
         header.DragStarted += (_, e) => BeginTabDrag(tab, e.ScreenLocation);
@@ -2550,6 +2716,15 @@ public sealed class MainForm : Form
         }
         overlayAction.Click += (_, _) => TriggerTabRecovery();
         overlay.Click += (_, _) => { if (tab.IsDiscarded) TriggerTabRecovery(); };
+        if (overlayTitle.Parent is Control overlayCard)
+        {
+            overlayCard.Click += (_, _) => { if (tab.IsDiscarded) TriggerTabRecovery(); };
+            foreach (Control child in overlayCard.Controls)
+            {
+                if (child == overlayAction || child == overlayTitle || child == overlayDetail) continue;
+                child.Click += (_, _) => { if (tab.IsDiscarded) TriggerTabRecovery(); };
+            }
+        }
         overlayTitle.Click += (_, _) => { if (tab.IsDiscarded) TriggerTabRecovery(); };
         overlayDetail.Click += (_, _) => { if (tab.IsDiscarded) TriggerTabRecovery(); };
         if (!isStartPage)
@@ -2723,64 +2898,126 @@ public sealed class MainForm : Form
         }
     }
 
-    private static TransparentTableLayoutPanel CreateTabOverlay(
+    private TransparentTableLayoutPanel CreateTabOverlay(
         out Label title,
         out Label detail,
         out Button action)
     {
+        var palette = ResolveChromeColorPolicy(IsHighContrastActive, isPrivateMode);
         var overlay = new TransparentTableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 3,
-            RowCount = 5,
+            RowCount = 3,
             Margin = Padding.Empty,
-            Padding = new Padding(20),
+            Padding = new Padding(24),
             AccessibleRole = AccessibleRole.Alert,
             AccessibleName = "Tab status"
         };
-        overlay.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20));
-        overlay.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 60));
-        overlay.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20));
+        overlay.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        overlay.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        overlay.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
         overlay.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-        overlay.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
-        overlay.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
-        overlay.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        overlay.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         overlay.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+
+        var card = new RoundedPanel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            MinimumSize = new Size(340, 210),
+            MaximumSize = new Size(480, 0),
+            Padding = new Padding(28, 22, 28, 24),
+            CornerRadius = 18,
+            HighContrast = palette.HighContrast,
+            FillColor = palette.HighContrast
+                ? SystemColors.Window
+                : isPrivateMode ? Color.FromArgb(30, 14, 34) : NativeUiTheme.Surface,
+            BackColor = palette.HighContrast
+                ? SystemColors.Window
+                : isPrivateMode ? Color.FromArgb(30, 14, 34) : NativeUiTheme.Surface,
+            BorderColor = palette.Border,
+            FocusBorderColor = palette.Focus
+        };
+
+        var cardLayout = new TableLayoutPanel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 4,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+        TrySetBackColor(cardLayout, Color.Transparent, card.FillColor);
+        cardLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        cardLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
+        cardLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        cardLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        cardLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
+
+        var logoHost = new Panel
+        {
+            Size = new Size(46, 46),
+            Anchor = AnchorStyles.None,
+            Margin = new Padding(0, 0, 0, 8),
+            TabStop = false
+        };
+        TrySetBackColor(logoHost, Color.Transparent, card.FillColor);
+        var bunnyMark = new BrandLogoControl
+        {
+            Dock = DockStyle.Fill,
+            PrivateMode = isPrivateMode
+        };
+        TrySetBackColor(bunnyMark, Color.Transparent, card.FillColor);
+        logoHost.Controls.Add(bunnyMark);
 
         title = new Label
         {
+            AutoSize = true,
             Dock = DockStyle.Fill,
+            MaximumSize = new Size(410, 0),
+            Margin = new Padding(0, 2, 0, 6),
             TextAlign = ContentAlignment.MiddleCenter,
-            ForeColor = PageTextColor,
-            Font = OverlayTitleFont,
-            AutoEllipsis = true
+            ForeColor = palette.HighContrast ? SystemColors.WindowText : NativeUiTheme.Text,
+            Font = OverlayTitleFont
         };
+        TrySetBackColor(title, Color.Transparent, card.FillColor);
+
         detail = new Label
         {
+            AutoSize = true,
             Dock = DockStyle.Fill,
+            MaximumSize = new Size(410, 0),
+            Margin = new Padding(0, 0, 0, 16),
             TextAlign = ContentAlignment.TopCenter,
-            ForeColor = MutedTextColor,
-            Font = OverlayDetailFont,
-            AutoEllipsis = true
+            ForeColor = palette.MutedText,
+            Font = OverlayDetailFont
         };
-        action = new Button
+        TrySetBackColor(detail, Color.Transparent, card.FillColor);
+
+        action = new PillActionButton
         {
-            Dock = DockStyle.Fill,
-            Margin = new Padding(90, 4, 90, 4),
-            FlatStyle = FlatStyle.Flat,
-            BackColor = NativeUiTheme.Accent,
-            ForeColor = NativeUiTheme.AccentText,
+            Size = new Size(168, 38),
+            Anchor = AnchorStyles.None,
+            Margin = new Padding(0, 4, 0, 0),
+            BackColor = card.FillColor,
+            ForeColor = palette.HighContrast ? SystemColors.HighlightText : NativeUiTheme.AccentText,
             Font = OverlayActionFont,
             Cursor = Cursors.Hand,
             Visible = false,
             AccessibleName = "Tab recovery action"
         };
-        action.FlatAppearance.BorderSize = 0;
-        action.FlatAppearance.MouseOverBackColor = NativeUiTheme.AccentHover;
-        action.FlatAppearance.MouseDownBackColor = NativeUiTheme.AccentPressed;
-        overlay.Controls.Add(title, 1, 1);
-        overlay.Controls.Add(detail, 1, 2);
-        overlay.Controls.Add(action, 1, 3);
+        ((PillActionButton)action).PrivateMode = isPrivateMode;
+        ((PillActionButton)action).HighContrast = palette.HighContrast;
+
+        cardLayout.Controls.Add(logoHost, 0, 0);
+        cardLayout.Controls.Add(title, 0, 1);
+        cardLayout.Controls.Add(detail, 0, 2);
+        cardLayout.Controls.Add(action, 0, 3);
+        card.Controls.Add(cardLayout);
+        overlay.Controls.Add(card, 1, 1);
         return overlay;
     }
 
@@ -3244,6 +3481,16 @@ public sealed class MainForm : Form
                     QueueBackgroundTabReduction(tab);
                 }
             });
+        TrackCoreEvent<object>(
+            tab,
+            handler => core.FaviconChanged += handler,
+            handler => core.FaviconChanged -= handler,
+            (_, _) =>
+            {
+                if (!IsCurrentCore() || tab.IsStartPage) return;
+                var docGeneration = tab.DocumentNavigationGeneration;
+                RunUiTask(() => RefreshTabFaviconAsync(tab, core, docGeneration), "Could not load site icon");
+            });
         TrackCoreEvent<CoreWebView2LaunchingExternalUriSchemeEventArgs>(
             tab,
             handler => core.LaunchingExternalUriScheme += handler,
@@ -3581,7 +3828,7 @@ public sealed class MainForm : Form
                 cacheEvaluation: !isPrivateMode))
         {
             e.Cancel = true;
-            tab.BlockedRequestCount++;
+            tab.RecordBlockedHost(targetHost, "Ad");
             tab.IsLoading = false;
             tab.StatusText = "Blocked an ad redirect";
             if (tab.BlockedRequestCount == 1) ShowTransientStatus("Shield blocked an ad redirect");
@@ -3671,7 +3918,11 @@ public sealed class MainForm : Form
         tab.IsLoading = true;
         tab.ConsecutiveSuspendFailures = 0;
         tab.StatusText = "Loading\u2026";
-        tab.BlockedRequestCount = 0;
+        tab.ResetBlockedStats();
+        if (tab.PendingRestoreScrollY == 0 && !BrowserPolicy.UrlEquals(e.Uri, tab.Url))
+        {
+            tab.SavedScrollY = 0;
+        }
         tab.IsStartPage = false;
         ReleaseNativeStartPage(tab);
         if (activeTab == tab && !isWindowMinimized && !tab.Overlay.Visible)
@@ -3769,14 +4020,15 @@ public sealed class MainForm : Form
                     resourceType,
                     mediaPermissionGranted)) return;
         }
-        if (!adBlocker.ShouldBlock(
-                e.Request.Uri,
-                sourceUrl,
-                resourceType,
-                cacheEvaluation: !isPrivateMode)) return;
+        var evaluation = adBlocker.EvaluateRequest(
+            e.Request.Uri,
+            sourceUrl,
+            resourceType,
+            cacheEvaluation: !isPrivateMode);
+        if (!evaluation.Blocked) return;
 
         e.Response = CreateBlockedResourceResponse(resourceType, e.Request.Uri, topLevelUrl, e.Request.Headers);
-        tab.BlockedRequestCount++;
+        tab.RecordBlockedAttempt(evaluation);
         if (tab.BlockedRequestCount == 1) ShowTransientStatus("Shield blocked ad and tracker requests");
         else if (activeTab == tab && !statusUiTimer.Enabled) statusUiTimer.Start();
     }
@@ -4671,6 +4923,43 @@ public sealed class MainForm : Form
                 UpdateTabUrlFromSource(tab, source);
                 ApplySitePreferences(tab, persist: false);
                 AddHistory(tab);
+                if (darkModeEnabled && state.DarkModeExcludedHosts.Count > 0)
+                {
+                    await ApplyWebsiteThemeAsync(tab);
+                    if (isClosing
+                        || tab.IsClosed
+                        || !ReferenceEquals(tab.Core, core)
+                        || tab.DocumentNavigationGeneration != navigationGeneration)
+                    {
+                        return;
+                    }
+                }
+                if (tab.PendingRestoreScrollY > 0)
+                {
+                    var restoreY = tab.PendingRestoreScrollY;
+                    tab.PendingRestoreScrollY = 0;
+                    tab.SavedScrollY = restoreY;
+                    try
+                    {
+                        await core.ExecuteScriptAsync($"(() => {{ try {{ window.scrollTo(0, {restoreY}); }} catch (_) {{}} }})();");
+                    }
+                    catch { }
+                    if (isClosing
+                        || tab.IsClosed
+                        || !ReferenceEquals(tab.Core, core)
+                        || tab.DocumentNavigationGeneration != navigationGeneration)
+                    {
+                        return;
+                    }
+                }
+                try
+                {
+                    if (!string.IsNullOrWhiteSpace(core.FaviconUri) && !TryApplyCachedFavicon(tab))
+                    {
+                        RunUiTask(() => RefreshTabFaviconAsync(tab, core, navigationGeneration), "Could not load page icon");
+                    }
+                }
+                catch { }
                 await RefreshTabMediaPermissionStateAsync(tab, navigationGeneration);
                 if (isClosing
                     || tab.IsClosed
@@ -4718,6 +5007,10 @@ public sealed class MainForm : Form
         var source = tab.Core!.Source;
         var keepAwakeChanged = UpdateTabUrlFromSource(tab, source);
         ApplySitePreferences(tab, persist: false);
+        if (darkModeEnabled && state.DarkModeExcludedHosts.Count > 0)
+        {
+            RunUiTask(() => ApplyWebsiteThemeAsync(tab), "Could not update the website color preference");
+        }
         if (!e.IsNewDocument) AddHistory(tab);
         if (keepAwakeChanged) UpdateTabHeader(tab);
         if (activeTab == tab && !addressBarEditing)
@@ -4800,7 +5093,7 @@ public sealed class MainForm : Form
                     cacheEvaluation: !isPrivateMode))
             {
                 e.Handled = true;
-                sourceTab.BlockedRequestCount++;
+                sourceTab.RecordBlockedHost(HostFromUrl(e.Uri), "Ad");
                 if (sourceTab.BlockedRequestCount == 1)
                 {
                     ShowTransientStatus("Shield blocked a cross-site popup");
@@ -4938,6 +5231,55 @@ public sealed class MainForm : Form
                 tab.StatusText = "Page not responding";
                 if (activeTab == tab) ShowTransientStatus("This page is not responding");
                 break;
+
+            case CoreWebView2ProcessFailedKind.FrameRenderProcessExited:
+                tab.StatusText = "A page frame stopped";
+                if (activeTab == tab) ShowTransientStatus("An embedded frame on this page stopped");
+                UpdateStatus();
+                break;
+
+            case CoreWebView2ProcessFailedKind.GpuProcessExited:
+                stateStore.Log(
+                    "WebView2 GPU process exited",
+                    new InvalidOperationException($"WebView2 process failed ({failedKind})"));
+                if (activeTab == tab) ShowTransientStatus("Graphics process restarted");
+                break;
+
+            case CoreWebView2ProcessFailedKind.UtilityProcessExited:
+            case CoreWebView2ProcessFailedKind.SandboxHelperProcessExited:
+            case CoreWebView2ProcessFailedKind.PpapiPluginProcessExited:
+            case CoreWebView2ProcessFailedKind.PpapiBrokerProcessExited:
+                stateStore.Log(
+                    $"WebView2 helper process exited ({failedKind})",
+                    new InvalidOperationException($"WebView2 process failed ({failedKind})"));
+                if (activeTab == tab) ShowTransientStatus("A browser helper process stopped");
+                break;
+
+            case CoreWebView2ProcessFailedKind.UnknownProcessExited:
+            default:
+                stateStore.Log(
+                    $"WebView2 process failed ({failedKind})",
+                    new InvalidOperationException($"WebView2 process failed ({failedKind})"));
+                if (tab.Core is null)
+                {
+                    ReplaceTabView(tab);
+                    tab.StatusText = "Page crashed";
+                    tab.ConnectionState = ConnectionState.Failed;
+                    ShowTabOverlay(
+                        tab,
+                        "This page stopped working",
+                        "Reload the tab to create a fresh page process.",
+                        "Reload tab",
+                        () => RecreateTabAsync(tab));
+                    UpdateTabHeader(tab);
+                }
+                else
+                {
+                    tab.StatusText = "Page process interrupted";
+                    if (activeTab == tab) ShowTransientStatus("A browser process stopped unexpectedly");
+                }
+                UpdateStatus();
+                break;
         }
     }
 
@@ -4966,6 +5308,7 @@ public sealed class MainForm : Form
         if (interruptedCount == 0) return 0;
 
         TrimDownloadRecords();
+        SyncRecentDownloadsToState();
         BeginDownloadGracePeriod();
         RefreshDownloadsUiNow();
         return interruptedCount;
@@ -5091,12 +5434,10 @@ public sealed class MainForm : Form
             var friendlyError = CreateFriendlyExtensionError(error);
             stateStore.Log("Chrome Web Store button installation failed", friendlyError);
             ShowTransientStatus("Extension installation failed");
-            MessageBox.Show(
+            NativeAlertDialog.ShowInfo(
                 this,
-                friendlyError.Message,
                 "Extension installation failed",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
+                friendlyError.Message);
         }
         finally
         {
@@ -5139,12 +5480,14 @@ public sealed class MainForm : Form
         downloads.Insert(0, entry);
         TrimDownloadRecords();
         downloadsButtonAutoVisible = true;
+        downloadsButton.GlyphState = "active";
         downloadGraceTimer.Stop();
         UpdateResponsiveToolbar();
         tab.ActiveDownloads++;
         tab.ConsecutiveSuspendFailures = 0;
         ApplyLiveTabMemoryTarget(tab, tab == activeTab && !isWindowMinimized);
         UpdateStatus();
+        ShowDownloadNotification(entry);
 
         var weakTab = new WeakReference<BrowserTab>(tab);
         EventHandler<object>? stateChanged = null;
@@ -5198,8 +5541,10 @@ public sealed class MainForm : Form
                     ShowTransientStatus($"Download interrupted: {entry.FileName}");
                 }
                 TrimDownloadRecords();
+                SyncRecentDownloadsToState();
                 if (tabs.All(item => item.ActiveDownloads == 0)) BeginDownloadGracePeriod();
                 ReleaseBrowserEnvironmentIfIdle();
+                if (ReferenceEquals(entry, notificationDownloadEntry)) UpdateDownloadNotificationIfVisible();
             }
             RefreshDownloadsUi();
         };
@@ -5257,14 +5602,13 @@ public sealed class MainForm : Form
             ?? NormalizePermissionOrigin(tab.Url)
             ?? HostFromUrl(tab.Url);
         var origin = SanitizeExtensionPromptText(originValue, 160);
-        var answer = MessageBox.Show(
+        var answer = NativeAlertDialog.Confirm(
             this,
-            $"Allow {origin} to open the '{scheme}' app?",
             "Open an external app?",
-            MessageBoxButtons.YesNo,
-            MessageBoxIcon.Question,
-            MessageBoxDefaultButton.Button2);
-        var allowed = answer == DialogResult.Yes;
+            $"Allow {origin} to open the '{scheme}' app?",
+            confirmText: "Open app",
+            cancelText: "Cancel");
+        var allowed = answer;
         if (isClosing
             || tab.IsClosed
             || tab.DocumentNavigationGeneration != documentGeneration)
@@ -5294,6 +5638,11 @@ public sealed class MainForm : Form
             return;
         }
 
+        if (!tab.IsStartPage)
+        {
+            await CaptureTabScrollOffsetAsync(tab);
+            if (isClosing || tab.IsClosed) return;
+        }
         var targetUrl = tab.Url;
         var showStartPage = tab.IsStartPage || targetUrl.Equals(StartPage.Url, StringComparison.OrdinalIgnoreCase);
         ReplaceTabView(tab);
@@ -5316,6 +5665,7 @@ public sealed class MainForm : Form
         if (tab.NavigationRequestId != navigationRequestId
             || tab.IsStartPage
             || !BrowserPolicy.UrlEquals(tab.Url, targetUrl)) return;
+        tab.PendingRestoreScrollY = tab.SavedScrollY;
         NavigateTabCore(tab, targetUrl);
     }
 
@@ -5339,21 +5689,17 @@ public sealed class MainForm : Form
                 break;
             case Program.BrowserRestartRequestResult.SessionSaveFailed:
                 ShowTransientStatus("Restart canceled because the current session could not be saved");
-                MessageBox.Show(
+                NativeAlertDialog.ShowInfo(
                     this,
-                    "MishaWeb could not safely save your open tabs, so the browser update restart was canceled and every window was left open.",
                     "Session could not be saved",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
+                    "MishaWeb could not safely save your open tabs, so the browser update restart was canceled and every window was left open.");
                 break;
             case Program.BrowserRestartRequestResult.LaunchFailed:
                 ShowTransientStatus("Could not start the updated browser process");
-                MessageBox.Show(
+                NativeAlertDialog.ShowInfo(
                     this,
-                    "MishaWeb could not start its replacement process. Your windows were left open and the update restart was canceled.",
                     "Could not restart MishaWeb",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
+                    "MishaWeb could not start its replacement process. Your windows were left open and the update restart was canceled.");
                 break;
             default:
                 ShowTransientStatus("The browser update restart is unavailable");
@@ -5546,7 +5892,8 @@ public sealed class MainForm : Form
         {
             if (tab.View is not { CoreWebView2: not null } view) return;
             tab.ZoomFactor = view.ZoomFactor;
-            tab.IsMuted = view.CoreWebView2.IsMuted;
+            tab.IsMuted = tab.TabMuteOverride ?? view.CoreWebView2.IsMuted;
+            tab.SavedScrollY = Math.Max(0, tab.SavedScrollY);
         }
         catch
         {
@@ -5572,6 +5919,9 @@ public sealed class MainForm : Form
         tab.ReaderModeActive = false;
         tab.ZoomFactor = 1.0;
         tab.IsMuted = false;
+        tab.TabMuteOverride = null;
+        tab.SavedScrollY = 0;
+        tab.PendingRestoreScrollY = 0;
 
         if (tab.View is not null) ReplaceTabView(tab);
         else
@@ -5591,7 +5941,7 @@ public sealed class MainForm : Form
         tab.Title = isPrivateMode ? "Incognito" : "New tab";
         tab.StatusText = "Ready";
         tab.ConnectionState = ConnectionState.Local;
-        tab.BlockedRequestCount = 0;
+        tab.ResetBlockedStats();
         UpdateTabHeader(tab);
         if (activeTab == tab)
         {
@@ -5722,6 +6072,9 @@ public sealed class MainForm : Form
                 break;
             case StartPageAction.ShowTabs:
                 ShowTabListMenu();
+                break;
+            case StartPageAction.ManageQuickLinks:
+                ShowManageQuickLinksDialog();
                 break;
         }
     }
@@ -5934,6 +6287,7 @@ public sealed class MainForm : Form
         {
             return;
         }
+        tab.PendingRestoreScrollY = tab.SavedScrollY;
         NavigateTabCore(tab, targetUrl);
         RefreshMemorySweepTimer();
         if (focusPage && activeTab == tab) BeginInvoke(() => tab.View?.Focus());
@@ -5982,6 +6336,9 @@ public sealed class MainForm : Form
             return;
         }
 
+        await CaptureTabScrollOffsetAsync(tab);
+        if (tab.IsClosed || !tabs.Contains(tab) || !CanUnloadTab(tab)) return;
+
         if (activeTab == tab)
         {
             var replacement = mruTabs.Order.FirstOrDefault(item =>
@@ -6023,14 +6380,12 @@ public sealed class MainForm : Form
         if (draggedTab == tab) CancelTabDrag();
         if (!isClosing && tab.ActiveDownloads > 0)
         {
-            MessageBox.Show(
+            NativeAlertDialog.ShowInfo(
                 this,
+                "Download in progress",
                 tab.ActiveDownloads == 1
                     ? "This tab has a download in progress. Keep it open until the download finishes or cancel the download first."
-                    : $"This tab has {tab.ActiveDownloads} downloads in progress. Keep it open until they finish or cancel them first.",
-                "Download in progress",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
+                    : $"This tab has {tab.ActiveDownloads} downloads in progress. Keep it open until they finish or cancel them first.");
             ShowDownloadsPopup();
             return;
         }
@@ -6531,6 +6886,31 @@ public sealed class MainForm : Form
 
         var suspendingView = tab.View;
         var core = tab.Core;
+        if (!tab.IsStartPage)
+        {
+            await CaptureTabScrollOffsetAsync(tab);
+            if (isClosing
+                || tab.IsClosed
+                || tab.IsSuspended
+                || tab.IsSuspending
+                || tab.IsDiscarded
+                || tab.IsLoading
+                || tab.IsInitializing
+                || IsBackgroundProtected(tab)
+                || (IsProtectedResidentTab(tab)
+                    && tab.ConsecutiveSuspendFailures
+                        >= TabLifecyclePolicy.SuspendFailureFallbackThreshold)
+                || tab.ActiveDownloads > 0
+                || (!includeActiveTab && tab == activeTab)
+                || !ReferenceEquals(tab.View, suspendingView)
+                || suspendingView.IsDisposed
+                || suspendingView.Disposing
+                || !ReferenceEquals(tab.Core, core)
+                || IsTabAudible(tab))
+            {
+                return false;
+            }
+        }
         // A page can leave the protected MRU set after using the Low target as
         // its failed-suspend fallback. Restore Normal before trying the separate
         // Ultra suspension strategy again.
@@ -6908,7 +7288,12 @@ public sealed class MainForm : Form
                      && !item.IsSuspended
                      && item.Core is not null).ToArray())
         {
-            ApplyWebsiteThemeLoadingBackground(tab, darkModeEnabled);
+            ApplyWebsiteThemeLoadingBackground(
+                tab,
+                WebsiteThemePolicy.ShouldApplyAutoDark(
+                    darkModeEnabled,
+                    tab.Url,
+                    state.DarkModeExcludedHosts));
             RunUiTask(
                 () => ApplyWebsiteThemeAsync(tab, themeGeneration),
                 "Could not change the website color preference");
@@ -6938,11 +7323,22 @@ public sealed class MainForm : Form
                 continue;
             }
 
-            ApplyWebsiteThemeLoadingBackground(tab, useDarkTheme);
+            var currentUrl = tab.Url;
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(core.Source)) currentUrl = core.Source;
+            }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+            var applyAutoDark = WebsiteThemePolicy.ShouldApplyAutoDark(
+                useDarkTheme,
+                currentUrl,
+                state.DarkModeExcludedHosts);
+            ApplyWebsiteThemeLoadingBackground(tab, applyAutoDark);
             try
             {
                 WebsiteThemePolicy.ApplyPreferredColorScheme(core, useDarkTheme);
-                await WebsiteThemePolicy.ApplyAutoDarkModeOverrideAsync(core, useDarkTheme);
+                await WebsiteThemePolicy.ApplyAutoDarkModeOverrideAsync(core, applyAutoDark);
             }
             catch (Exception error)
             {
@@ -6953,7 +7349,11 @@ public sealed class MainForm : Form
 
             if (ReferenceEquals(tab.Core, core)
                 && generation == Interlocked.Read(ref websiteThemeGeneration)
-                && useDarkTheme == darkModeEnabled)
+                && useDarkTheme == darkModeEnabled
+                && applyAutoDark == WebsiteThemePolicy.ShouldApplyAutoDark(
+                    darkModeEnabled,
+                    tab.Url,
+                    state.DarkModeExcludedHosts))
             {
                 return;
             }
@@ -7068,13 +7468,15 @@ public sealed class MainForm : Form
 
     private async Task ClearBrowsingDataAsync()
     {
-        var answer = MessageBox.Show(
-            "Clear cookies, cache, saved passwords, autofill data, permissions, and browsing history? Favorites are kept.",
-            "Clear browsing data",
-            MessageBoxButtons.YesNo,
-            MessageBoxIcon.Warning,
-            MessageBoxDefaultButton.Button2);
-        if (answer != DialogResult.Yes) return;
+        if (!NativeAlertDialog.Confirm(
+                this,
+                "Clear browsing data",
+                "Clear cookies, cache, saved passwords, autofill data, permissions, and browsing history? Favorites are kept.",
+                confirmText: "Clear data",
+                cancelText: "Cancel"))
+        {
+            return;
+        }
 
         ShowTransientStatus("Clearing browsing data\u2026", false);
         CancelAllPendingPermissionRequests();
@@ -7127,6 +7529,7 @@ public sealed class MainForm : Form
 
         state.History.Clear();
         downloads.RemoveAll(item => item.IsTerminal);
+        state.RecentDownloads.Clear();
         closedTabs.Clear();
         state.RecentlyClosed.Clear();
         state.DismissedSuggestionUrls.Clear();
@@ -7135,17 +7538,24 @@ public sealed class MainForm : Form
         state.MutedHosts.Clear();
         state.KeepAwakeHosts.Clear();
         state.AdBlockExceptionHosts.Clear();
+        state.DarkModeExcludedHosts.Clear();
         adBlockExceptionHosts.Clear();
+        ClearFaviconCache();
         foreach (var tab in tabs)
         {
             tab.ZoomFactor = 1.0;
             tab.IsMuted = false;
+            tab.TabMuteOverride = null;
             tab.KeepAwake = false;
             if (tab.View is not null)
             {
                 try { tab.View.ZoomFactor = 1.0; }
                 catch (ObjectDisposedException) { }
                 catch (InvalidOperationException) { }
+            }
+            if (darkModeEnabled && !tab.IsSuspended && tab.Core is not null)
+            {
+                RunUiTask(() => ApplyWebsiteThemeAsync(tab), "Could not update the website color preference");
             }
             UpdateTabHeader(tab);
         }
@@ -7184,12 +7594,10 @@ public sealed class MainForm : Form
             : profileClearError is not null
                 ? "The local MishaWeb history was cleared, but the browser profile could not be fully cleared."
                 : "The browser profile was cleared, but the local state file could not be updated.";
-        MessageBox.Show(
+        NativeAlertDialog.ShowInfo(
             this,
-            detail,
             "Browsing data partially cleared",
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Warning);
+            detail);
     }
 
     private void CancelAllPendingPermissionRequests()
@@ -7228,6 +7636,7 @@ public sealed class MainForm : Form
 
         var tab = activeTab!;
         if (tab.FindUsingNativeApi && tab.FindSession is not null
+            && tab.FindCaseSensitive == findMatchCase
             && tab.FindQuery.Equals(query, StringComparison.Ordinal))
         {
             if (backwards) tab.FindSession.FindPrevious();
@@ -7246,17 +7655,76 @@ public sealed class MainForm : Form
             ShowTransientStatus("Find is unavailable until a website is open");
             return;
         }
+        var openGeneration = ++findOpenGeneration;
+        var editGeneration = findBoxEditGeneration;
         findBar.Visible = true;
-        rootLayout.RowStyles[2].Height = ScaleChromeLogical(40);
+        rootLayout.RowStyles[2].Height = ScaleChromeLogical(44);
         UpdateFindBarLayout();
         findBox.Focus();
         findBox.SelectAll();
         findDebounceTimer.Stop();
         if (findBox.TextLength > 0) RunUiTask(StartFindSession, "Find failed");
+        RunUiTask(() => PrefillFindSelectionAsync(activeTab, openGeneration, editGeneration), "Find failed");
+    }
+
+    private async Task PrefillFindSelectionAsync(BrowserTab? tab, long openGeneration, long editGeneration)
+    {
+        if (tab?.Core is not { } core || tab.IsStartPage || tab.IsClosed) return;
+        var documentGeneration = tab.DocumentNavigationGeneration;
+        string? rawSelection;
+        try
+        {
+            rawSelection = await core.ExecuteScriptAsync(
+                "(() => { try { const text = window.getSelection ? String(window.getSelection() || '') : ''; return text.length > 0 && text.length <= 200 ? text : ''; } catch (_) { return ''; } })()");
+        }
+        catch
+        {
+            return;
+        }
+
+        if (isClosing
+            || !findBar.Visible
+            || openGeneration != findOpenGeneration
+            || editGeneration != findBoxEditGeneration
+            || activeTab != tab
+            || tab.IsClosed
+            || !ReferenceEquals(tab.Core, core)
+            || tab.DocumentNavigationGeneration != documentGeneration)
+        {
+            return;
+        }
+
+        string? selected = null;
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(rawSelection) && !rawSelection.Equals("null", StringComparison.Ordinal))
+            {
+                selected = JsonSerializer.Deserialize<string>(rawSelection);
+            }
+        }
+        catch { }
+
+        if (string.IsNullOrWhiteSpace(selected)) return;
+        var normalized = selected.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        if (normalized.Length == 0 || normalized.Length > 200) return;
+
+        suppressFindEditTracking = true;
+        try
+        {
+            findBox.Text = normalized;
+            findBox.SelectAll();
+        }
+        finally
+        {
+            suppressFindEditTracking = false;
+        }
+        findDebounceTimer.Stop();
+        await StartFindSession();
     }
 
     private void HideFindBar()
     {
+        findOpenGeneration++;
         findDebounceTimer.Stop();
         StopFindSession(activeTab);
         findBar.Visible = false;
@@ -7279,6 +7747,7 @@ public sealed class MainForm : Form
             return;
         }
 
+        var caseSensitive = findMatchCase;
         var documentGeneration = tab.DocumentNavigationGeneration;
         StopFindSession(tab);
         var requestGeneration = tab.FindRequestGeneration;
@@ -7320,6 +7789,7 @@ public sealed class MainForm : Form
             };
             tab.FindSession = find;
             tab.FindQuery = query;
+            tab.FindCaseSensitive = caseSensitive;
             tab.FindUsingNativeApi = true;
             tab.FindMatchCountChangedHandler = matchCountChanged;
             tab.FindActiveMatchIndexChangedHandler = activeMatchChanged;
@@ -7328,6 +7798,7 @@ public sealed class MainForm : Form
             var options = (environment ?? throw new InvalidOperationException("Browser environment is not ready"))
                 .CreateFindOptions();
             options.FindTerm = query;
+            options.IsCaseSensitive = caseSensitive;
             options.ShouldHighlightAllMatches = true;
             options.SuppressDefaultFindDialog = true;
             await find.StartAsync(options);
@@ -7377,6 +7848,7 @@ public sealed class MainForm : Form
                 documentGeneration,
                 requestGeneration,
                 query,
+                caseSensitive,
                 backwards);
         }
         catch
@@ -7395,6 +7867,7 @@ public sealed class MainForm : Form
         long documentGeneration,
         long requestGeneration,
         string query,
+        bool caseSensitive,
         bool backwards)
     {
         if (!IsLegacyFindContinuationCurrent(
@@ -7404,7 +7877,7 @@ public sealed class MainForm : Form
                 requestGeneration,
                 query)) return;
         var encoded = JsonSerializer.Serialize(query);
-        var script = $"window.find({encoded}, false, {(backwards ? "true" : "false")}, true, false, true, false)";
+        var script = $"window.find({encoded}, {(caseSensitive ? "true" : "false")}, {(backwards ? "true" : "false")}, true, false, true, false)";
         var result = await core.ExecuteScriptAsync(script);
         if (!IsLegacyFindContinuationCurrent(
                 tab,
@@ -7602,9 +8075,10 @@ public sealed class MainForm : Form
             tab.ZoomFactor = isPrivateMode
                 ? tab.ZoomFactor
                 : SitePreferencePolicy.GetZoom(state.SiteZoom, tab.Url);
-            tab.IsMuted = isPrivateMode
+            var siteMuted = isPrivateMode
                 ? tab.IsMuted
                 : SitePreferencePolicy.ShouldMuteAudio(state.AudioOutputPolicy, state.AllowedAudioHosts, state.MutedHosts, tab.Url);
+            tab.IsMuted = tab.TabMuteOverride ?? siteMuted;
         }
 
         if (tab.View is { CoreWebView2: not null } view)
@@ -7677,6 +8151,33 @@ public sealed class MainForm : Form
         ScheduleStateSave();
     }
 
+    private void ToggleActiveTabAudioMute()
+    {
+        var tab = activeTab;
+        if (tab is null || tab.IsClosed)
+        {
+            ShowTransientStatus("No active tab to mute");
+            return;
+        }
+        ToggleTabAudioMute(tab);
+    }
+
+    private void ToggleTabAudioMute(BrowserTab tab)
+    {
+        if (tab.IsClosed) return;
+        var nextMuted = !IsTabMuted(tab);
+        tab.TabMuteOverride = nextMuted;
+        tab.IsMuted = nextMuted;
+        if (tab.Core is not null)
+        {
+            try { tab.Core.IsMuted = nextMuted; }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+        }
+        UpdateTabHeader(tab);
+        ShowTransientStatus(nextMuted ? "Muted tab audio" : "Unmuted tab audio");
+    }
+
     private void ToggleActiveSiteMute()
     {
         var tab = activeTab;
@@ -7692,8 +8193,15 @@ public sealed class MainForm : Form
     {
         if (isPrivateMode)
         {
-            tab.IsMuted = !tab.IsMuted;
-            if (tab.Core is not null) tab.Core.IsMuted = tab.IsMuted;
+            var nextMuted = !IsTabMuted(tab);
+            tab.TabMuteOverride = nextMuted;
+            tab.IsMuted = nextMuted;
+            if (tab.Core is not null)
+            {
+                try { tab.Core.IsMuted = nextMuted; }
+                catch (ObjectDisposedException) { }
+                catch (InvalidOperationException) { }
+            }
             UpdateTabHeader(tab);
             return;
         }
@@ -7744,8 +8252,14 @@ public sealed class MainForm : Form
                      !item.IsClosed
                      && SitePreferencePolicy.GetHost(item.Url)?.Equals(host, StringComparison.OrdinalIgnoreCase) == true))
         {
+            liveTab.TabMuteOverride = null;
             liveTab.IsMuted = muted;
-            if (liveTab.Core is not null) liveTab.Core.IsMuted = muted;
+            if (liveTab.Core is not null)
+            {
+                try { liveTab.Core.IsMuted = muted; }
+                catch (ObjectDisposedException) { }
+                catch (InvalidOperationException) { }
+            }
             UpdateTabHeader(liveTab);
         }
         ScheduleStateSave();
@@ -7920,7 +8434,36 @@ public sealed class MainForm : Form
                 : uri.IdnHost;
         siteInfoMenu.Items.Add(new ToolStripMenuItem(locationLabel) { Enabled = false });
         siteInfoMenu.Items.Add(new ToolStripMenuItem($"Connection: {connection}") { Enabled = false });
-        siteInfoMenu.Items.Add(new ToolStripMenuItem($"Blocked requests: {tab.BlockedRequestCount}") { Enabled = false });
+        var blockedLabel = tab.BlockedRequestCount > 0
+            ? $"Shield blocked {tab.BlockedRequestCount} (Ads {tab.BlockedAdCount} \u00B7 Trackers {tab.BlockedTrackerCount} \u00B7 Scripts {tab.BlockedScriptCount})"
+            : "Blocked requests: 0";
+        if (tab.BlockedRequestCount > 0 || tab.RecentBlockedHosts.Count > 0)
+        {
+            var blockedMenu = new ToolStripMenuItem(blockedLabel);
+            blockedMenu.DropDown.Renderer = menuRenderer;
+            NativeUiTheme.ApplyMenuWindowFrame(blockedMenu.DropDown);
+            blockedMenu.DropDownItems.Add(new ToolStripMenuItem($"Ads: {tab.BlockedAdCount}") { Enabled = false });
+            blockedMenu.DropDownItems.Add(new ToolStripMenuItem($"Trackers: {tab.BlockedTrackerCount}") { Enabled = false });
+            blockedMenu.DropDownItems.Add(new ToolStripMenuItem($"Scripts: {tab.BlockedScriptCount}") { Enabled = false });
+            if (tab.BlockedOtherCount > 0)
+            {
+                blockedMenu.DropDownItems.Add(new ToolStripMenuItem($"Other: {tab.BlockedOtherCount}") { Enabled = false });
+            }
+            if (tab.RecentBlockedHosts.Count > 0)
+            {
+                blockedMenu.DropDownItems.Add(new ToolStripSeparator());
+                blockedMenu.DropDownItems.Add(new ToolStripMenuItem("Recent blocked hosts") { Enabled = false });
+                foreach (var blockedHost in tab.RecentBlockedHosts)
+                {
+                    blockedMenu.DropDownItems.Add(new ToolStripMenuItem(blockedHost) { Enabled = false });
+                }
+            }
+            siteInfoMenu.Items.Add(blockedMenu);
+        }
+        else
+        {
+            siteInfoMenu.Items.Add(new ToolStripMenuItem(blockedLabel) { Enabled = false });
+        }
         siteInfoMenu.Items.Add(new ToolStripSeparator());
 
         var currentZoom = Math.Round(tab.ZoomFactor * 100);
@@ -7957,6 +8500,19 @@ public sealed class MainForm : Form
         var muteItem = new ToolStripMenuItem(IsTabMuted(tab) ? "Unmute site" : "Mute site");
         muteItem.Click += (_, _) => ToggleSiteMute(tab);
         siteInfoMenu.Items.Add(muteItem);
+        var keepAwakeItem = new ToolStripMenuItem("Keep active in background")
+        {
+            Checked = tab.KeepAwake
+        };
+        keepAwakeItem.Click += (_, _) => ToggleTabKeepAwake(tab);
+        siteInfoMenu.Items.Add(keepAwakeItem);
+        var darkExcluded = WebsiteThemePolicy.IsHostExcluded(tab.Url, state.DarkModeExcludedHosts);
+        var darkExcludeItem = new ToolStripMenuItem("Exclude site from dark mode")
+        {
+            Checked = darkExcluded
+        };
+        darkExcludeItem.Click += (_, _) => ToggleSiteDarkModeExclusion(uri.Host);
+        siteInfoMenu.Items.Add(darkExcludeItem);
         var cleanLink = new ToolStripMenuItem("Copy clean page link");
         cleanLink.Click += (_, _) => CopyCleanPageLink();
         siteInfoMenu.Items.Add(cleanLink);
@@ -7965,8 +8521,8 @@ public sealed class MainForm : Form
         readerItem.Click += (_, _) => RunUiTask(ToggleReaderModeAsync, "Reader mode unavailable");
         siteInfoMenu.Items.Add(readerItem);
         siteInfoMenu.Items.Add(new ToolStripSeparator());
-        var microphonePermission = new ToolStripMenuItem("Microphone: checking…") { Enabled = false };
-        var cameraPermission = new ToolStripMenuItem("Camera: checking…") { Enabled = false };
+        var microphonePermission = new ToolStripMenuItem("Microphone: checking\u2026") { Enabled = false };
+        var cameraPermission = new ToolStripMenuItem("Camera: checking\u2026") { Enabled = false };
         siteInfoMenu.Items.Add(microphonePermission);
         siteInfoMenu.Items.Add(cameraPermission);
         if (tab.Core is not null)
@@ -7980,6 +8536,8 @@ public sealed class MainForm : Form
                 "Could not read camera and microphone permissions");
         }
         var windowsPrivacy = new ToolStripMenuItem("Windows camera and microphone settings");
+        windowsPrivacy.DropDown.Renderer = menuRenderer;
+        NativeUiTheme.ApplyMenuWindowFrame(windowsPrivacy.DropDown);
         var microphoneSettings = new ToolStripMenuItem("Microphone privacy settings");
         microphoneSettings.Click += (_, _) => OpenWindowsPrivacySettings("microphone");
         var cameraSettings = new ToolStripMenuItem("Camera privacy settings");
@@ -8002,7 +8560,7 @@ public sealed class MainForm : Form
         var shieldItem = new ToolStripMenuItem(
             shieldDisabled ? "Enable shield for this site" : "Disable shield for this site")
         {
-            ToolTipText = "Uses this exact host only; a reload is required"
+            ToolTipText = "Uses this exact host only and reloads matching tabs"
         };
         shieldItem.Click += (_, _) => ToggleSiteShield(uri.Host);
         siteInfoMenu.Items.Add(shieldItem);
@@ -8029,18 +8587,20 @@ public sealed class MainForm : Form
     {
         var normalized = BrowserPolicy.NormalizeExactHost(host);
         if (normalized is null) return;
+        bool shieldEnabled;
         if (adBlockExceptionHosts.Remove(normalized))
         {
             var existing = state.AdBlockExceptionHosts.FindIndex(item =>
                 item.Equals(normalized, StringComparison.OrdinalIgnoreCase));
             if (existing >= 0) state.AdBlockExceptionHosts.RemoveAt(existing);
+            shieldEnabled = true;
             // The control channel is deliberately left alone. It is baked into the
             // already-loaded document at injection time, so minting a new name
             // here would leave that document listening on a name nothing
             // dispatches, and a later "disable on this page" would silently do
             // nothing. InstallAdBlockPageScriptsAsync reuses the existing name
             // for future navigations, which is what the listener needs.
-            ShowTransientStatus($"Shield restored for {normalized}; reload required");
+            ShowTransientStatus($"Shield restored for {normalized}");
         }
         else
         {
@@ -8051,17 +8611,37 @@ public sealed class MainForm : Form
             }
             state.AdBlockExceptionHosts.Add(normalized);
             adBlockExceptionHosts.Add(normalized);
-            foreach (var tab in tabs.Where(item =>
-                item.Core is not null
-                && BrowserPolicy.IsExactHost(HostFromUrl(item.Core.Source), normalized)))
-            {
-                RunUiTask(
-                    () => DisableAdBlockForCurrentDocumentAsync(tab),
-                    "Could not disable the current page shield");
-            }
+            shieldEnabled = false;
             ShowTransientStatus($"Shield disabled for {normalized}");
         }
+
         RefreshAdBlockPagePolicies();
+        foreach (var matchingTab in tabs.Where(item =>
+                     !item.IsClosed
+                     && !item.IsStartPage
+                     && item.Core is not null
+                     && BrowserPolicy.IsExactHost(HostFromUrl(item.Core.Source ?? item.Url), normalized)).ToArray())
+        {
+            matchingTab.ResetBlockedStats();
+            RunUiTask(
+                async () =>
+                {
+                    if (matchingTab.Core is null) return;
+                    if (shieldEnabled && adBlockEnabled)
+                    {
+                        await InstallAdBlockPageScriptsAsync(matchingTab);
+                    }
+                    else if (!shieldEnabled)
+                    {
+                        await DisableAdBlockForCurrentDocumentAsync(matchingTab);
+                    }
+                    if (!isClosing && !matchingTab.IsClosed && matchingTab.Core is not null)
+                    {
+                        matchingTab.Core.Reload();
+                    }
+                },
+                "Could not reload after changing the site shield");
+        }
         if (!isPrivateMode) ScheduleStateSave();
     }
 
@@ -8080,6 +8660,16 @@ public sealed class MainForm : Form
     {
         var tab = activeTab;
         if (tab is null || tab.IsStartPage)
+        {
+            ShowTransientStatus("Open a website before protecting it");
+            return;
+        }
+        ToggleTabKeepAwake(tab);
+    }
+
+    private void ToggleTabKeepAwake(BrowserTab tab)
+    {
+        if (tab.IsClosed || tab.IsStartPage)
         {
             ShowTransientStatus("Open a website before protecting it");
             return;
@@ -8106,17 +8696,54 @@ public sealed class MainForm : Form
         ShowTransientStatus(tab.KeepAwake ? "Tab kept active" : "Tab can sleep again");
     }
 
+    private void ToggleSiteDarkModeExclusion(string host)
+    {
+        var normalized = BrowserPolicy.NormalizeExactHost(host);
+        if (normalized is null) return;
+
+        var removed = state.DarkModeExcludedHosts.RemoveAll(item =>
+            item.Equals(normalized, StringComparison.OrdinalIgnoreCase)) > 0;
+        if (!removed)
+        {
+            if (state.DarkModeExcludedHosts.Count >= BrowserStateStore.MaximumDarkModeExcludedHosts)
+            {
+                ShowTransientStatus("You can exclude up to 200 sites from dark mode");
+                return;
+            }
+            state.DarkModeExcludedHosts.Insert(0, normalized);
+        }
+
+        foreach (var matchingTab in tabs.Where(item =>
+                     !item.IsClosed
+                     && !item.IsSuspended
+                     && !item.IsStartPage
+                     && item.Core is not null
+                     && BrowserPolicy.IsExactHost(HostFromUrl(item.Core.Source ?? item.Url), normalized)).ToArray())
+        {
+            RunUiTask(
+                () => ApplyWebsiteThemeAsync(matchingTab),
+                "Could not update the website color preference");
+        }
+
+        if (!isPrivateMode) ScheduleStateSave();
+        ShowTransientStatus(removed
+            ? $"Dark mode enabled for {normalized}"
+            : $"Excluded {normalized} from dark mode");
+    }
+
     private void ResetSitePreferences(Uri uri)
     {
         var host = SitePreferencePolicy.GetHost(uri.Host);
         if (host is null) return;
         state.SiteZoom.RemoveAll(item => BrowserPolicy.IsExactHost(item.Host, host));
         state.MutedHosts.RemoveAll(item => BrowserPolicy.IsExactHost(item, host));
+        state.DarkModeExcludedHosts.RemoveAll(item => BrowserPolicy.IsExactHost(item, host));
         foreach (var tab in tabs.Where(item =>
                      !item.IsClosed
                      && SitePreferencePolicy.GetHost(item.Url)?.Equals(host, StringComparison.OrdinalIgnoreCase) == true))
         {
             tab.ZoomFactor = 1.0;
+            tab.TabMuteOverride = null;
             tab.IsMuted = false;
             if (tab.View is { CoreWebView2: not null } view)
             {
@@ -8134,6 +8761,10 @@ public sealed class MainForm : Form
                 {
                     applyingZoomPreference = false;
                 }
+            }
+            if (darkModeEnabled && !tab.IsSuspended && tab.Core is not null)
+            {
+                RunUiTask(() => ApplyWebsiteThemeAsync(tab), "Could not update the website color preference");
             }
             UpdateTabHeader(tab);
         }
@@ -8964,13 +9595,15 @@ public sealed class MainForm : Form
         if (core is null) return;
         if (action == PermissionManagerAction.ResetAll)
         {
-            var answer = MessageBox.Show(
-                "Reset every saved website permission?",
-                "Reset all permissions?",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Warning,
-                MessageBoxDefaultButton.Button2);
-            if (answer != DialogResult.Yes) return;
+            if (!NativeAlertDialog.Confirm(
+                    this,
+                    "Reset all permissions?",
+                    "Reset every saved website permission?",
+                    confirmText: "Reset all",
+                    cancelText: "Cancel"))
+            {
+                return;
+            }
             var settings = await core.Profile.GetNonDefaultPermissionSettingsAsync();
             for (var index = 0; index < settings.Count; index++)
             {
@@ -9034,11 +9667,10 @@ public sealed class MainForm : Form
     {
         var runtimeVersion = environment?.BrowserVersionString ?? "not running";
         var resourceMode = ultraLightEnabled ? "Ultra-light" : memorySaverEnabled ? "Memory saver" : "Off";
-        MessageBox.Show(
-            $"MishaWeb {Application.ProductVersion}\n\nA resource-light native Windows browser powered by WebView2.\n\nWebView2 Runtime: {runtimeVersion}\nTabs: {tabs.Count}\nResource mode: {resourceMode}\n\nKeyboard help: Ctrl+L, Ctrl+T, Ctrl+W, Ctrl+Shift+T, Ctrl+Tab, Ctrl+F, Ctrl+D, Ctrl+P, Ctrl+Shift+S, F11.",
+        NativeAlertDialog.ShowInfo(
+            this,
             "About MishaWeb",
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Information);
+            $"MishaWeb {Application.ProductVersion}\n\nA resource-light native Windows browser powered by WebView2.\n\nWebView2 Runtime: {runtimeVersion}\nTabs: {tabs.Count}\nResource mode: {resourceMode}\n\nKeyboard help: Ctrl+L, Ctrl+T, Ctrl+W, Ctrl+Shift+T, Ctrl+Tab, Ctrl+F, Ctrl+D, Ctrl+M, Ctrl+H, Ctrl+Shift+O, Ctrl+P, Ctrl+Shift+S, F11.");
     }
 
     private void ShowTabContextMenu(BrowserTab tab, Point screenLocation)
@@ -9068,6 +9700,12 @@ public sealed class MainForm : Form
         AddMenuItem(tabMenu, "Reopen closed tab", "Ctrl+Shift+T", () =>
             RunUiTask(RestoreClosedTabAsync, "Could not restore the tab"));
         tabMenu.Items.Add(new ToolStripSeparator());
+        var muteTabItem = AddMenuItem(
+            tabMenu,
+            IsTabMuted(tab) ? "Unmute tab" : "Mute tab",
+            tab == activeTab ? "Ctrl+M" : string.Empty,
+            () => ToggleTabAudioMute(tab));
+        muteTabItem.Enabled = !tab.IsStartPage || IsTabMuted(tab) || tab.IsAudible;
         var muteItem = AddMenuItem(tabMenu, IsTabMuted(tab) ? "Unmute site" : "Mute site", string.Empty, () =>
         {
             ToggleSiteMute(tab);
@@ -9077,35 +9715,15 @@ public sealed class MainForm : Form
             tabMenu,
             "Keep active in background",
             string.Empty,
-            () =>
-            {
-                var newKeepAwake = !tab.KeepAwake;
-                tab.KeepAwake = newKeepAwake;
-                SyncKeepAwakeHostState(tab);
-                if (newKeepAwake)
-                {
-                    tab.ConsecutiveSuspendFailures = 0;
-                    ResumeTab(tab);
-                    if (tab.IsDiscarded)
-                    {
-                        RunUiTask(
-                            () => RestoreDiscardedTabAsync(tab, focusPage: false),
-                            "Could not reload the protected tab");
-                    }
-                }
-                else if (tab != activeTab || isWindowMinimized)
-                {
-                    QueueBackgroundTabReduction(tab);
-                }
-                ApplyLiveTabMemoryTarget(tab, tab == activeTab && !isWindowMinimized);
-                RefreshMemorySweepTimer();
-                UpdateTabHeader(tab);
-                ShowTransientStatus(tab.KeepAwake
-                    ? "This tab will stay active in the background"
-                    : "This tab can sleep again");
-            });
+            () => ToggleTabKeepAwake(tab));
         keepAwakeItem.Checked = tab.KeepAwake;
         keepAwakeItem.Enabled = GetKeepAwakeHost(tab.Url) is not null;
+        var pipItem = AddMenuItem(
+            tabMenu,
+            "Picture-in-Picture",
+            string.Empty,
+            () => RunUiTask(() => TogglePictureInPictureAsync(tab), "Picture-in-Picture is unavailable"));
+        pipItem.Enabled = !tab.IsStartPage && tab.Core is not null;
         var unloadItem = AddMenuItem(
             tabMenu,
             "Unload tab",
@@ -9182,6 +9800,7 @@ public sealed class MainForm : Form
                 ? "Private quick links are not saved"
                 : "Pins appear before favorites and recent history") { Enabled = false });
         menu.Closed += (_, _) => menu.Dispose();
+        NativeUiTheme.ApplyMenuWindowFrame(menu);
         menu.Show(screenLocation);
     }
 
@@ -9196,7 +9815,11 @@ public sealed class MainForm : Form
     private CommandPaletteForm CreateCommandPalette()
     {
         var palette = new CommandPaletteForm(
-            query => CommandRankingEngine.Rank(BuildCommandCandidates(query), query),
+            query =>
+            {
+                var (_, effectiveQuery) = ParseScopedCommandQuery(query);
+                return CommandRankingEngine.Rank(BuildCommandCandidates(query), effectiveQuery);
+            },
             ExecutePaletteCommand);
         palette.Cancelled += (_, _) => RestoreFocusAfterCommandPalette();
         palette.CommandActivated += (_, candidate) =>
@@ -9206,6 +9829,20 @@ public sealed class MainForm : Form
             else focusBeforeCommandPalette = null;
         };
         return palette;
+    }
+
+    private static (CommandSource? Scope, string Query) ParseScopedCommandQuery(string? rawQuery)
+    {
+        if (string.IsNullOrEmpty(rawQuery)) return (null, string.Empty);
+        var trimmed = rawQuery.TrimStart();
+        if (trimmed.Length == 0) return (null, string.Empty);
+        return trimmed[0] switch
+        {
+            '>' => (CommandSource.BrowserCommand, trimmed[1..].TrimStart()),
+            '@' => (CommandSource.OpenTab, trimmed[1..].TrimStart()),
+            '#' => (CommandSource.Favorite, trimmed[1..].TrimStart()),
+            _ => (null, rawQuery)
+        };
     }
 
     private static bool ShouldRestoreFocusAfterPalette(CommandCandidate candidate)
@@ -9221,6 +9858,9 @@ public sealed class MainForm : Form
             or "downloads"
             or "permissions"
             or "voice-audio-settings"
+            or "saved-items"
+            or "history"
+            or "manage-quick-links"
             or "find");
     }
 
@@ -9233,68 +9873,88 @@ public sealed class MainForm : Form
             string shortcut = "") =>
             new(title, detail, CommandSource.BrowserCommand, Shortcut: shortcut, Target: id);
 
-        var showAllActions = !string.IsNullOrWhiteSpace(query);
-        yield return Action("New tab", "Open a blank start page", "new-tab", "Ctrl+T");
-        yield return Action("New incognito window", "Open a temporary incognito window", "private-window", "Ctrl+Shift+N");
-        yield return Action("Close tab", "Close the active tab", "close-tab", "Ctrl+W");
-        yield return Action("Reopen tab", "Restore the newest recently closed tab", "reopen-tab", "Ctrl+Shift+T");
-        yield return Action("Find on page", "Search text in the current page", "find", "Ctrl+F");
-        yield return Action("Open downloads", "Review downloads from this runtime session", "downloads", "Ctrl+J");
-        if (showAllActions)
+        var (scope, effectiveQuery) = ParseScopedCommandQuery(query);
+        if (scope is null or CommandSource.BrowserCommand)
         {
-            yield return Action("Duplicate tab", "Open another tab at the current address", "duplicate-tab");
-            yield return Action(
-                activeTab?.IsPinned == true ? "Unpin tab" : "Pin tab",
-                "Move the active tab in or out of the pinned section",
-                "toggle-pin-tab");
-            yield return Action("Unload tab", "Sleep tab; release its WebView while keeping the tab", "unload-tab");
-            if (!isPrivateMode)
+            var showAllActions = scope == CommandSource.BrowserCommand || !string.IsNullOrWhiteSpace(effectiveQuery);
+            yield return Action("New tab", "Open a blank start page", "new-tab", "Ctrl+T");
+            yield return Action("New incognito window", "Open a temporary incognito window", "private-window", "Ctrl+Shift+N");
+            yield return Action("Close tab", "Close the active tab", "close-tab", "Ctrl+W");
+            yield return Action("Reopen tab", "Restore the newest recently closed tab", "reopen-tab", "Ctrl+Shift+T");
+            yield return Action("Find on page", "Search text in the current page", "find", "Ctrl+F");
+            yield return Action("Open downloads", "Review downloads from this runtime session", "downloads", "Ctrl+J");
+            if (showAllActions)
             {
-                yield return Action("Save current window as a session", "Capture the current tabs as a named session", "save-session");
-                yield return Action("Open session manager", "Open and manage saved sessions", "session-manager");
+                yield return Action("Duplicate tab", "Open another tab at the current address", "duplicate-tab");
+                yield return Action(
+                    activeTab?.IsPinned == true ? "Unpin tab" : "Pin tab",
+                    "Move the active tab in or out of the pinned section",
+                    "toggle-pin-tab");
+                yield return Action("Unload tab", "Sleep tab; release its WebView while keeping the tab", "unload-tab");
+                if (!isPrivateMode)
+                {
+                    yield return Action("Save current window as a session", "Capture the current tabs as a named session", "save-session");
+                    yield return Action("Open session manager", "Open and manage saved sessions", "session-manager");
+                    yield return Action("Saved items", "Browse favorites, history, quick links, and closed tabs", "saved-items", "Ctrl+Shift+O");
+                    yield return Action("History", "Open browsing history", "history", "Ctrl+H");
+                    yield return Action("Manage quick links", "Edit or reorder pinned start page shortcuts", "manage-quick-links");
+                }
+                yield return Action("Toggle reader mode", "Show a clean reading view for the current page", "reader-mode", "F9");
+                yield return Action("Picture-in-Picture", "Pop out the current page's video player", "pip");
+                yield return Action("Copy clean page link", "Copy the current page URL without tracking parameters", "copy-clean-link");
+                yield return Action("Open permission manager", "Review saved website permissions", "permissions");
+                yield return Action("Toggle resource mode", "Cycle memory saver and ultra-light modes", "resource-mode");
+                yield return Action("Toggle shield", "Enable or disable the exact-host page shield", "shield");
+                yield return Action("Keep active in background", "Protect the current site from lifecycle release", "keep-awake");
+                yield return Action(
+                    activeTab is not null && IsTabMuted(activeTab) ? "Unmute tab" : "Mute tab",
+                    "Mute or unmute audio for the active tab only",
+                    "mute-tab",
+                    "Ctrl+M");
+                yield return Action("Mute site", "Remember mute for the current exact host", "mute-site");
+                yield return Action("Voice and audio settings", "Configure sound output and microphone input policies", "voice-audio-settings");
+                yield return Action("Fullscreen", "Toggle browser fullscreen", "fullscreen", "F11");
+                yield return Action("Toggle website theme", "Change the global website color mode", "theme");
+                yield return Action("Clear browsing data", "Clear history, cookies, cache, and saved permissions", "clear-browsing-data", "Ctrl+Shift+Del");
             }
-            yield return Action("Toggle reader mode", "Show a clean reading view for the current page", "reader-mode", "F9");
-            yield return Action("Copy clean page link", "Copy the current page URL without tracking parameters", "copy-clean-link");
-            yield return Action("Open permission manager", "Review saved website permissions", "permissions");
-            yield return Action("Toggle resource mode", "Cycle memory saver and ultra-light modes", "resource-mode");
-            yield return Action("Toggle shield", "Enable or disable the exact-host page shield", "shield");
-            yield return Action("Keep active in background", "Protect the current site from lifecycle release", "keep-awake");
-            yield return Action("Mute site", "Remember mute for the current exact host", "mute-site");
-            yield return Action("Voice and audio settings", "Configure sound output and microphone input policies", "voice-audio-settings");
-            yield return Action("Fullscreen", "Toggle browser fullscreen", "fullscreen", "F11");
-            yield return Action("Toggle website theme", "Change the global website color mode", "theme");
         }
 
-        var mruRanks = mruTabs.Order
-            .Select((tab, index) => (tab, index))
-            .ToDictionary(item => item.tab, item => item.index);
-        for (var index = 0; index < tabs.Count; index++)
+        if (scope is null or CommandSource.OpenTab)
         {
-            var tab = tabs[index];
-            if (tab.IsClosed) continue;
-            yield return new CommandCandidate(
-                tab.Title,
-                BuildTabDetail(tab),
-                CommandSource.OpenTab,
-                tab.IsStartPage ? null : tab.Url,
-                MruRank: mruRanks.TryGetValue(tab, out var rank) ? rank : int.MaxValue,
-                SourceIndex: index,
-                Target: tab);
+            var mruRanks = mruTabs.Order
+                .Select((tab, index) => (tab, index))
+                .ToDictionary(item => item.tab, item => item.index);
+            for (var index = 0; index < tabs.Count; index++)
+            {
+                var tab = tabs[index];
+                if (tab.IsClosed) continue;
+                yield return new CommandCandidate(
+                    tab.Title,
+                    BuildTabDetail(tab),
+                    CommandSource.OpenTab,
+                    tab.IsStartPage ? null : tab.Url,
+                    MruRank: mruRanks.TryGetValue(tab, out var rank) ? rank : int.MaxValue,
+                    SourceIndex: index,
+                    Target: tab);
+            }
         }
 
-        for (var index = 0; index < state.Bookmarks.Count; index++)
+        if (scope is null or CommandSource.Favorite)
         {
-            var bookmark = state.Bookmarks[index];
-            yield return new CommandCandidate(
-                bookmark.Title,
-                FormatBrowserChromeUrlForDisplay(bookmark.Url),
-                CommandSource.Favorite,
-                bookmark.Url,
-                SourceIndex: index,
-                Target: bookmark.Url);
+            for (var index = 0; index < state.Bookmarks.Count; index++)
+            {
+                var bookmark = state.Bookmarks[index];
+                yield return new CommandCandidate(
+                    bookmark.Title,
+                    FormatBrowserChromeUrlForDisplay(bookmark.Url),
+                    CommandSource.Favorite,
+                    bookmark.Url,
+                    SourceIndex: index,
+                    Target: bookmark.Url);
+            }
         }
 
-        if (!isPrivateMode)
+        if (!isPrivateMode && scope is null)
         {
             for (var index = 0; index < state.NamedSessions.Count; index++)
             {
@@ -9413,8 +10073,20 @@ public sealed class MainForm : Form
             case "session-manager":
                 ShowSessionManager();
                 break;
+            case "saved-items":
+                ShowSavedItemsDialog();
+                break;
+            case "history":
+                ShowSavedItemsDialog(SavedItemsView.History);
+                break;
+            case "manage-quick-links":
+                ShowManageQuickLinksDialog();
+                break;
             case "reader-mode":
                 RunUiTask(ToggleReaderModeAsync, "Reader mode unavailable");
+                break;
+            case "pip":
+                RunUiTask(() => TogglePictureInPictureAsync(), "Picture-in-Picture is unavailable");
                 break;
             case "copy-clean-link":
                 CopyCleanPageLink();
@@ -9437,6 +10109,9 @@ public sealed class MainForm : Form
             case "keep-awake":
                 ToggleActiveKeepAwake();
                 break;
+            case "mute-tab":
+                ToggleActiveTabAudioMute();
+                break;
             case "mute-site":
                 ToggleActiveSiteMute();
                 break;
@@ -9448,6 +10123,9 @@ public sealed class MainForm : Form
                 break;
             case "theme":
                 ToggleDarkMode();
+                break;
+            case "clear-browsing-data":
+                RunUiTask(ClearBrowsingDataAsync, "Could not clear browsing data");
                 break;
         }
     }
@@ -9611,13 +10289,15 @@ public sealed class MainForm : Form
             item.Name.Equals(normalizedName, StringComparison.OrdinalIgnoreCase));
         if (existingIndex >= 0 && !allowOverwrite)
         {
-            var answer = MessageBox.Show(
-                $"Replace the existing '{state.NamedSessions[existingIndex].Name}' session?",
-                "Replace saved session?",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Question,
-                MessageBoxDefaultButton.Button2);
-            if (answer != DialogResult.Yes) return;
+            if (!NativeAlertDialog.Confirm(
+                    this,
+                    "Replace saved session?",
+                    $"Replace the existing '{state.NamedSessions[existingIndex].Name}' session?",
+                    confirmText: "Replace",
+                    cancelText: "Cancel"))
+            {
+                return;
+            }
         }
 
         if (existingIndex >= 0) state.NamedSessions.RemoveAt(existingIndex);
@@ -9679,13 +10359,15 @@ public sealed class MainForm : Form
                 ShowDownloadsPopup();
                 return;
             }
-            var answer = MessageBox.Show(
-                $"Replace the current {tabs.Count} tabs with '{normalized.Name}'? Current tabs will not be added to Recently closed.",
-                "Replace current window?",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Warning,
-                MessageBoxDefaultButton.Button2);
-            if (answer != DialogResult.Yes) return;
+            if (!NativeAlertDialog.Confirm(
+                    this,
+                    "Replace current window?",
+                    $"Replace the current {tabs.Count} tabs with '{normalized.Name}'? Current tabs will not be added to Recently closed.",
+                    confirmText: "Replace",
+                    cancelText: "Cancel"))
+            {
+                return;
+            }
             replacingWindow = true;
             try
             {
@@ -9774,13 +10456,15 @@ public sealed class MainForm : Form
             && !item.Name.Equals(session.Name, StringComparison.OrdinalIgnoreCase));
         if (existingIndex >= 0)
         {
-            var answer = MessageBox.Show(
-                $"Replace the existing '{state.NamedSessions[existingIndex].Name}' session?",
-                "Replace saved session?",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Question,
-                MessageBoxDefaultButton.Button2);
-            if (answer != DialogResult.Yes) return;
+            if (!NativeAlertDialog.Confirm(
+                    this,
+                    "Replace saved session?",
+                    $"Replace the existing '{state.NamedSessions[existingIndex].Name}' session?",
+                    confirmText: "Replace",
+                    cancelText: "Cancel"))
+            {
+                return;
+            }
             state.NamedSessions.RemoveAt(existingIndex);
             if (existingIndex < sourceIndex) sourceIndex--;
         }
@@ -9797,13 +10481,15 @@ public sealed class MainForm : Form
 
     private void DeleteSavedSession(SavedSessionEntry session)
     {
-        var answer = MessageBox.Show(
-            $"Delete the '{session.Name}' session?",
-            "Delete saved session?",
-            MessageBoxButtons.YesNo,
-            MessageBoxIcon.Warning,
-            MessageBoxDefaultButton.Button2);
-        if (answer != DialogResult.Yes) return;
+        if (!NativeAlertDialog.Confirm(
+                this,
+                "Delete saved session?",
+                $"Delete the '{session.Name}' session?",
+                confirmText: "Delete",
+                cancelText: "Cancel"))
+        {
+            return;
+        }
         state.NamedSessions.RemoveAll(item =>
             item.Name.Equals(session.Name, StringComparison.OrdinalIgnoreCase));
         ScheduleStateSave();
@@ -9955,7 +10641,7 @@ public sealed class MainForm : Form
             ? "Extensions are unavailable in private windows"
             : "Install and manage browser extensions";
         ClearAndDisposeMenuItems(extensionsMenuItem.DropDownItems);
-        var manageItem = new ToolStripMenuItem("Manage extensions…")
+        var manageItem = new ToolStripMenuItem("Manage extensions\u2026")
         {
             ToolTipText = "Open the extensions manager"
         };
@@ -9982,6 +10668,8 @@ public sealed class MainForm : Form
                         }
                     }
                     var extItem = new ToolStripMenuItem(TrimMenuText(ext.Name, 42), icon);
+                    extItem.DropDown.Renderer = menuRenderer;
+                    NativeUiTheme.ApplyMenuWindowFrame(extItem.DropDown);
                     var hasPopup = ext.PopupPath is not null || ext.LaunchPath is not null;
                     var hasOptions = ext.OptionsPath is not null;
                     if (hasPopup && hasOptions)
@@ -10086,6 +10774,8 @@ public sealed class MainForm : Form
                 {
                     ToolTipText = SanitizeDownloadDisplayPath(download.FilePath)
                 };
+                item.DropDown.Renderer = menuRenderer;
+                NativeUiTheme.ApplyMenuWindowFrame(item.DropDown);
                 if (download.State.Equals("Complete", StringComparison.OrdinalIgnoreCase)
                     && File.Exists(download.FilePath))
                 {
@@ -10103,6 +10793,8 @@ public sealed class MainForm : Form
                     item.DropDownItems.Add("Remove from list", null, (_, _) =>
                     {
                         downloads.Remove(download);
+                        SyncRecentDownloadsToState();
+                        RefreshDownloadsUi();
                         ShowTransientStatus("Download removed from this session's list");
                     });
                 }
@@ -10186,14 +10878,17 @@ public sealed class MainForm : Form
             var query = smartSearchBarEditing && activeSmartSearchBar is not null
                 ? activeSmartSearchBar.Text
                 : addressBar.Text;
-            addressSuggestionPopup.SetSuggestions(AddressSuggestionEngine.GetSuggestions(query, state));
+            addressSuggestionPopup.SetSuggestions(
+            AddressSuggestionEngine.GetSuggestions(query, state, BuildOpenTabCandidates()));
             PositionAddressSuggestions();
         }
         if (!isPrivateMode) ScheduleStateSave();
         ShowTransientStatus($"Search engine: {BrowserPolicy.GetSearchProviderName(searchProviderId)}");
     }
 
-    private void ShowSavedItemsDialog()
+    private void ShowSavedItemsDialog() => ShowSavedItemsDialog(SavedItemsView.Favorites);
+
+    private void ShowSavedItemsDialog(SavedItemsView initialView)
     {
         if (isPrivateMode)
         {
@@ -10202,12 +10897,757 @@ public sealed class MainForm : Form
         }
 
         using var dialog = new SavedItemsDialog(BuildSavedItemRows);
+        if (initialView != SavedItemsView.Favorites
+            && FindFirstComboBox(dialog) is { } picker
+            && (int)initialView is var initialIndex
+            && initialIndex >= 0
+            && initialIndex < picker.Items.Count)
+        {
+            picker.SelectedIndex = initialIndex;
+        }
         dialog.ActionRequested += (_, action) =>
         {
             HandleSavedItemAction(action);
             dialog.RefreshItems();
         };
         dialog.ShowDialog(this);
+    }
+
+    private static ComboBox? FindFirstComboBox(Control root)
+    {
+        foreach (Control child in root.Controls)
+        {
+            if (child is ComboBox comboBox) return comboBox;
+            var nested = FindFirstComboBox(child);
+            if (nested is not null) return nested;
+        }
+        return null;
+    }
+
+    private void PersistPinnedQuickLinks()
+    {
+        BrowserStateStore.NormalizeForPersistence(state);
+        InvalidateStartPageLinks();
+        RefreshNativeStartPages(refreshLinks: true);
+        if (!isPrivateMode) ScheduleStateSave();
+    }
+
+    private void ShowManageQuickLinksDialog()
+    {
+        if (isPrivateMode)
+        {
+            ShowTransientStatus("Quick links are unavailable in a private window");
+            return;
+        }
+
+        using var dialog = new Form
+        {
+            Text = "Manage quick links",
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.SizableToolWindow,
+            MinimumSize = new Size(480, 340),
+            Size = new Size(560, 380),
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowInTaskbar = false,
+            AccessibleRole = AccessibleRole.Dialog,
+            AccessibleName = "Manage quick links"
+        };
+        NativeDialogLayout.EnableDpiScaling(dialog);
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Padding = new Padding(14),
+            ColumnCount = 1,
+            RowCount = 4
+        };
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, NativeDialogLayout.WrappedActionRowHeight));
+
+        var subtitle = new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Text = $"Pinned shortcuts appear first on your New Tab page (up to {BrowserStateStore.MaximumPinnedStartPageLinks})."
+        };
+        var list = new ListBox
+        {
+            Dock = DockStyle.Fill,
+            IntegralHeight = false,
+            AccessibleName = "Pinned quick links"
+        };
+        NativeUiTheme.ConfigureModernListBox(
+            list,
+            48,
+            (index, _) =>
+            {
+                var item = state.PinnedStartPageLinks[index];
+                var title = string.IsNullOrWhiteSpace(item.Title) ? HostFromUrl(item.Url) : item.Title;
+                return new ModernListRowVisual(
+                    title,
+                    FormatBrowserChromeUrlForDisplay(item.Url),
+                    (index + 1).ToString(),
+                    NativeUiTheme.Accent,
+                    "Pinned",
+                    NativeUiTheme.Accent);
+            });
+        var emptyHint = new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Text = "No pinned quick links yet. Add up to 3 favorites or sites below."
+        };
+
+        var actions = NativeDialogLayout.CreateActionBar(wrap: true);
+        var addButton = new Button();
+        var editButton = new Button();
+        var moveUpButton = new Button();
+        var moveDownButton = new Button();
+        var removeButton = new Button();
+        var doneButton = new Button { DialogResult = DialogResult.OK };
+        NativeDialogLayout.ConfigureButton(addButton, "Add\u2026", "Add a new quick link");
+        NativeDialogLayout.ConfigureButton(editButton, "Edit\u2026", "Edit the selected quick link");
+        NativeDialogLayout.ConfigureButton(moveUpButton, "Up", "Move the selected quick link up");
+        NativeDialogLayout.ConfigureButton(moveDownButton, "Down", "Move the selected quick link down");
+        NativeDialogLayout.ConfigureButton(removeButton, "Remove", "Remove the selected quick link");
+        NativeDialogLayout.ConfigureButton(doneButton, "Done", "Close manage quick links");
+        actions.Controls.Add(doneButton);
+        actions.Controls.Add(removeButton);
+        actions.Controls.Add(moveDownButton);
+        actions.Controls.Add(moveUpButton);
+        actions.Controls.Add(editButton);
+        actions.Controls.Add(addButton);
+
+        root.Controls.Add(subtitle, 0, 0);
+        root.Controls.Add(list, 0, 1);
+        root.Controls.Add(emptyHint, 0, 2);
+        root.Controls.Add(actions, 0, 3);
+        dialog.Controls.Add(root);
+        dialog.AcceptButton = doneButton;
+        dialog.CancelButton = doneButton;
+
+        NativeUiTheme.Apply(dialog, addButton);
+        foreach (var btn in new[] { editButton, moveUpButton, moveDownButton, removeButton, doneButton })
+        {
+            NativeUiTheme.ApplySecondaryButton(btn);
+        }
+        emptyHint.ForeColor = NativeUiTheme.MutedText;
+
+        void RefreshList(int selectedIndex = -1)
+        {
+            list.BeginUpdate();
+            try
+            {
+                list.Items.Clear();
+                foreach (var link in state.PinnedStartPageLinks)
+                {
+                    list.Items.Add(link.Title);
+                }
+                if (list.Items.Count > 0)
+                {
+                    list.SelectedIndex = Math.Clamp(selectedIndex < 0 ? 0 : selectedIndex, 0, list.Items.Count - 1);
+                }
+            }
+            finally
+            {
+                list.EndUpdate();
+            }
+            emptyHint.Text = list.Items.Count == 0
+                ? "No pinned quick links yet. Add up to 3 favorites or sites below."
+                : $"{list.Items.Count} of {BrowserStateStore.MaximumPinnedStartPageLinks} quick link slots used.";
+            addButton.Enabled = state.PinnedStartPageLinks.Count < BrowserStateStore.MaximumPinnedStartPageLinks;
+            var sel = list.SelectedIndex;
+            editButton.Enabled = sel >= 0;
+            removeButton.Enabled = sel >= 0;
+            moveUpButton.Enabled = sel > 0;
+            moveDownButton.Enabled = sel >= 0 && sel < list.Items.Count - 1;
+        }
+
+        void EditSelected()
+        {
+            var index = list.SelectedIndex;
+            if (index < 0 || index >= state.PinnedStartPageLinks.Count) return;
+            var current = state.PinnedStartPageLinks[index];
+            if (!TryEditQuickLink(dialog, "Edit quick link", current.Title, current.Url, out var updated)
+                || updated is null)
+            {
+                return;
+            }
+            if (state.PinnedStartPageLinks.Where((_, i) => i != index)
+                .Any(item => BrowserPolicy.UrlEquals(item.Url, updated.Url)))
+            {
+                NativeAlertDialog.ShowInfo(dialog, "Duplicate quick link", "That URL is already pinned.");
+                return;
+            }
+            state.PinnedStartPageLinks[index] = updated;
+            PersistPinnedQuickLinks();
+            RefreshList(index);
+            ShowTransientStatus("Quick link updated");
+        }
+
+        list.SelectedIndexChanged += (_, _) =>
+        {
+            var sel = list.SelectedIndex;
+            editButton.Enabled = sel >= 0;
+            removeButton.Enabled = sel >= 0;
+            moveUpButton.Enabled = sel > 0;
+            moveDownButton.Enabled = sel >= 0 && sel < list.Items.Count - 1;
+        };
+        list.DoubleClick += (_, _) => EditSelected();
+        addButton.Click += (_, _) =>
+        {
+            if (state.PinnedStartPageLinks.Count >= BrowserStateStore.MaximumPinnedStartPageLinks) return;
+            var defaultTitle = activeTab is { IsStartPage: false } && BrowserPolicy.IsHttpUrl(activeTab.Url) && !IsPinned(activeTab.Url)
+                ? activeTab.Title
+                : string.Empty;
+            var defaultUrl = activeTab is { IsStartPage: false } && BrowserPolicy.IsHttpUrl(activeTab.Url) && !IsPinned(activeTab.Url)
+                ? activeTab.Url
+                : string.Empty;
+            if (!TryEditQuickLink(dialog, "Add quick link", defaultTitle, defaultUrl, out var created)
+                || created is null)
+            {
+                return;
+            }
+            if (IsPinned(created.Url))
+            {
+                NativeAlertDialog.ShowInfo(dialog, "Already pinned", "That URL is already in your pinned quick links.");
+                return;
+            }
+            state.PinnedStartPageLinks.Add(created);
+            PersistPinnedQuickLinks();
+            RefreshList(state.PinnedStartPageLinks.Count - 1);
+            ShowTransientStatus("Quick link added");
+        };
+        editButton.Click += (_, _) => EditSelected();
+        moveUpButton.Click += (_, _) =>
+        {
+            var sel = list.SelectedIndex;
+            if (sel <= 0 || sel >= state.PinnedStartPageLinks.Count) return;
+            (state.PinnedStartPageLinks[sel - 1], state.PinnedStartPageLinks[sel]) =
+                (state.PinnedStartPageLinks[sel], state.PinnedStartPageLinks[sel - 1]);
+            PersistPinnedQuickLinks();
+            RefreshList(sel - 1);
+        };
+        moveDownButton.Click += (_, _) =>
+        {
+            var sel = list.SelectedIndex;
+            if (sel < 0 || sel >= state.PinnedStartPageLinks.Count - 1) return;
+            (state.PinnedStartPageLinks[sel], state.PinnedStartPageLinks[sel + 1]) =
+                (state.PinnedStartPageLinks[sel + 1], state.PinnedStartPageLinks[sel]);
+            PersistPinnedQuickLinks();
+            RefreshList(sel + 1);
+        };
+        removeButton.Click += (_, _) =>
+        {
+            var sel = list.SelectedIndex;
+            if (sel < 0 || sel >= state.PinnedStartPageLinks.Count) return;
+            state.PinnedStartPageLinks.RemoveAt(sel);
+            PersistPinnedQuickLinks();
+            RefreshList(Math.Min(sel, state.PinnedStartPageLinks.Count - 1));
+            ShowTransientStatus("Quick link removed");
+        };
+
+        RefreshList();
+        dialog.ShowDialog(this);
+    }
+
+    private bool TryEditQuickLink(
+        IWin32Window owner,
+        string dialogTitle,
+        string initialTitle,
+        string initialUrl,
+        out PinnedStartPageLink? link)
+    {
+        link = null;
+        using var editor = new Form
+        {
+            Text = dialogTitle,
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            ShowInTaskbar = false,
+            Size = new Size(440, 224),
+            AccessibleRole = AccessibleRole.Dialog,
+            AccessibleName = dialogTitle
+        };
+        NativeDialogLayout.EnableDpiScaling(editor);
+
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Padding = new Padding(14),
+            ColumnCount = 1,
+            RowCount = 5
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        var titleLabel = new Label { Dock = DockStyle.Fill, Text = "Name", TextAlign = ContentAlignment.BottomLeft };
+        var titleBox = new TextBox { Dock = DockStyle.Fill, Text = initialTitle, AccessibleName = "Quick link name" };
+        var urlLabel = new Label { Dock = DockStyle.Fill, Text = "Web address (https://\u2026)", TextAlign = ContentAlignment.BottomLeft };
+        var urlBox = new TextBox { Dock = DockStyle.Fill, Text = initialUrl, AccessibleName = "Quick link address" };
+
+        var buttons = NativeDialogLayout.CreateActionBar(wrap: false);
+        var saveButton = new Button();
+        var cancelButton = new Button { DialogResult = DialogResult.Cancel };
+        NativeDialogLayout.ConfigureButton(saveButton, "Save", "Save quick link");
+        NativeDialogLayout.ConfigureButton(cancelButton, "Cancel", "Cancel editing quick link");
+        buttons.Controls.Add(cancelButton);
+        buttons.Controls.Add(saveButton);
+
+        PinnedStartPageLink? result = null;
+        saveButton.Click += (_, _) =>
+        {
+            var rawUrl = urlBox.Text.Trim();
+            if (string.IsNullOrWhiteSpace(rawUrl)
+                || !BrowserPolicy.IsRecognizedAddressInput(rawUrl)
+                || BrowserPolicy.ResolveAddress(rawUrl, searchProviderId) is not { Url: { } resolvedUrl }
+                || !BrowserPolicy.IsHttpUrl(resolvedUrl))
+            {
+                NativeAlertDialog.ShowInfo(editor, "Invalid web address", "Enter an http:// or https:// website address.");
+                urlBox.Focus();
+                urlBox.SelectAll();
+                return;
+            }
+
+            var title = BrowserStateStore.SanitizeTitle(titleBox.Text);
+            if (title.Length == 0)
+            {
+                title = HostFromUrl(resolvedUrl);
+            }
+            if (title.Length == 0) title = resolvedUrl;
+            result = new PinnedStartPageLink(title, resolvedUrl);
+            editor.DialogResult = DialogResult.OK;
+            editor.Close();
+        };
+
+        layout.Controls.Add(titleLabel, 0, 0);
+        layout.Controls.Add(titleBox, 0, 1);
+        layout.Controls.Add(urlLabel, 0, 2);
+        layout.Controls.Add(urlBox, 0, 3);
+        layout.Controls.Add(buttons, 0, 4);
+        editor.Controls.Add(layout);
+        editor.AcceptButton = saveButton;
+        editor.CancelButton = cancelButton;
+
+        NativeUiTheme.Apply(editor, saveButton);
+        NativeUiTheme.ApplySecondaryButton(cancelButton);
+
+        if (editor.ShowDialog(owner) != DialogResult.OK || result is null) return false;
+        link = result;
+        return true;
+    }
+
+    private async Task ShowNavigationHistoryMenuAsync(Control anchor, bool forward)
+    {
+        var tab = activeTab;
+        var core = tab?.Core;
+        if (tab is null || core is null || tab.IsClosed || tab.IsStartPage || isClosing) return;
+
+        string json;
+        try
+        {
+            json = await core.CallDevToolsProtocolMethodAsync("Page.getNavigationHistory", "{}");
+        }
+        catch (Exception error)
+        {
+            stateStore.Log("Could not inspect tab navigation history", error);
+            return;
+        }
+
+        if (isClosing || tab.IsClosed || !ReferenceEquals(tab.Core, core) || anchor.IsDisposed || !anchor.Visible)
+        {
+            return;
+        }
+
+        var entries = new List<(int Id, string Title, string Url)>(15);
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("currentIndex", out var currentIndexProp)
+                || !root.TryGetProperty("entries", out var entriesProp)
+                || entriesProp.ValueKind != JsonValueKind.Array)
+            {
+                return;
+            }
+
+            var currentIndex = currentIndexProp.GetInt32();
+            var total = entriesProp.GetArrayLength();
+            if (forward)
+            {
+                for (var index = currentIndex + 1; index < total && entries.Count < 15; index++)
+                {
+                    AddHistoryEntry(entriesProp[index]);
+                }
+            }
+            else
+            {
+                for (var index = currentIndex - 1; index >= 0 && entries.Count < 15; index--)
+                {
+                    AddHistoryEntry(entriesProp[index]);
+                }
+            }
+
+            void AddHistoryEntry(JsonElement entry)
+            {
+                if (!entry.TryGetProperty("id", out var idProp)
+                    || !entry.TryGetProperty("url", out var urlProp))
+                {
+                    return;
+                }
+                var entryUrl = urlProp.GetString() ?? string.Empty;
+                if (entryUrl.Length == 0 || entryUrl.Equals("about:blank", StringComparison.OrdinalIgnoreCase)) return;
+                if (!BrowserPolicy.IsSafeTopLevelUrl(entryUrl, allowFileScheme: true)) return;
+                var rawTitle = entry.TryGetProperty("title", out var titleProp) ? titleProp.GetString() : null;
+                var cleanTitle = BrowserStateStore.SanitizeTitle(rawTitle);
+                if (cleanTitle.Length == 0) cleanTitle = HostFromUrl(entryUrl);
+                if (cleanTitle.Length == 0) cleanTitle = FormatBrowserChromeUrlForDisplay(entryUrl);
+                entries.Add((idProp.GetInt32(), cleanTitle, entryUrl));
+            }
+        }
+        catch (Exception error)
+        {
+            stateStore.Log("Could not parse navigation history", error);
+            return;
+        }
+
+        if (entries.Count == 0) return;
+
+        var menu = new ContextMenuStrip
+        {
+            ShowImageMargin = false,
+            Renderer = menuRenderer
+        };
+        foreach (var entry in entries)
+        {
+            var entryId = entry.Id;
+            var item = new ToolStripMenuItem(TrimMenuText(entry.Title, 44))
+            {
+                ToolTipText = FormatBrowserChromeUrlForDisplay(entry.Url)
+            };
+            item.Click += (_, _) => RunUiTask(
+                async () =>
+                {
+                    if (isClosing || tab.IsClosed || !ReferenceEquals(tab.Core, core)) return;
+                    await core.CallDevToolsProtocolMethodAsync(
+                        "Page.navigateToHistoryEntry",
+                        $"{{\"entryId\":{entryId}}}");
+                },
+                "Could not open that history page");
+            menu.Items.Add(item);
+        }
+        menu.Closed += (_, _) => menu.Dispose();
+        NativeUiTheme.ApplyMenuWindowFrame(menu);
+        menu.Show(anchor, new Point(0, anchor.Height), ToolStripDropDownDirection.BelowRight);
+    }
+
+    private async Task TogglePictureInPictureAsync(BrowserTab? targetTab = null)
+    {
+        var tab = targetTab ?? activeTab;
+        if (tab is null || tab.IsClosed || tab.IsStartPage || tab.Core is not { } core)
+        {
+            ShowTransientStatus("Open a page with video before using Picture-in-Picture");
+            return;
+        }
+
+        try
+        {
+            var raw = await core.ExecuteScriptAsync(
+                "(() => { try { if (document.pictureInPictureElement) { document.exitPictureInPicture()?.catch(() => {}); return 'exiting'; } const video = document.querySelector('video'); if (!video) return 'none'; if (!document.pictureInPictureEnabled || video.disablePictureInPicture) return 'disabled'; video.requestPictureInPicture()?.catch(() => {}); return 'entering'; } catch (_) { return 'error'; } })()");
+            var status = raw.Trim('"');
+            ShowTransientStatus(status switch
+            {
+                "entering" => "Opened Picture-in-Picture",
+                "exiting" => "Closed Picture-in-Picture",
+                "none" => "No video found on this page",
+                "disabled" => "Picture-in-Picture is blocked by this page",
+                _ => "Picture-in-Picture is unavailable on this page"
+            });
+        }
+        catch (Exception error)
+        {
+            stateStore.Log("Picture-in-Picture toggle failed", error);
+            ShowTransientStatus("Picture-in-Picture is unavailable");
+        }
+    }
+
+    private void HardReloadActiveTab()
+    {
+        var tab = activeTab;
+        if (tab is null || tab.IsClosed) return;
+        if (tab.IsStartPage)
+        {
+            ShowStartPage(tab, false);
+            return;
+        }
+        var core = tab.Core;
+        if (core is null) return;
+        RunUiTask(
+            async () =>
+            {
+                try
+                {
+                    await core.CallDevToolsProtocolMethodAsync("Page.reload", "{\"ignoreCache\":true}");
+                }
+                catch
+                {
+                    if (!isClosing && !tab.IsClosed && ReferenceEquals(tab.Core, core))
+                    {
+                        core.Reload();
+                    }
+                }
+            },
+            "Hard reload failed");
+    }
+
+    private IReadOnlyList<OpenTabCandidate> BuildOpenTabCandidates()
+    {
+        if (tabs.Count == 0) return Array.Empty<OpenTabCandidate>();
+        var result = new List<OpenTabCandidate>(tabs.Count);
+        foreach (var tab in tabs)
+        {
+            if (tab.IsClosed || tab.IsStartPage || !BrowserPolicy.IsSafeTopLevelUrl(tab.Url)) continue;
+            result.Add(new OpenTabCandidate(tab.Title, tab.Url, tab == activeTab));
+        }
+        return result;
+    }
+
+    private async Task CaptureTabScrollOffsetAsync(BrowserTab tab)
+    {
+        if (isClosing || tab.IsClosed || tab.IsStartPage || tab.Core is not { } core) return;
+        try
+        {
+            var raw = await core.ExecuteScriptAsync(
+                "(() => { try { return Math.max(0, Math.round(window.scrollY || document.documentElement?.scrollTop || 0)); } catch (_) { return 0; } })()");
+            if (isClosing || tab.IsClosed || !ReferenceEquals(tab.Core, core)) return;
+            if (double.TryParse(raw, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var y)
+                && double.IsFinite(y)
+                && y >= 0)
+            {
+                tab.SavedScrollY = (int)Math.Min(int.MaxValue, Math.Round(y));
+            }
+        }
+        catch
+        {
+            // Suspending/unloading may race with process shutdown; preserve last known offset.
+        }
+    }
+
+    private void HydrateRecentDownloadsFromState()
+    {
+        if (isPrivateMode || downloads.Count > 0 || state.RecentDownloads.Count == 0) return;
+        foreach (var recent in state.RecentDownloads.Take(BrowserStateStore.MaximumRecentDownloads))
+        {
+            var entry = new DownloadEntry(
+                SanitizeDownloadDisplayName(recent.FileName),
+                recent.TargetPath,
+                recent.SourceUrl,
+                recent.CompletedAtUtc.ToLocalTime().DateTime,
+                string.IsNullOrWhiteSpace(recent.State) ? "Complete" : recent.State)
+            {
+                IsTerminal = true,
+                CanResume = false
+            };
+            downloads.Add(entry);
+        }
+        TrimDownloadRecords();
+    }
+
+    private void SyncRecentDownloadsToState(bool scheduleSave = true)
+    {
+        if (isPrivateMode) return;
+        state.RecentDownloads.Clear();
+        foreach (var download in downloads
+                     .Where(item => item.IsTerminal)
+                     .Take(BrowserStateStore.MaximumRecentDownloads))
+        {
+            var completedUtc = new DateTimeOffset(DateTime.SpecifyKind(download.StartedAt, DateTimeKind.Local))
+                .ToUniversalTime();
+            state.RecentDownloads.Add(new RecentDownloadEntry(
+                download.FileName,
+                download.SourceUrl,
+                download.FilePath,
+                download.State,
+                completedUtc));
+        }
+        if (scheduleSave) ScheduleStateSave();
+    }
+
+    private static string? GetFaviconCacheKey(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url) || StartPage.IsStartPageUrl(url)) return null;
+        if (!BrowserPolicy.IsHttpUrl(url)) return null;
+        var host = BrowserPolicy.NormalizeExactHost(HostFromUrl(url));
+        return string.IsNullOrWhiteSpace(host) ? null : host;
+    }
+
+    private static string? BuildFaviconMonogram(string? url)
+    {
+        var hostKey = GetFaviconCacheKey(url);
+        if (hostKey is null) return null;
+        var label = hostKey.StartsWith("www.", StringComparison.OrdinalIgnoreCase)
+            ? hostKey[4..]
+            : hostKey;
+        foreach (var ch in label)
+        {
+            if (char.IsLetterOrDigit(ch))
+            {
+                return char.ToUpperInvariant(ch).ToString();
+            }
+        }
+        return "W";
+    }
+
+    private Bitmap? GetCachedFaviconCopy(string? hostKey)
+    {
+        if (isClosing || IsDisposed || hostKey is null) return null;
+        if (!faviconCacheMap.TryGetValue(hostKey, out var node)) return null;
+        faviconCacheOrder.Remove(node);
+        faviconCacheOrder.AddLast(node);
+        try
+        {
+            return new Bitmap(node.Value.Icon);
+        }
+        catch
+        {
+            faviconCacheOrder.Remove(node);
+            faviconCacheMap.Remove(hostKey);
+            return null;
+        }
+    }
+
+    private bool TryApplyCachedFavicon(BrowserTab tab)
+    {
+        if (tab.IsClosed || tab.IsStartPage) return false;
+        var hostKey = GetFaviconCacheKey(tab.Url);
+        if (hostKey is null || !faviconCacheMap.ContainsKey(hostKey)) return false;
+        UpdateTabHeader(tab);
+        return true;
+    }
+
+    private void StoreFaviconInCache(string hostKey, Bitmap favicon16)
+    {
+        if (isClosing || IsDisposed)
+        {
+            favicon16.Dispose();
+            return;
+        }
+
+        if (faviconCacheMap.TryGetValue(hostKey, out var existing))
+        {
+            faviconCacheOrder.Remove(existing);
+            faviconCacheMap.Remove(hostKey);
+            try { existing.Value.Icon.Dispose(); }
+            catch { }
+        }
+
+        while (faviconCacheMap.Count >= MaximumCachedFaviconHosts && faviconCacheOrder.First is { } oldest)
+        {
+            faviconCacheOrder.RemoveFirst();
+            faviconCacheMap.Remove(oldest.Value.Host);
+            try { oldest.Value.Icon.Dispose(); }
+            catch { }
+        }
+
+        var node = faviconCacheOrder.AddLast((hostKey, favicon16));
+        faviconCacheMap[hostKey] = node;
+        faviconCacheVersion++;
+    }
+
+    private void ClearFaviconCache()
+    {
+        foreach (var entry in faviconCacheOrder)
+        {
+            try { entry.Icon.Dispose(); }
+            catch { }
+        }
+        faviconCacheOrder.Clear();
+        faviconCacheMap.Clear();
+        faviconCacheVersion++;
+    }
+
+    private async Task RefreshTabFaviconAsync(
+        BrowserTab tab,
+        CoreWebView2 core,
+        long documentGeneration)
+    {
+        if (isClosing || IsDisposed || tab.IsClosed || tab.IsStartPage || !ReferenceEquals(tab.Core, core))
+        {
+            return;
+        }
+
+        string? faviconUri;
+        try { faviconUri = core.FaviconUri; }
+        catch { return; }
+
+        var hostKey = GetFaviconCacheKey(tab.Url);
+        if (string.IsNullOrWhiteSpace(faviconUri) || hostKey is null)
+        {
+            UpdateTabHeader(tab);
+            return;
+        }
+
+        try
+        {
+            using var stream = await core.GetFaviconAsync(CoreWebView2FaviconImageFormat.Png);
+            if (isClosing
+                || IsDisposed
+                || tab.IsClosed
+                || tab.IsStartPage
+                || !ReferenceEquals(tab.Core, core)
+                || tab.DocumentNavigationGeneration != documentGeneration
+                || stream is null)
+            {
+                return;
+            }
+
+            using var buffer = new MemoryStream();
+            await stream.CopyToAsync(buffer);
+            if (buffer.Length == 0 || buffer.Length > 512 * 1024) return;
+            if (isClosing
+                || IsDisposed
+                || tab.IsClosed
+                || !ReferenceEquals(tab.Core, core)
+                || tab.DocumentNavigationGeneration != documentGeneration)
+            {
+                return;
+            }
+
+            buffer.Position = 0;
+            using var decoded = Image.FromStream(buffer, useEmbeddedColorManagement: false, validateImageData: false);
+            using var scaled = new Bitmap(16, 16, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            using (var graphics = Graphics.FromImage(scaled))
+            {
+                graphics.Clear(Color.Transparent);
+                graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                graphics.DrawImage(decoded, new Rectangle(0, 0, 16, 16));
+            }
+            StoreFaviconInCache(hostKey, new Bitmap(scaled));
+
+            foreach (var openTab in tabs.Where(item =>
+                         !item.IsClosed
+                         && !item.IsStartPage
+                         && string.Equals(GetFaviconCacheKey(item.Url), hostKey, StringComparison.OrdinalIgnoreCase)).ToArray())
+            {
+                UpdateTabHeader(openTab);
+            }
+        }
+        catch
+        {
+            // Broken/empty site favicons fall back cleanly to the crisp tinted host monogram.
+        }
     }
 
     private IReadOnlyList<SavedItemRow> BuildSavedItemRows(SavedItemsView view)
@@ -10756,25 +12196,24 @@ public sealed class MainForm : Form
             maximumVisibleCapabilities);
         var requestedText = requested.Count == 0
             ? "No permissions or site access are declared in its manifest."
-            : string.Join(Environment.NewLine, requested.Select(value => "• " + value));
+            : string.Join(Environment.NewLine, requested.Select(value => "\u2022 " + value));
         var added = SelectExtensionCapabilitiesForPrompt(
             update.AddedCapabilities,
             maximumVisibleCapabilities);
         var addedText = added.Count == 0
             ? "No newly declared access."
-            : string.Join(Environment.NewLine, added.Select(value => "• " + value));
+            : string.Join(Environment.NewLine, added.Select(value => "\u2022 " + value));
         var message = $"Update {safeName} from {safeCurrentVersion} to {safeNewVersion}?{Environment.NewLine}"
             + $"Chrome Web Store ID: {prepared.StoreId}{Environment.NewLine}{Environment.NewLine}"
             + $"Newly declared access:{Environment.NewLine}{addedText}{Environment.NewLine}{Environment.NewLine}"
             + $"All access requested by the update:{Environment.NewLine}{requestedText}"
             + $"{Environment.NewLine}{Environment.NewLine}The update activates only if you approve it.";
-        return MessageBox.Show(
+        return NativeAlertDialog.Confirm(
             owner,
-            message,
             "Update extension",
-            MessageBoxButtons.YesNo,
-            MessageBoxIcon.Warning,
-            MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+            message,
+            confirmText: "Update",
+            cancelText: "Cancel");
     }
 
     private bool ConfirmPreparedExtensionInstall(
@@ -10791,20 +12230,19 @@ public sealed class MainForm : Form
             maximumVisibleCapabilities);
         var access = visibleCapabilities.Count == 0
             ? "No permissions or site access are declared in its manifest."
-            : string.Join(Environment.NewLine, visibleCapabilities.Select(value => "• " + value));
+            : string.Join(Environment.NewLine, visibleCapabilities.Select(value => "\u2022 " + value));
         var source = prepared.StoreId is null
             ? "Local package"
             : $"Chrome Web Store ID: {prepared.StoreId}";
         var message = $"Install {safeName} {safeVersion}?{Environment.NewLine}"
             + $"{source}{Environment.NewLine}{Environment.NewLine}Requested access:{Environment.NewLine}{access}"
             + $"{Environment.NewLine}{Environment.NewLine}Only install extensions you trust.";
-        return MessageBox.Show(
+        return NativeAlertDialog.Confirm(
             owner,
-            message,
             "Install extension",
-            MessageBoxButtons.YesNo,
-            MessageBoxIcon.Warning,
-            MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+            message,
+            confirmText: "Install",
+            cancelText: "Cancel");
     }
 
     internal static List<string> SelectExtensionCapabilitiesForPrompt(
@@ -11198,8 +12636,72 @@ public sealed class MainForm : Form
 
     private void ShowDownloadsPopup()
     {
+        downloadNotification?.Dismiss();
         downloadsPopup ??= new DownloadsPopupForm(BuildDownloadPopupRows, HandleDownloadPopupAction);
         downloadsPopup.Open(this, downloadsButtonAutoVisible ? downloadsButton : menuButton);
+    }
+
+    private void ShowDownloadNotification(DownloadEntry entry)
+    {
+        notificationDownloadEntry = entry;
+        if (isClosing || isWindowMinimized || WindowState == FormWindowState.Minimized) return;
+        if (!IsHandleCreated || !Visible || downloadsPopup?.Visible == true) return;
+        downloadNotification ??= new DownloadNotificationForm(HandleDownloadPopupAction, ShowDownloadsPopup);
+        downloadNotification.ShowOrUpdate(
+            this,
+            GetDownloadsPopupAnchor(),
+            BuildDownloadNotificationState(entry));
+    }
+
+    private void UpdateDownloadNotificationIfVisible()
+    {
+        if (isClosing || downloadNotification?.Visible != true) return;
+        var entry = notificationDownloadEntry;
+        if (entry is null || !downloads.Contains(entry))
+        {
+            notificationDownloadEntry = null;
+            downloadNotification.Dismiss();
+            return;
+        }
+        downloadNotification.UpdateIfVisible(
+            GetDownloadsPopupAnchor(),
+            BuildDownloadNotificationState(entry));
+    }
+
+    private void RepositionDownloadNotification()
+    {
+        if (downloadNotification?.Visible == true)
+        {
+            downloadNotification.Reposition(GetDownloadsPopupAnchor());
+        }
+    }
+
+    private Control GetDownloadsPopupAnchor() =>
+        downloadsButtonAutoVisible && downloadsButton.Visible ? downloadsButton : menuButton;
+
+    private DownloadNotificationState BuildDownloadNotificationState(DownloadEntry download)
+    {
+        var activeCount = tabs.Sum(item => item.ActiveDownloads);
+        var percent = download.TotalBytesToReceive > 0
+            ? (int?)Math.Clamp(
+                (int)Math.Round((double)download.BytesReceived / download.TotalBytesToReceive * 100d),
+                0,
+                100)
+            : null;
+        var detail = string.IsNullOrWhiteSpace(download.InterruptReason)
+            ? download.EstimatedEndTimeText
+            : download.InterruptReason;
+        return new DownloadNotificationState(
+            download.FileName,
+            download.State,
+            BuildDownloadProgress(download),
+            detail,
+            percent,
+            activeCount,
+            download.IsTerminal && download.State.Equals("Complete", StringComparison.OrdinalIgnoreCase) && File.Exists(download.FilePath),
+            !string.IsNullOrWhiteSpace(download.FilePath),
+            !download.IsTerminal && download.CancelAction is not null,
+            download);
     }
 
     private IReadOnlyList<DownloadPopupRow> BuildDownloadPopupRows()
@@ -11247,6 +12749,12 @@ public sealed class MainForm : Form
                 break;
             case DownloadPopupAction.Remove when download.IsTerminal:
                 downloads.Remove(download);
+                SyncRecentDownloadsToState();
+                if (ReferenceEquals(download, notificationDownloadEntry))
+                {
+                    notificationDownloadEntry = null;
+                    downloadNotification?.Dismiss();
+                }
                 RefreshDownloadsUi();
                 ShowTransientStatus("Download removed from this session's list");
                 break;
@@ -11301,7 +12809,9 @@ public sealed class MainForm : Form
     private void RefreshDownloadsUiNow()
     {
         downloadUiTimer.Stop();
+        downloadsButton.GlyphState = tabs.Sum(item => item.ActiveDownloads) > 0 ? "active" : string.Empty;
         if (downloadsPopup?.Visible == true) downloadsPopup.RefreshRows();
+        UpdateDownloadNotificationIfVisible();
         UpdateStatus();
     }
 
@@ -11378,7 +12888,11 @@ public sealed class MainForm : Form
                 100d);
             return $"{FormatBytes(download.BytesReceived)} / {FormatBytes(download.TotalBytesToReceive)} ({percent:0}%)";
         }
-        return download.BytesReceived > 0 ? $"{FormatBytes(download.BytesReceived)} received" : "Waiting for size";
+        return download.BytesReceived > 0
+            ? $"{FormatBytes(download.BytesReceived)} received"
+            : download.IsTerminal
+                ? (download.State.Equals("Interrupted", StringComparison.OrdinalIgnoreCase) ? "Interrupted" : "Saved")
+                : "Waiting for size";
     }
 
     private static string FormatEstimatedEndTime(object? value)
@@ -11962,7 +13476,7 @@ public sealed class MainForm : Form
         }
 
         lastAddressSuggestionInput = query;
-        var localSuggestions = AddressSuggestionEngine.GetSuggestions(query, state);
+        var localSuggestions = AddressSuggestionEngine.GetSuggestions(query, state, BuildOpenTabCandidates());
 
         liveSuggestionCts?.Cancel();
         liveSuggestionCts?.Dispose();
@@ -12081,6 +13595,24 @@ public sealed class MainForm : Form
         addressBarEditing = false;
         smartSearchBarEditing = false;
         HideAddressSuggestions();
+        if (suggestion.Source == AddressSuggestionSource.OpenTab)
+        {
+            var matchingTab = tabs.FirstOrDefault(item =>
+                    !item.IsClosed
+                    && !item.IsStartPage
+                    && item != activeTab
+                    && BrowserPolicy.UrlEquals(item.Url, suggestion.NavigationTarget))
+                ?? tabs.FirstOrDefault(item =>
+                    !item.IsClosed
+                    && !item.IsStartPage
+                    && BrowserPolicy.UrlEquals(item.Url, suggestion.NavigationTarget));
+            if (matchingTab is not null)
+            {
+                ActivateTab(matchingTab, focusPage: true);
+                ShowTransientStatus($"Switched to {matchingTab.Title}");
+                return;
+            }
+        }
         if (activeSmartSearchBar is not null && activeSmartSearchBar.InputControl.Focused)
         {
             activeSmartSearchBar.Text = suggestion.AcceptText;
@@ -12119,7 +13651,7 @@ public sealed class MainForm : Form
 
     private void RemoveAddressSuggestion(AddressSuggestion suggestion)
     {
-        if (suggestion.IsSearch) return;
+        if (suggestion.IsSearch || suggestion.Source == AddressSuggestionSource.OpenTab) return;
 
         if (isPrivateMode)
         {
@@ -12141,7 +13673,8 @@ public sealed class MainForm : Form
         var query = activeSmartSearchBar is not null && activeSmartSearchBar.InputControl.Focused
             ? activeSmartSearchBar.Text
             : addressBar.Text;
-        addressSuggestionPopup.SetSuggestions(AddressSuggestionEngine.GetSuggestions(query, state));
+        addressSuggestionPopup.SetSuggestions(
+            AddressSuggestionEngine.GetSuggestions(query, state, BuildOpenTabCandidates()));
         PositionAddressSuggestions();
         ShowTransientStatus("Suggestion removed");
     }
@@ -12342,9 +13875,64 @@ public sealed class MainForm : Form
             GoForward();
             return true;
         }
+        if (keyData is (Keys.Alt | Keys.Home))
+        {
+            ShowStartPage(activeTab);
+            return true;
+        }
+        if (keyData is (Keys.Control | Keys.Shift | Keys.R) or (Keys.Control | Keys.F5) or (Keys.Control | Keys.Shift | Keys.F5))
+        {
+            HardReloadActiveTab();
+            return true;
+        }
         if (keyData is (Keys.Control | Keys.R) or Keys.F5)
         {
             ReloadOrStop();
+            return true;
+        }
+        if (keyData == (Keys.Control | Keys.H))
+        {
+            ShowSavedItemsDialog(SavedItemsView.History);
+            return true;
+        }
+        if (keyData == (Keys.Control | Keys.Shift | Keys.O))
+        {
+            ShowSavedItemsDialog();
+            return true;
+        }
+        if (keyData == (Keys.Control | Keys.Shift | Keys.Delete))
+        {
+            RunUiTask(ClearBrowsingDataAsync, "Could not clear browsing data");
+            return true;
+        }
+        if (keyData == (Keys.Control | Keys.M))
+        {
+            ToggleActiveTabAudioMute();
+            return true;
+        }
+        if (keyData is (Keys.Control | Keys.G) or (Keys.Control | Keys.Shift | Keys.G))
+        {
+            if (!findBar.Visible || findBox.TextLength == 0)
+            {
+                ShowFindBar();
+                if (findBox.TextLength == 0) ShowTransientStatus("Type a word to find on this page");
+            }
+            else
+            {
+                RunUiTask(() => FindOnPageAsync(keyData.HasFlag(Keys.Shift)), "Find failed");
+            }
+            return true;
+        }
+        if (keyData == (Keys.Shift | Keys.G)
+            && findBar.Visible
+            && !findBox.Focused
+            && FindFocusedControl() is { } findBarFocus
+            && findBar.Contains(findBarFocus))
+        {
+            if (findBox.TextLength > 0)
+            {
+                RunUiTask(() => FindOnPageAsync(true), "Find failed");
+            }
             return true;
         }
         if (keyData == (Keys.Control | Keys.P))
@@ -12440,6 +14028,10 @@ public sealed class MainForm : Form
             }
             else if (isDomFullScreen) ExitDomFullScreen();
             else if (findBar.Visible) HideFindBar();
+            else if (activeTab?.ReaderModeActive == true)
+            {
+                RunUiTask(ToggleReaderModeAsync, "Reader mode unavailable");
+            }
             else if (isFullScreen) ToggleFullScreen();
             else if (activeTab?.IsLoading == true) ReloadOrStop();
             else
@@ -12853,6 +14445,55 @@ public sealed class MainForm : Form
     {
         tab.Header.HighContrast = IsHighContrastActive;
         tab.Header.IsPrivateMode = isPrivateMode;
+        var isWebTab = !tab.IsStartPage && BrowserPolicy.IsHttpUrl(tab.Url);
+        var hostKey = isWebTab ? GetFaviconCacheKey(tab.Url) : null;
+        var monogram = isWebTab ? BuildFaviconMonogram(tab.Url) : null;
+        if (!isWebTab)
+        {
+            tab.LoadedFaviconHostKey = null;
+            tab.LoadedFaviconVersion = 0;
+            tab.Header.SetFavicon(null, null, webTab: false);
+        }
+        else if (hostKey is not null && faviconCacheMap.ContainsKey(hostKey))
+        {
+            if (!string.Equals(tab.LoadedFaviconHostKey, hostKey, StringComparison.OrdinalIgnoreCase)
+                || tab.LoadedFaviconVersion != faviconCacheVersion)
+            {
+                var copy = GetCachedFaviconCopy(hostKey);
+                if (copy is not null)
+                {
+                    var cacheVersion = faviconCacheVersion;
+                    try
+                    {
+                        tab.Header.SetFavicon(copy, monogram, webTab: true);
+                        tab.LoadedFaviconHostKey = hostKey;
+                        tab.LoadedFaviconVersion = cacheVersion;
+                    }
+                    catch
+                    {
+                        copy.Dispose();
+                        throw;
+                    }
+                }
+                else
+                {
+                    tab.LoadedFaviconHostKey = null;
+                    tab.LoadedFaviconVersion = 0;
+                    tab.Header.SetFavicon(null, monogram, webTab: true);
+                }
+            }
+            else
+            {
+                tab.Header.SetFaviconMetadata(monogram, webTab: true);
+            }
+        }
+        else
+        {
+            tab.LoadedFaviconHostKey = null;
+            tab.LoadedFaviconVersion = 0;
+            tab.Header.SetFavicon(null, monogram, webTab: true);
+        }
+
         tab.Header.SetState(
             tab.Title,
             activeTab == tab,
@@ -12867,7 +14508,8 @@ public sealed class MainForm : Form
 
     private bool IsTabMuted(BrowserTab tab)
     {
-        return tab.IsMuted || (!isPrivateMode && SitePreferencePolicy.ShouldMuteAudio(state.AudioOutputPolicy, state.AllowedAudioHosts, state.MutedHosts, tab.Url));
+        return tab.TabMuteOverride
+            ?? (tab.IsMuted || (!isPrivateMode && SitePreferencePolicy.ShouldMuteAudio(state.AudioOutputPolicy, state.AllowedAudioHosts, state.MutedHosts, tab.Url)));
     }
 
     private void ResizeTabHeaders()
@@ -13005,7 +14647,7 @@ public sealed class MainForm : Form
 
     private void UpdateFindBarLayout()
     {
-        if (findBar.ColumnStyles.Count < 5) return;
+        if (findBar.ColumnStyles.Count < 6) return;
         findBar.SuspendLayout();
         try
         {
@@ -13017,7 +14659,7 @@ public sealed class MainForm : Form
                 ? ScaleChromeLogical(244)
                 : width >= ScaleChromeLogical(700) ? ScaleChromeLogical(120) : ScaleChromeLogical(12);
             var minimumInput = ScaleChromeLogical(120);
-            var fixedControls = matchWidth + (buttonWidth * 3) + rightPadding;
+            var fixedControls = matchWidth + (buttonWidth * 4) + rightPadding;
             var leftPadding = Math.Min(
                 preferredLeft,
                 Math.Max(ScaleChromeLogical(4), width - fixedControls - minimumInput));
@@ -13027,7 +14669,7 @@ public sealed class MainForm : Form
                 rightPadding,
                 ScaleChromeLogical(5));
             findBar.ColumnStyles[1].Width = matchWidth;
-            for (var index = 2; index <= 4; index++) findBar.ColumnStyles[index].Width = buttonWidth;
+            for (var index = 2; index <= 5; index++) findBar.ColumnStyles[index].Width = buttonWidth;
         }
         finally
         {
@@ -13320,7 +14962,12 @@ public sealed class MainForm : Form
             .TakeWhile(tab => tab.IsPinned && !tab.IsStartPage)
             .Count();
         state.RecentlyClosed = isPrivateMode ? [] : closedTabs.ToList();
-        if (!isPrivateMode) state.WindowPlacement = CaptureCurrentWindowPlacement();
+        if (!isPrivateMode)
+        {
+            state.WindowPlacement = CaptureCurrentWindowPlacement();
+            SyncRecentDownloadsToState(scheduleSave: false);
+            state.CleanShutdown = markCleanShutdownOnSave;
+        }
 
         var activeIndex = activeTab is null ? -1 : restorableTabs.IndexOf(activeTab);
         state.ActiveTabIndex = activeIndex >= 0 ? activeIndex : null;
@@ -13378,16 +15025,15 @@ public sealed class MainForm : Form
             && activeDownloadCount > 0
             && e.CloseReason is CloseReason.UserClosing or CloseReason.ApplicationExitCall)
         {
-            var answer = MessageBox.Show(
+            var confirmCancelDownloads = NativeAlertDialog.Confirm(
                 this,
+                "Exit and cancel downloads?",
                 activeDownloadCount == 1
                     ? "One download is still in progress. Exiting now will cancel it."
                     : $"{activeDownloadCount} downloads are still in progress. Exiting now will cancel them.",
-                "Exit and cancel downloads?",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Warning,
-                MessageBoxDefaultButton.Button2);
-            if (answer != DialogResult.Yes)
+                "Exit and cancel",
+                "Keep downloading");
+            if (!confirmCancelDownloads)
             {
                 e.Cancel = true;
                 ShowDownloadsPopup();
@@ -13396,24 +15042,25 @@ public sealed class MainForm : Form
             }
         }
 
+        if (!isPrivateMode) markCleanShutdownOnSave = true;
         var sessionSaved = !persistStateOnClose
             || (browserProcessRestartApproved && browserProcessRestartStateSaved)
             || SaveStateNow();
         if (!sessionSaved
             && e.CloseReason is CloseReason.UserClosing or CloseReason.ApplicationExitCall)
         {
-            var answer = MessageBox.Show(
+            var confirmExitWithoutSave = NativeAlertDialog.Confirm(
                 this,
-                "MishaWeb could not save your current tabs and window settings. Exiting anyway may restore an older session the next time you open MishaWeb.",
                 "Exit without saving this session?",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Warning,
-                MessageBoxDefaultButton.Button2);
-            if (answer != DialogResult.Yes)
+                "MishaWeb could not save your current tabs and window settings. Exiting anyway may restore an older session the next time you open MishaWeb.",
+                "Exit anyway",
+                "Stay open");
+            if (!confirmExitWithoutSave)
             {
+                markCleanShutdownOnSave = false;
                 e.Cancel = true;
                 ScheduleStateSave();
-                ShowTransientStatus("Exit canceled — MishaWeb will retry saving your session");
+                ShowTransientStatus("Exit canceled \u2014 MishaWeb will retry saving your session");
                 ResetChromeStoreInstallCancellationAfterCanceledClose();
                 return;
             }
@@ -13436,6 +15083,7 @@ public sealed class MainForm : Form
         statusUiTimer.Stop();
         downloadUiTimer.Stop();
         downloadGraceTimer.Stop();
+        downloadNotification?.Dismiss();
         if (isPrivateMode)
         {
             downloads.Clear();
@@ -13498,6 +15146,7 @@ public sealed class MainForm : Form
             StopFrameSetupQueue();
             if (tabs.Count > 0) DisposeAllTabs();
             else InvalidateBrowserEnvironment();
+            ClearFaviconCache();
             SystemEvents.UserPreferenceChanged -= OnSystemPreferenceChanged;
             memoryTimer.Dispose();
             stateSaveTimer.Dispose();
@@ -13521,6 +15170,8 @@ public sealed class MainForm : Form
             permissionPrompt?.Dispose();
             permissionManager?.Dispose();
             downloadsPopup?.Dispose();
+            downloadNotification?.Dispose();
+            notificationDownloadEntry = null;
             extensionsManager?.Dispose();
             DisposeExtensionProfileController();
             chromeStoreInstallCancellation.Dispose();
@@ -13782,6 +15433,167 @@ public sealed class MainForm : Form
             set => colorTable.HighContrast = value;
         }
 
+        protected override void Initialize(ToolStrip toolStrip)
+        {
+            base.Initialize(toolStrip);
+            if (toolStrip is ToolStripDropDown dropDown)
+            {
+                NativeUiTheme.ApplyMenuWindowFrame(dropDown);
+            }
+        }
+
+        protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
+        {
+            if (e.ToolStrip is null || e.ToolStrip.Width <= 2 || e.ToolStrip.Height <= 2) return;
+            var borderColor = HighContrast
+                ? SystemColors.WindowText
+                : Color.FromArgb(156, NativeUiTheme.Border);
+            using var pen = new Pen(borderColor, 1f);
+            e.Graphics.DrawRectangle(
+                pen,
+                0,
+                0,
+                e.ToolStrip.Width - 1,
+                e.ToolStrip.Height - 1);
+        }
+
+        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+        {
+            if (e.Item is null || !e.Item.Enabled || (!e.Item.Selected && !e.Item.Pressed)) return;
+            if (e.Item.Width <= 6 || e.Item.Height <= 4) return;
+
+            if (HighContrast)
+            {
+                using var hcBrush = new SolidBrush(SystemColors.Highlight);
+                e.Graphics.FillRectangle(
+                    hcBrush,
+                    new Rectangle(2, 1, Math.Max(1, e.Item.Width - 4), Math.Max(1, e.Item.Height - 2)));
+                return;
+            }
+
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            var pillBounds = new RectangleF(
+                4f,
+                1.5f,
+                Math.Max(1f, e.Item.Width - 8f),
+                Math.Max(1f, e.Item.Height - 3f));
+            using var pillPath = NativeUiTheme.CreateRoundedPath(pillBounds, 6f);
+            using var fillBrush = new LinearGradientBrush(
+                pillBounds,
+                Color.FromArgb(e.Item.Pressed ? 204 : 162, 134, 54, 112),
+                Color.FromArgb(e.Item.Pressed ? 172 : 124, 72, 24, 66),
+                LinearGradientMode.Vertical);
+            e.Graphics.FillPath(fillBrush, pillPath);
+
+            var state = e.Graphics.Save();
+            try
+            {
+                e.Graphics.SetClip(pillPath, CombineMode.Intersect);
+                var sheenRect = new RectangleF(
+                    pillBounds.X,
+                    pillBounds.Y,
+                    pillBounds.Width,
+                    Math.Max(2f, pillBounds.Height * 0.46f));
+                using var sheenBrush = new LinearGradientBrush(
+                    sheenRect,
+                    Color.FromArgb(52, 255, 255, 255),
+                    Color.FromArgb(0, 255, 232, 246),
+                    LinearGradientMode.Vertical);
+                e.Graphics.FillRectangle(sheenBrush, sheenRect);
+            }
+            finally
+            {
+                e.Graphics.Restore(state);
+            }
+
+            using var rimPen = new Pen(Color.FromArgb(148, NativeUiTheme.Focus), 0.9f);
+            e.Graphics.DrawPath(rimPen, pillPath);
+        }
+
+        protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
+        {
+            if (e.Item is null || e.Item.Width <= 24) return;
+            var lineY = e.Item.Height / 2f;
+            var color = HighContrast
+                ? SystemColors.WindowText
+                : Color.FromArgb(96, NativeUiTheme.Border);
+            using var pen = new Pen(color, 1f);
+            e.Graphics.DrawLine(pen, 12f, lineY, e.Item.Width - 12f, lineY);
+        }
+
+        protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e)
+        {
+            var rect = e.ImageRectangle;
+            if (rect.Width <= 2 || rect.Height <= 2) return;
+
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            var badgeSize = Math.Min(16f, Math.Min(rect.Width, rect.Height));
+            var badgeRect = new RectangleF(
+                rect.X + ((rect.Width - badgeSize) / 2f),
+                rect.Y + ((rect.Height - badgeSize) / 2f),
+                badgeSize,
+                badgeSize);
+            using var badgePath = NativeUiTheme.CreateRoundedPath(badgeRect, 4.5f);
+            if (HighContrast)
+            {
+                using var hcFill = new SolidBrush(SystemColors.Highlight);
+                e.Graphics.FillPath(hcFill, badgePath);
+            }
+            else
+            {
+                using var fill = new SolidBrush(Color.FromArgb(74, NativeUiTheme.Accent));
+                e.Graphics.FillPath(fill, badgePath);
+                using var rim = new Pen(Color.FromArgb(186, NativeUiTheme.Accent), 1f);
+                e.Graphics.DrawPath(rim, badgePath);
+            }
+
+            var checkColor = HighContrast ? SystemColors.HighlightText : NativeUiTheme.Accent;
+            using var checkPen = new Pen(checkColor, 1.75f)
+            {
+                StartCap = LineCap.Round,
+                EndCap = LineCap.Round,
+                LineJoin = LineJoin.Round
+            };
+            var left = new PointF(badgeRect.Left + (badgeSize * 0.24f), badgeRect.Top + (badgeSize * 0.54f));
+            var mid = new PointF(badgeRect.Left + (badgeSize * 0.44f), badgeRect.Top + (badgeSize * 0.74f));
+            var right = new PointF(badgeRect.Left + (badgeSize * 0.78f), badgeRect.Top + (badgeSize * 0.28f));
+            e.Graphics.DrawLines(checkPen, [left, mid, right]);
+        }
+
+        protected override void OnRenderArrow(ToolStripArrowRenderEventArgs e)
+        {
+            var rect = e.ArrowRectangle;
+            if (rect.Width <= 2 || rect.Height <= 2) return;
+
+            var disabled = e.Item is { Enabled: false };
+            var selected = e.Item is { Selected: true };
+            var color = HighContrast
+                ? disabled ? SystemColors.GrayText : selected ? SystemColors.HighlightText : SystemColors.MenuText
+                : disabled ? NativeUiTheme.Muted : selected ? NativeUiTheme.Text : NativeUiTheme.SecondaryText;
+
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using var pen = new Pen(color, 1.55f)
+            {
+                StartCap = LineCap.Round,
+                EndCap = LineCap.Round,
+                LineJoin = LineJoin.Round
+            };
+            var cx = rect.Left + (rect.Width / 2f);
+            var cy = rect.Top + (rect.Height / 2f);
+            var rx = 2.6f;
+            var ry = 4.0f;
+            PointF[] points = e.Direction switch
+            {
+                ArrowDirection.Left => [new(cx + rx, cy - ry), new(cx - rx, cy), new(cx + rx, cy + ry)],
+                ArrowDirection.Up => [new(cx - ry, cy + rx), new(cx, cy - rx), new(cx + ry, cy + rx)],
+                ArrowDirection.Down => [new(cx - ry, cy - rx), new(cx, cy + rx), new(cx + ry, cy - rx)],
+                _ => [new(cx - rx, cy - ry), new(cx + rx, cy), new(cx - rx, cy + ry)]
+            };
+            e.Graphics.DrawLines(pen, points);
+        }
+
         protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
         {
             if (HighContrast)
@@ -13789,6 +15601,12 @@ public sealed class MainForm : Form
                 e.TextColor = !e.Item.Enabled
                     ? SystemColors.GrayText
                     : e.Item.Selected ? SystemColors.HighlightText : SystemColors.MenuText;
+            }
+            else
+            {
+                e.TextColor = !e.Item.Enabled
+                    ? NativeUiTheme.Muted
+                    : e.Item.Selected ? NativeUiTheme.Text : NativeUiTheme.SecondaryText;
             }
             base.OnRenderItemText(e);
         }
@@ -13823,7 +15641,11 @@ public sealed class MainForm : Form
         Downloads,
         Menu,
         NewTab,
-        TabList
+        TabList,
+        MatchCase,
+        FindPrevious,
+        FindNext,
+        FindClose
     }
 
     private sealed class ChromeButton : Button
@@ -13834,6 +15656,7 @@ public sealed class MainForm : Form
         private static readonly Color FocusStrokeColor = NativeUiTheme.Focus;
         private bool isHovered;
         private bool isPressed;
+        private bool isActiveToggle;
         private ChromeIconKind iconKind;
         private string glyphState = string.Empty;
 
@@ -13875,6 +15698,17 @@ public sealed class MainForm : Form
         public int CornerRadius { get; set; } = 10;
         public bool HighContrast { get; set; }
         public bool IsOmniboxEmbedded { get; set; }
+
+        public bool IsActiveToggle
+        {
+            get => isActiveToggle;
+            set
+            {
+                if (isActiveToggle == value) return;
+                isActiveToggle = value;
+                Invalidate();
+            }
+        }
 
         protected override void OnTextChanged(EventArgs e)
         {
@@ -13955,7 +15789,7 @@ public sealed class MainForm : Form
                 surfaceBounds.Inflate(-2f, -2f);
             }
             using var surfacePath = CreateRoundedPath(surfaceBounds, Scale(IsOmniboxEmbedded ? Math.Min(CornerRadius, 8) : CornerRadius));
-            var highlighted = HighContrast && Enabled && (isPressed || isHovered);
+            var highlighted = HighContrast && Enabled && (isPressed || isHovered || isActiveToggle);
             if (HighContrast)
             {
                 if (highlighted)
@@ -13966,30 +15800,34 @@ public sealed class MainForm : Form
             }
             else if (IsOmniboxEmbedded)
             {
-                if (Enabled && (isPressed || isHovered))
+                if (Enabled && (isPressed || isHovered || isActiveToggle))
                 {
                     using var pillBrush = new LinearGradientBrush(
                         surfaceBounds,
-                        Color.FromArgb(isPressed ? 168 : 112, 128, 52, 106),
-                        Color.FromArgb(isPressed ? 132 : 82, 74, 24, 66),
+                        Color.FromArgb(isPressed ? 168 : isActiveToggle ? 156 : 112, 128, 52, 106),
+                        Color.FromArgb(isPressed ? 132 : isActiveToggle ? 124 : 82, 74, 24, 66),
                         LinearGradientMode.Vertical);
                     e.Graphics.FillPath(pillBrush, surfacePath);
                 }
             }
             else if (Enabled)
             {
-                var topAlpha = isPressed ? 196 : isHovered ? 148 : 42;
-                var bottomAlpha = isPressed ? 164 : isHovered ? 114 : 18;
+                var topAlpha = isPressed ? 196 : isActiveToggle ? 186 : isHovered ? 148 : 42;
+                var bottomAlpha = isPressed ? 164 : isActiveToggle ? 156 : isHovered ? 114 : 18;
                 var topFill = isPressed
                     ? Color.FromArgb(topAlpha, 148, 58, 118)
-                    : isHovered
-                        ? Color.FromArgb(topAlpha, 122, 48, 98)
-                        : Color.FromArgb(topAlpha, 255, 224, 244);
+                    : isActiveToggle
+                        ? Color.FromArgb(topAlpha, 174, 52, 122)
+                        : isHovered
+                            ? Color.FromArgb(topAlpha, 122, 48, 98)
+                            : Color.FromArgb(topAlpha, 255, 224, 244);
                 var bottomFill = isPressed
                     ? Color.FromArgb(bottomAlpha, 76, 28, 66)
-                    : isHovered
-                        ? Color.FromArgb(bottomAlpha, 64, 22, 58)
-                        : Color.FromArgb(bottomAlpha, 168, 72, 134);
+                    : isActiveToggle
+                        ? Color.FromArgb(bottomAlpha, 104, 28, 78)
+                        : isHovered
+                            ? Color.FromArgb(bottomAlpha, 64, 22, 58)
+                            : Color.FromArgb(bottomAlpha, 168, 72, 134);
                 using var glassFill = new LinearGradientBrush(
                     surfaceBounds,
                     topFill,
@@ -14004,13 +15842,13 @@ public sealed class MainForm : Form
                     Math.Max(2f, surfaceBounds.Height * 0.44f));
                 using var specBrush = new LinearGradientBrush(
                     specRect,
-                    Color.FromArgb(isPressed ? 68 : isHovered ? 74 : 44, 255, 255, 255),
+                    Color.FromArgb(isPressed ? 68 : isHovered || isActiveToggle ? 74 : 44, 255, 255, 255),
                     Color.FromArgb(0, 255, 232, 246),
                     LinearGradientMode.Vertical);
                 e.Graphics.FillRectangle(specBrush, specRect);
             }
 
-            if (Enabled && (HighContrast ? (isHovered || isPressed || (Focused && ShowFocusCues)) : (!IsOmniboxEmbedded || isHovered || isPressed || (Focused && ShowFocusCues))))
+            if (Enabled && (HighContrast ? (isHovered || isPressed || isActiveToggle || (Focused && ShowFocusCues)) : (!IsOmniboxEmbedded || isHovered || isPressed || isActiveToggle || (Focused && ShowFocusCues))))
             {
                 if (HighContrast)
                 {
@@ -14023,10 +15861,10 @@ public sealed class MainForm : Form
                 {
                     using var rimBrush = new LinearGradientBrush(
                         surfaceBounds,
-                        Color.FromArgb(Focused && ShowFocusCues ? 230 : isHovered || isPressed ? 195 : 78, 255, 228, 246),
-                        Color.FromArgb(Focused && ShowFocusCues ? 175 : isHovered || isPressed ? 108 : 26, NativeUiTheme.Accent),
+                        Color.FromArgb(Focused && ShowFocusCues ? 230 : isActiveToggle ? 218 : isHovered || isPressed ? 195 : 78, 255, 228, 246),
+                        Color.FromArgb(Focused && ShowFocusCues ? 175 : isActiveToggle ? 196 : isHovered || isPressed ? 108 : 26, NativeUiTheme.Accent),
                         LinearGradientMode.Vertical);
-                    using var border = new Pen(rimBrush, Focused && ShowFocusCues ? Scale(1.35f) : Scale(0.9f));
+                    using var border = new Pen(rimBrush, (Focused && ShowFocusCues) || isActiveToggle ? Scale(1.35f) : Scale(0.9f));
                     e.Graphics.DrawPath(border, surfacePath);
                 }
             }
@@ -14173,6 +16011,17 @@ public sealed class MainForm : Form
                             new PointF(center.X + (bounds.Width * 0.2f), center.Y + (bounds.Height * 0.12f))
                         ]);
                     graphics.DrawLine(pen, bounds.Left + (bounds.Width * 0.15f), bounds.Bottom - (bounds.Height * 0.08f), bounds.Right - (bounds.Width * 0.15f), bounds.Bottom - (bounds.Height * 0.08f));
+                    if (text.Equals("active", StringComparison.Ordinal))
+                    {
+                        var dotSize = Math.Max(4f, 5f * scale);
+                        using var badgeBrush = new SolidBrush(HighContrast ? SystemColors.Highlight : NativeUiTheme.Accent);
+                        graphics.FillEllipse(
+                            badgeBrush,
+                            bounds.Right - dotSize,
+                            bounds.Top,
+                            dotSize,
+                            dotSize);
+                    }
                     break;
                     case ChromeIconKind.Menu:
                     {
@@ -14208,6 +16057,58 @@ public sealed class MainForm : Form
                                 new PointF(center.X, center.Y + halfHeight),
                                 new PointF(center.X + halfWidth, center.Y - halfHeight)
                             ]);
+                    }
+                    break;
+                case ChromeIconKind.MatchCase:
+                    {
+                        using var caseFont = new Font(
+                            "Segoe UI Semibold",
+                            Math.Max(7.5f, 9.2f * scale),
+                            FontStyle.Regular);
+                        TextRenderer.DrawText(
+                            graphics,
+                            "Aa",
+                            caseFont,
+                            ClientRectangle,
+                            color,
+                            TextFormatFlags.HorizontalCenter
+                            | TextFormatFlags.VerticalCenter
+                            | TextFormatFlags.NoPadding
+                            | TextFormatFlags.NoPrefix
+                            | TextFormatFlags.SingleLine);
+                    }
+                    break;
+                case ChromeIconKind.FindPrevious:
+                    {
+                        var halfWidth = bounds.Width * 0.28f;
+                        var halfHeight = bounds.Height * 0.16f;
+                        graphics.DrawLines(
+                            pen,
+                            [
+                                new PointF(center.X - halfWidth, center.Y + halfHeight),
+                                new PointF(center.X, center.Y - halfHeight),
+                                new PointF(center.X + halfWidth, center.Y + halfHeight)
+                            ]);
+                    }
+                    break;
+                case ChromeIconKind.FindNext:
+                    {
+                        var halfWidth = bounds.Width * 0.28f;
+                        var halfHeight = bounds.Height * 0.16f;
+                        graphics.DrawLines(
+                            pen,
+                            [
+                                new PointF(center.X - halfWidth, center.Y - halfHeight),
+                                new PointF(center.X, center.Y + halfHeight),
+                                new PointF(center.X + halfWidth, center.Y - halfHeight)
+                            ]);
+                    }
+                    break;
+                case ChromeIconKind.FindClose:
+                    {
+                        var arm = bounds.Width * 0.26f;
+                        graphics.DrawLine(pen, center.X - arm, center.Y - arm, center.X + arm, center.Y + arm);
+                        graphics.DrawLine(pen, center.X + arm, center.Y - arm, center.X - arm, center.Y + arm);
                     }
                     break;
             }
@@ -14334,6 +16235,162 @@ public sealed class MainForm : Form
             path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
             path.CloseFigure();
             return path;
+        }
+    }
+
+    private sealed class PillActionButton : Button
+    {
+        private bool isHovered;
+        private bool isPressed;
+
+        public PillActionButton()
+        {
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint
+                | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.Opaque
+                | ControlStyles.ResizeRedraw
+                | ControlStyles.UserPaint,
+                true);
+            UseMnemonic = false;
+        }
+
+        public bool PrivateMode { get; set; }
+        public bool HighContrast { get; set; }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            isHovered = true;
+            Invalidate();
+            base.OnMouseEnter(e);
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            isHovered = false;
+            isPressed = false;
+            Invalidate();
+            base.OnMouseLeave(e);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (Enabled && e.Button == MouseButtons.Left) isPressed = true;
+            Invalidate();
+            base.OnMouseDown(e);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            isPressed = false;
+            Invalidate();
+            base.OnMouseUp(e);
+        }
+
+        protected override void OnGotFocus(EventArgs e)
+        {
+            base.OnGotFocus(e);
+            Invalidate();
+        }
+
+        protected override void OnLostFocus(EventArgs e)
+        {
+            base.OnLostFocus(e);
+            isPressed = false;
+            Invalidate();
+        }
+
+        protected override void OnEnabledChanged(EventArgs e)
+        {
+            base.OnEnabledChanged(e);
+            isPressed = false;
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(Parent?.BackColor ?? BackColor);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.CompositingQuality = CompositingQuality.HighQuality;
+            e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
+            var bounds = new RectangleF(1f, 1f, Math.Max(2f, Width - 2f), Math.Max(2f, Height - 2f));
+            var radius = Math.Max(6f, bounds.Height / 2f);
+            using var pillPath = NativeUiTheme.CreateRoundedPath(bounds, radius);
+            var useHighContrast = HighContrast || SystemInformation.HighContrast;
+
+            if (useHighContrast)
+            {
+                var highlighted = Enabled && (isHovered || isPressed);
+                using var hcFill = new SolidBrush(highlighted ? SystemColors.Highlight : SystemColors.Control);
+                e.Graphics.FillPath(hcFill, pillPath);
+                using var hcBorder = new Pen(
+                    Focused && ShowFocusCues ? SystemColors.Highlight : SystemColors.WindowText,
+                    Focused && ShowFocusCues ? 2f : 1f);
+                e.Graphics.DrawPath(hcBorder, pillPath);
+                TextRenderer.DrawText(
+                    e.Graphics,
+                    Text,
+                    Font,
+                    ClientRectangle,
+                    !Enabled ? SystemColors.GrayText : highlighted ? SystemColors.HighlightText : SystemColors.ControlText,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+                return;
+            }
+
+            var topColor = !Enabled
+                ? NativeUiTheme.Surface
+                : isPressed
+                    ? (PrivateMode ? Color.FromArgb(182, 118, 224) : NativeUiTheme.AccentPressed)
+                    : isHovered
+                        ? (PrivateMode ? Color.FromArgb(232, 168, 255) : NativeUiTheme.AccentHover)
+                        : (PrivateMode ? NativeUiTheme.Lavender : NativeUiTheme.Accent);
+            var bottomColor = !Enabled
+                ? NativeUiTheme.Chrome
+                : isPressed
+                    ? (PrivateMode ? Color.FromArgb(148, 86, 194) : Color.FromArgb(204, 72, 130))
+                    : isHovered
+                        ? (PrivateMode ? Color.FromArgb(208, 134, 248) : NativeUiTheme.BrandCoral)
+                        : (PrivateMode ? Color.FromArgb(186, 112, 232) : Color.FromArgb(240, 102, 152));
+
+            using (var fill = new LinearGradientBrush(bounds, topColor, bottomColor, LinearGradientMode.Vertical))
+            {
+                e.Graphics.FillPath(fill, pillPath);
+            }
+
+            if (Enabled)
+            {
+                var state = e.Graphics.Save();
+                try
+                {
+                    e.Graphics.SetClip(pillPath, CombineMode.Intersect);
+                    var gloss = new RectangleF(bounds.X, bounds.Y, bounds.Width, Math.Max(4f, bounds.Height * 0.45f));
+                    using var glossBrush = new LinearGradientBrush(
+                        gloss,
+                        Color.FromArgb(isPressed ? 48 : 88, 255, 255, 255),
+                        Color.FromArgb(0, 255, 240, 248),
+                        LinearGradientMode.Vertical);
+                    e.Graphics.FillRectangle(glossBrush, gloss);
+                }
+                finally
+                {
+                    e.Graphics.Restore(state);
+                }
+            }
+
+            var borderColor = Focused && ShowFocusCues
+                ? Color.White
+                : Color.FromArgb(Enabled ? 196 : 80, 255, 236, 248);
+            using var rim = new Pen(borderColor, Focused && ShowFocusCues ? 1.6f : 1f);
+            e.Graphics.DrawPath(rim, pillPath);
+
+            TextRenderer.DrawText(
+                e.Graphics,
+                Text,
+                Font,
+                ClientRectangle,
+                Enabled ? ForeColor : NativeUiTheme.Muted,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
         }
     }
 
@@ -14744,9 +16801,11 @@ public sealed class MainForm : Form
 
     private sealed class BrowserTab : IDisposable
     {
+        private const int MaximumRecentBlockedHosts = 20;
         private bool disposed;
         private readonly Dictionary<CoreWebView2Frame, FrameEventSubscription> frameSubscriptions = [];
         private readonly List<Action> coreEventUnsubscribers = [];
+        private readonly List<string> recentBlockedHosts = [];
 
         public BrowserTab(
             Panel host,
@@ -14810,8 +16869,13 @@ public sealed class MainForm : Form
                 && (MicrophoneAllowedOrigins.Contains(origin) || CameraAllowedOrigins.Contains(origin));
         }
         public bool IsMuted { get; set; }
+        public bool? TabMuteOverride { get; set; }
         public bool IsAudible { get; set; }
         public bool ReaderModeActive { get; set; }
+        public int SavedScrollY { get; set; }
+        public int PendingRestoreScrollY { get; set; }
+        public string? LoadedFaviconHostKey { get; set; }
+        public long LoadedFaviconVersion { get; set; }
         public bool SupportsMemoryUsageTarget { get; set; } = true;
         public CoreWebView2MemoryUsageTargetLevel? MemoryUsageTargetLevel { get; set; }
         public bool CanScriptClose { get; set; }
@@ -14819,6 +16883,11 @@ public sealed class MainForm : Form
         public string ExternalNavigationStatus { get; set; } = string.Empty;
         public ConnectionState ConnectionState { get; set; } = ConnectionState.Unknown;
         public int BlockedRequestCount { get; set; }
+        public int BlockedAdCount { get; private set; }
+        public int BlockedTrackerCount { get; private set; }
+        public int BlockedScriptCount { get; private set; }
+        public int BlockedOtherCount { get; private set; }
+        public IReadOnlyList<string> RecentBlockedHosts => recentBlockedHosts;
         public int ActiveDownloads { get; set; }
         public string? ExtensionOriginId { get; set; }
         public string? ChromeStoreInstallChannel { get; set; }
@@ -14858,9 +16927,66 @@ public sealed class MainForm : Form
         public EventHandler<object>? FindActiveMatchIndexChangedHandler { get; set; }
         public long FindRequestGeneration { get; set; }
         public string FindQuery { get; set; } = string.Empty;
+        public bool FindCaseSensitive { get; set; }
         public bool FindUsingNativeApi { get; set; }
         public Func<Task>? RetryAction { get; set; }
         public Task<bool>? InitializationTask { get; set; }
+
+        internal void RecordBlockedAttempt(AdBlockMatchResult evaluation)
+        {
+            if (!evaluation.Blocked) return;
+            RecordBlockedHost(evaluation.Host, evaluation.Category);
+        }
+
+        internal void RecordBlockedHost(string? host, string category)
+        {
+            BlockedRequestCount++;
+            if (string.Equals(category, "Ad", StringComparison.OrdinalIgnoreCase))
+            {
+                BlockedAdCount++;
+            }
+            else if (string.Equals(category, "Tracker", StringComparison.OrdinalIgnoreCase))
+            {
+                BlockedTrackerCount++;
+            }
+            else if (string.Equals(category, "Script", StringComparison.OrdinalIgnoreCase))
+            {
+                BlockedScriptCount++;
+            }
+            else
+            {
+                BlockedOtherCount++;
+            }
+
+            if (string.IsNullOrWhiteSpace(host)) return;
+            var normalized = host.Trim();
+            for (var index = 0; index < recentBlockedHosts.Count; index++)
+            {
+                if (string.Equals(recentBlockedHosts[index], normalized, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (index == 0) return;
+                    recentBlockedHosts.RemoveAt(index);
+                    recentBlockedHosts.Insert(0, normalized);
+                    return;
+                }
+            }
+
+            if (recentBlockedHosts.Count >= MaximumRecentBlockedHosts)
+            {
+                recentBlockedHosts.RemoveAt(recentBlockedHosts.Count - 1);
+            }
+            recentBlockedHosts.Insert(0, normalized);
+        }
+
+        internal void ResetBlockedStats()
+        {
+            BlockedRequestCount = 0;
+            BlockedAdCount = 0;
+            BlockedTrackerCount = 0;
+            BlockedScriptCount = 0;
+            BlockedOtherCount = 0;
+            recentBlockedHosts.Clear();
+        }
 
         internal bool TryTrackFrame(CoreWebView2Frame frame, FrameEventSubscription subscription)
         {
@@ -14980,6 +17106,8 @@ public sealed class MainForm : Form
             AdBlockControlChannel = null;
             ChromeStoreInstallChannel = null;
             ContextLinkTarget = null;
+            LoadedFaviconHostKey = null;
+            recentBlockedHosts.Clear();
 
             if (view is not null)
             {
@@ -15095,11 +17223,14 @@ public sealed class MainForm : Form
 
     private sealed class TabHeader : UserControl
     {
+        private static readonly Font TabMonogramFont = new("Segoe UI Semibold", 8f, FontStyle.Bold);
         private readonly ToolTip toolTip;
         private bool isSelected;
         private bool isHovered;
         private bool isCloseHovered;
         private bool isClosePressed;
+        private bool isAudioHovered;
+        private bool isAudioPressed;
         private bool isSuspended;
         private bool isLoading;
         private bool isDiscarded;
@@ -15113,6 +17244,9 @@ public sealed class MainForm : Form
         private bool isMaximized;
         private Point pointerDownScreenLocation;
         private string currentTitle = "New tab";
+        private Bitmap? faviconBitmap;
+        private string? hostMonogram;
+        private bool isWebTab;
 
         public bool IsPrivateMode { get; set; }
 
@@ -15146,6 +17280,7 @@ public sealed class MainForm : Form
             MouseLeave += (_, _) =>
             {
                 isCloseHovered = false;
+                isAudioHovered = false;
                 SetHovered(false);
             };
             MouseDown += OnPointerDown;
@@ -15176,6 +17311,7 @@ public sealed class MainForm : Form
 
         public event EventHandler? Activated;
         public event EventHandler? CloseRequested;
+        public event EventHandler? AudioToggleRequested;
         public event EventHandler<TabContextEventArgs>? ContextRequested;
         public event EventHandler<TabDragEventArgs>? DragStarted;
         public event EventHandler<TabDragEventArgs>? DragMoved;
@@ -15228,6 +17364,27 @@ public sealed class MainForm : Form
             toolTip.SetToolTip(this, tooltip);
         }
 
+        public void SetFavicon(Bitmap? ownedFavicon, string? monogram, bool webTab)
+        {
+            if (!ReferenceEquals(faviconBitmap, ownedFavicon))
+            {
+                faviconBitmap?.Dispose();
+                faviconBitmap = ownedFavicon;
+            }
+            hostMonogram = string.IsNullOrWhiteSpace(monogram) ? null : monogram;
+            isWebTab = webTab;
+            ApplyVisualState();
+        }
+
+        public void SetFaviconMetadata(string? monogram, bool webTab)
+        {
+            var normalized = string.IsNullOrWhiteSpace(monogram) ? null : monogram;
+            if (string.Equals(hostMonogram, normalized, StringComparison.Ordinal) && isWebTab == webTab) return;
+            hostMonogram = normalized;
+            isWebTab = webTab;
+            ApplyVisualState();
+        }
+
         protected override void OnResize(EventArgs e)
         {
             base.OnResize(e);
@@ -15244,6 +17401,8 @@ public sealed class MainForm : Form
         {
             if (disposing)
             {
+                faviconBitmap?.Dispose();
+                faviconBitmap = null;
                 toolTip.SetToolTip(this, string.Empty);
             }
             base.Dispose(disposing);
@@ -15271,6 +17430,19 @@ public sealed class MainForm : Form
             bounds.Inflate(3f, 3f);
             return bounds;
         }
+
+        private bool ShouldShowAudioButton() => (isAudible || isMuted) && !isDragging;
+
+        private RectangleF GetAudioButtonBounds() => new(6f, Math.Max(1f, (Height - 16f) / 2f), 16f, 16f);
+
+        private RectangleF GetAudioButtonHitBounds()
+        {
+            var bounds = GetAudioButtonBounds();
+            bounds.Inflate(2f, 4f);
+            return bounds;
+        }
+
+        private bool HasFaviconVisual() => faviconBitmap is not null || (isWebTab && !string.IsNullOrEmpty(hostMonogram));
 
         private static GraphicsPath CreateTabRoundedPath(RectangleF bounds, float radius)
         {
@@ -15409,16 +17581,51 @@ public sealed class MainForm : Form
             }
 
             var hasAudioState = isAudible || isMuted;
+            var hasFaviconVisual = HasFaviconVisual();
             if (hasAudioState)
             {
+                var audioBounds = GetAudioButtonBounds();
+                if (isAudioHovered || isAudioPressed)
+                {
+                    var pillRect = RectangleF.Inflate(audioBounds, 2f, 2f);
+                    using var hoverPath = CreateTabRoundedPath(pillRect, 6f);
+                    using var hoverFill = new SolidBrush(
+                        HighContrast
+                            ? SystemColors.Highlight
+                            : Color.FromArgb(isAudioPressed ? 196 : 132, 138, 52, 108));
+                    e.Graphics.FillPath(hoverFill, hoverPath);
+                }
+
                 var audioColor = HighContrast
-                    ? isSelected ? SystemColors.HighlightText : SystemColors.WindowText
+                    ? (isAudioHovered || isAudioPressed || isSelected) ? SystemColors.HighlightText : SystemColors.WindowText
                     : isMuted ? Color.FromArgb(244, 198, 132) : PageTextColor;
                 DrawAudioGlyph(
                     e.Graphics,
-                    new RectangleF(6f, Math.Max(1f, (Height - 16f) / 2f), 16f, 16f),
+                    audioBounds,
                     audioColor,
                     isMuted);
+
+                if (hasFaviconVisual && Width >= 115)
+                {
+                    DrawFaviconOrMonogram(
+                        e.Graphics,
+                        new RectangleF(26f, Math.Max(1f, (Height - 16f) / 2f), 16f, 16f));
+                }
+            }
+            else if (hasFaviconVisual)
+            {
+                var iconBounds = new RectangleF(8f, Math.Max(1f, (Height - 16f) / 2f), 16f, 16f);
+                DrawFaviconOrMonogram(e.Graphics, iconBounds);
+                if (isLoading || isDiscarded || isSuspended || keepAwake)
+                {
+                    var stateColor = HighContrast
+                        ? isSelected ? SystemColors.HighlightText : SystemColors.WindowText
+                        : isLoading
+                            ? AccentColor
+                            : isDiscarded ? NegativeColor : keepAwake ? PositiveColor : MutedTextColor;
+                    using var stateBrush = new SolidBrush(stateColor);
+                    e.Graphics.FillEllipse(stateBrush, iconBounds.Right - 4f, iconBounds.Bottom - 4f, 5f, 5f);
+                }
             }
             else if (isLoading || isDiscarded || isSuspended || keepAwake)
             {
@@ -15507,6 +17714,62 @@ public sealed class MainForm : Form
             }
         }
 
+        private void DrawFaviconOrMonogram(Graphics graphics, RectangleF bounds)
+        {
+            if (faviconBitmap is not null)
+            {
+                using var clipPath = CreateTabRoundedPath(bounds, 4f);
+                var state = graphics.Save();
+                try
+                {
+                    graphics.SetClip(clipPath, CombineMode.Intersect);
+                    graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    graphics.DrawImage(faviconBitmap, bounds);
+                }
+                finally
+                {
+                    graphics.Restore(state);
+                }
+                return;
+            }
+
+            if (string.IsNullOrEmpty(hostMonogram)) return;
+            using var pillPath = CreateTabRoundedPath(bounds, 5f);
+            if (HighContrast)
+            {
+                using var hcBorder = new Pen(isSelected ? SystemColors.HighlightText : SystemColors.WindowText, 1f);
+                graphics.DrawPath(hcBorder, pillPath);
+                TextRenderer.DrawText(
+                    graphics,
+                    hostMonogram,
+                    TabMonogramFont,
+                    Rectangle.Round(bounds),
+                    isSelected ? SystemColors.HighlightText : SystemColors.WindowText,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+                return;
+            }
+
+            var topTint = IsPrivateMode
+                ? Color.FromArgb(172, 120, 56, 174)
+                : Color.FromArgb(172, 142, 54, 112);
+            var bottomTint = IsPrivateMode
+                ? Color.FromArgb(188, 66, 26, 98)
+                : Color.FromArgb(188, 72, 24, 64);
+            using (var badgeBrush = new LinearGradientBrush(bounds, topTint, bottomTint, LinearGradientMode.Vertical))
+            {
+                graphics.FillPath(badgeBrush, pillPath);
+            }
+            using var badgeRim = new Pen(Color.FromArgb(145, IsPrivateMode ? NativeUiTheme.Lavender : NativeUiTheme.Focus), 0.9f);
+            graphics.DrawPath(badgeRim, pillPath);
+            TextRenderer.DrawText(
+                graphics,
+                hostMonogram,
+                TabMonogramFont,
+                Rectangle.Round(bounds),
+                PageTextColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+        }
+
         private static void DrawAudioGlyph(
             Graphics graphics,
             RectangleF bounds,
@@ -15558,10 +17821,17 @@ public sealed class MainForm : Form
 
         private void OnPointerDown(object? sender, MouseEventArgs e)
         {
-            if (e.Button != MouseButtons.Left || pointerTracking || isClosePressed) return;
+            if (e.Button != MouseButtons.Left || pointerTracking || isClosePressed || isAudioPressed) return;
             if (ShouldShowCloseButton() && GetCloseButtonHitBounds().Contains(e.Location))
             {
                 isClosePressed = true;
+                Capture = true;
+                Invalidate();
+                return;
+            }
+            if (ShouldShowAudioButton() && GetAudioButtonHitBounds().Contains(e.Location))
+            {
+                isAudioPressed = true;
                 Capture = true;
                 Invalidate();
                 return;
@@ -15577,13 +17847,15 @@ public sealed class MainForm : Form
         private void OnPointerMove(object? sender, MouseEventArgs e)
         {
             var nextCloseHover = ShouldShowCloseButton() && GetCloseButtonHitBounds().Contains(e.Location);
-            if (isCloseHovered != nextCloseHover)
+            var nextAudioHover = !nextCloseHover && ShouldShowAudioButton() && GetAudioButtonHitBounds().Contains(e.Location);
+            if (isCloseHovered != nextCloseHover || isAudioHovered != nextAudioHover)
             {
                 isCloseHovered = nextCloseHover;
+                isAudioHovered = nextAudioHover;
                 Invalidate();
             }
 
-            if (isClosePressed || !pointerTracking) return;
+            if (isClosePressed || isAudioPressed || !pointerTracking) return;
 
             var source = sender as Control ?? this;
             var screenLocation = source.PointToScreen(e.Location);
@@ -15612,6 +17884,7 @@ public sealed class MainForm : Form
         private void OnMouseCaptureChanged(object? sender, EventArgs e)
         {
             isClosePressed = false;
+            isAudioPressed = false;
             if (!pointerTracking) return;
 
             var wasDragging = dragStarted;
@@ -15631,6 +17904,18 @@ public sealed class MainForm : Form
                 Capture = false;
                 Invalidate();
                 if (insideClose) CloseRequested?.Invoke(this, EventArgs.Empty);
+                return;
+            }
+
+            if (isAudioPressed)
+            {
+                var insideAudio = e.Button == MouseButtons.Left
+                    && ShouldShowAudioButton()
+                    && GetAudioButtonHitBounds().Contains(e.Location);
+                isAudioPressed = false;
+                Capture = false;
+                Invalidate();
+                if (insideAudio) AudioToggleRequested?.Invoke(this, EventArgs.Empty);
                 return;
             }
 
@@ -15677,7 +17962,15 @@ public sealed class MainForm : Form
                 : isDragging ? NativeUiTheme.Pressed
                 : isSelected ? activeBackground
                 : isHovered ? hoverBackground : idleBackground;
-            Padding = new Padding(isAudible || isMuted ? 25 : isLoading || isDiscarded || isSuspended || keepAwake ? 20 : 10, 0, 0, 0);
+            var hasAudioState = isAudible || isMuted;
+            var hasFaviconVisual = HasFaviconVisual();
+            var showSplitFaviconWithAudio = hasAudioState && hasFaviconVisual && Width >= 115;
+            var leftPadding = hasAudioState
+                ? (showSplitFaviconWithAudio ? 45 : 25)
+                : hasFaviconVisual
+                    ? 28
+                    : (isLoading || isDiscarded || isSuspended || keepAwake ? 20 : 10);
+            Padding = new Padding(leftPadding, 0, 0, 0);
             BackColor = background;
             Invalidate();
         }

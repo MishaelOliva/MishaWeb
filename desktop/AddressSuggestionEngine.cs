@@ -4,7 +4,8 @@ internal enum AddressSuggestionSource
 {
     Bookmark,
     History,
-    Search
+    Search,
+    OpenTab
 }
 
 internal enum AddressSuggestionMatch
@@ -14,6 +15,11 @@ internal enum AddressSuggestionMatch
     Fuzzy,
     Search
 }
+
+internal readonly record struct OpenTabCandidate(
+    string Title,
+    string Url,
+    bool IsSelected);
 
 internal readonly record struct AddressSuggestion(
     int KeyboardIndex,
@@ -41,6 +47,7 @@ internal static class AddressSuggestionEngine
 
     private const int MaximumBookmarksToScan = 200;
     private const int MaximumHistoryItemsToScan = 300;
+    private const int MaximumOpenTabsToScan = 256;
     private const int MaximumQueryCharactersToMatch = 256;
     private const int MaximumTitleCharactersToMatch = 256;
     private const int MaximumUrlCharactersToMatch = 1_024;
@@ -54,6 +61,15 @@ internal static class AddressSuggestionEngine
     public static IReadOnlyList<AddressSuggestion> GetSuggestions(
         string? input,
         BrowserState state,
+        int maximumResults = DefaultResultLimit)
+    {
+        return GetSuggestions(input, state, openTabs: null, maximumResults: maximumResults);
+    }
+
+    public static IReadOnlyList<AddressSuggestion> GetSuggestions(
+        string? input,
+        BrowserState state,
+        IReadOnlyList<OpenTabCandidate>? openTabs,
         int maximumResults = DefaultResultLimit)
     {
         ArgumentNullException.ThrowIfNull(state);
@@ -80,8 +96,23 @@ internal static class AddressSuggestionEngine
         var topCandidateCount = 0;
         if (localResultLimit > 0)
         {
+            HashSet<string>? matchedOpenTabUrls = null;
+            if (openTabs is { Count: > 0 })
+            {
+                matchedOpenTabUrls = AddOpenTabCandidates(
+                    openTabs,
+                    query,
+                    topCandidates,
+                    ref topCandidateCount);
+            }
+
             foreach (var indexedCandidate in GetIndexedCandidates(state))
             {
+                if (matchedOpenTabUrls is not null && matchedOpenTabUrls.Contains(indexedCandidate.Url))
+                {
+                    continue;
+                }
+
                 AddCandidate(
                     indexedCandidate,
                     query,
@@ -96,9 +127,11 @@ internal static class AddressSuggestionEngine
         {
             var candidate = topCandidates[index];
             var isTopMatch = index == 0 && (candidate.Match == AddressSuggestionMatch.Exact || candidate.Quality <= 1);
-            var detailText = candidate.IsSearchQuery
-                ? candidate.SearchProviderName
-                : TextSafety.FormatUrlForDisplay(candidate.Url, MaximumUrlCharactersToDisplay);
+            var detailText = candidate.Source == AddressSuggestionSource.OpenTab
+                ? $"Switch to tab \u00B7 {TextSafety.FormatUrlForDisplay(candidate.Url, MaximumUrlCharactersToDisplay)}"
+                : candidate.IsSearchQuery
+                    ? candidate.SearchProviderName
+                    : TextSafety.FormatUrlForDisplay(candidate.Url, MaximumUrlCharactersToDisplay);
             var acceptText = candidate.IsSearchQuery
                 ? candidate.Title
                 : candidate.Url;
@@ -128,6 +161,80 @@ internal static class AddressSuggestionEngine
                 searchUrl);
         }
         return results;
+    }
+
+    private static HashSet<string>? AddOpenTabCandidates(
+        IReadOnlyList<OpenTabCandidate> openTabs,
+        string query,
+        Candidate[] topCandidates,
+        ref int topCandidateCount)
+    {
+        HashSet<string>? matchedUrls = null;
+        var scanCount = Math.Min(openTabs.Count, MaximumOpenTabsToScan);
+        for (var index = 0; index < scanCount; index++)
+        {
+            var tab = openTabs[index];
+            if (tab.IsSelected
+                || string.IsNullOrWhiteSpace(tab.Url)
+                || tab.Url.Length > BrowserPolicy.MaximumUrlLength
+                || tab.Url.Equals(StartPage.Url, StringComparison.OrdinalIgnoreCase)
+                || !Uri.TryCreate(tab.Url, UriKind.Absolute, out var parsedUrl)
+                || (parsedUrl.Scheme != Uri.UriSchemeHttp && parsedUrl.Scheme != Uri.UriSchemeHttps))
+            {
+                continue;
+            }
+
+            var title = string.IsNullOrWhiteSpace(tab.Title)
+                ? TextSafety.FormatUrlForDisplay(tab.Url, MaximumTitleCharactersToMatch)
+                : TextSafety.SanitizeSingleLine(tab.Title, MaximumTitleCharactersToMatch);
+            if (title.Length == 0)
+            {
+                title = TextSafety.FormatUrlForDisplay(tab.Url, MaximumTitleCharactersToMatch);
+            }
+
+            var host = parsedUrl.IdnHost;
+            if (host.StartsWith("www.", StringComparison.OrdinalIgnoreCase)) host = host[4..];
+            var isRootHost = parsedUrl.AbsolutePath.Length <= 1 && string.IsNullOrEmpty(parsedUrl.Query);
+
+            var indexed = new IndexedCandidate(
+                AddressSuggestionSource.OpenTab,
+                index,
+                title,
+                tab.Url,
+                GetUrlHash(parsedUrl),
+                AcceptedCount: 0,
+                LastAcceptedUtc: DateTimeOffset.UnixEpoch,
+                IsSearchQuery: false,
+                SearchProviderName: string.Empty,
+                host,
+                isRootHost);
+
+            var match = Classify(
+                query,
+                indexed.Title,
+                indexed.Url,
+                indexed.Host,
+                indexed.IsRootHost,
+                indexed.IsSearchQuery);
+            if (!match.IsMatch) continue;
+
+            matchedUrls ??= new HashSet<string>(BrowserPolicy.UrlComparer);
+            if (!matchedUrls.Add(indexed.Url)) continue;
+
+            var candidate = new Candidate(
+                AddressSuggestionSource.OpenTab,
+                match.Kind,
+                match.Quality,
+                indexed.SourceIndex,
+                indexed.Title,
+                indexed.Url,
+                indexed.AcceptedCount,
+                indexed.LastAcceptedUtc,
+                indexed.UrlHash);
+            AddTopCandidate(candidate, topCandidates, ref topCandidateCount);
+        }
+
+        return matchedUrls;
     }
 
     private static void AddCandidate(
@@ -618,6 +725,11 @@ internal static class AddressSuggestionEngine
     private static int CompareCandidates(Candidate left, Candidate right)
     {
         var comparison = ((int)left.Match).CompareTo((int)right.Match);
+        if (comparison != 0) return comparison;
+
+        var leftOpenTab = left.Source == AddressSuggestionSource.OpenTab;
+        var rightOpenTab = right.Source == AddressSuggestionSource.OpenTab;
+        comparison = rightOpenTab.CompareTo(leftOpenTab);
         if (comparison != 0) return comparison;
 
         comparison = right.AcceptedCount.CompareTo(left.AcceptedCount);

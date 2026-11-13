@@ -38,6 +38,12 @@ internal readonly record struct AdBlockCompileDiagnostics(
     int UnindexedGenericRegexRules,
     int DroppedRegexRules);
 
+internal readonly record struct AdBlockMatchResult(
+    bool Blocked,
+    string Category,
+    string Host,
+    string RuleKind);
+
 /// <summary>
 /// A bounded ABP/uBlock-compatible network and standard cosmetic filter engine.
 ///
@@ -49,28 +55,38 @@ internal readonly record struct AdBlockCompileDiagnostics(
 /// </summary>
 internal sealed class AdBlockEngine
 {
+    private enum FilterSourceCategory : byte
+    {
+        Unknown = 0,
+        Fallback = 1,
+        Ad = 2,
+        Privacy = 3,
+        ScriptAbuse = 4,
+        Unbreak = 5
+    }
+
     private static readonly FilterListSource[] FilterListSources =
     [
-        new("list-0.txt", new("https://easylist.to/easylist/easylist.txt")),
-        new("list-1.txt", new("https://easylist.to/easylist/easyprivacy.txt")),
-        new("list-2.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt")),
-        new("list-3.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-general.txt")),
-        new("list-4.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2026.txt")),
-        new("list-5.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/quick-fixes.txt")),
-        new("list-6.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/privacy.txt")),
-        new("list-7.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/unbreak.txt")),
-        new("list-8.txt", new("https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/brave-specific.txt")),
-        new("list-9.txt", new("https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/brave-firstparty.txt")),
-        new("list-10.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2020.txt")),
-        new("list-11.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2021.txt")),
-        new("list-12.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2022.txt")),
-        new("list-13.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2023.txt")),
-        new("list-14.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2024.txt")),
-        new("list-15.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2025.txt")),
-        new("list-16.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/ubo-link-shorteners.txt")),
-        new("list-17.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/resource-abuse.txt")),
-        new("list-18.txt", new("https://raw.githubusercontent.com/brave/adblock-lists/master/brave-unbreak.txt")),
-        new("list-19.txt", new("https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/brave-firstparty-regional.txt"))
+        new("list-0.txt", new("https://easylist.to/easylist/easylist.txt"), FilterSourceCategory.Ad),
+        new("list-1.txt", new("https://easylist.to/easylist/easyprivacy.txt"), FilterSourceCategory.Privacy),
+        new("list-2.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt"), FilterSourceCategory.Ad),
+        new("list-3.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-general.txt"), FilterSourceCategory.Ad),
+        new("list-4.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2026.txt"), FilterSourceCategory.Ad),
+        new("list-5.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/quick-fixes.txt"), FilterSourceCategory.Ad),
+        new("list-6.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/privacy.txt"), FilterSourceCategory.Privacy),
+        new("list-7.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/unbreak.txt"), FilterSourceCategory.Unbreak),
+        new("list-8.txt", new("https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/brave-specific.txt"), FilterSourceCategory.Ad),
+        new("list-9.txt", new("https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/brave-firstparty.txt"), FilterSourceCategory.Ad),
+        new("list-10.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2020.txt"), FilterSourceCategory.Ad),
+        new("list-11.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2021.txt"), FilterSourceCategory.Ad),
+        new("list-12.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2022.txt"), FilterSourceCategory.Ad),
+        new("list-13.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2023.txt"), FilterSourceCategory.Ad),
+        new("list-14.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2024.txt"), FilterSourceCategory.Ad),
+        new("list-15.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2025.txt"), FilterSourceCategory.Ad),
+        new("list-16.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/ubo-link-shorteners.txt"), FilterSourceCategory.Privacy),
+        new("list-17.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/resource-abuse.txt"), FilterSourceCategory.ScriptAbuse),
+        new("list-18.txt", new("https://raw.githubusercontent.com/brave/adblock-lists/master/brave-unbreak.txt"), FilterSourceCategory.Unbreak),
+        new("list-19.txt", new("https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/brave-firstparty-regional.txt"), FilterSourceCategory.Ad)
     ];
 
     private static readonly HttpClient HttpClient = CreateHttpClient();
@@ -237,8 +253,12 @@ internal sealed class AdBlockEngine
             "MishaWeb",
             "Filters");
         this.updateRemoteLists = updateRemoteLists;
-        baselineRuleSet = CompiledRuleSet.FromLines(
-            BuiltInFallbackRules.Concat(initialRules ?? Enumerable.Empty<string>()));
+        var taggedBaseline = BuiltInFallbackRules
+            .Select(static line => (line, FilterSourceCategory.Fallback));
+        var taggedInitial = CompiledRuleSet
+            .PreprocessLines(initialRules ?? Enumerable.Empty<string>())
+            .Select(static line => (line, FilterSourceCategory.Unknown));
+        baselineRuleSet = CompiledRuleSet.FromTaggedLines(taggedBaseline.Concat(taggedInitial));
         ruleSet = baselineRuleSet;
     }
 
@@ -397,14 +417,62 @@ internal sealed class AdBlockEngine
         AdBlockResourceType resourceType,
         bool cacheEvaluation = true)
     {
+        if (!TryResolveEvaluationUris(
+                requestUrl,
+                sourceUrl,
+                cacheEvaluation,
+                out var requestUri,
+                out var sourceUri)
+            || requestUri is null)
+        {
+            return false;
+        }
+        return ruleSet.ShouldBlock(requestUri, sourceUri, resourceType);
+    }
+
+    public AdBlockMatchResult EvaluateRequest(
+        string url,
+        string? sourceUrl,
+        string resourceType) =>
+        EvaluateRequest(url, sourceUrl, ParseResourceType(resourceType));
+
+    internal AdBlockMatchResult EvaluateRequest(
+        string url,
+        string? sourceUrl,
+        AdBlockResourceType resourceType,
+        bool cacheEvaluation = true)
+    {
+        if (!TryResolveEvaluationUris(
+                url,
+                sourceUrl,
+                cacheEvaluation,
+                out var requestUri,
+                out var sourceUri)
+            || requestUri is null)
+        {
+            return new AdBlockMatchResult(false, "None", string.Empty, "None");
+        }
+        return ruleSet.Evaluate(requestUri, sourceUri, resourceType);
+    }
+
+    private static bool TryResolveEvaluationUris(
+        string? requestUrl,
+        string? sourceUrl,
+        bool cacheEvaluation,
+        out Uri? requestUri,
+        out Uri? sourceUri)
+    {
         var requestValid = cacheEvaluation
-            ? TryGetCachedRequestUri(requestUrl, out var requestUri)
+            ? TryGetCachedRequestUri(requestUrl, out requestUri)
             : TryGetHttpUri(requestUrl, out requestUri);
-        if (!requestValid || requestUri is null) return false;
-        Uri? sourceUri;
+        if (!requestValid || requestUri is null)
+        {
+            sourceUri = null;
+            return false;
+        }
         if (cacheEvaluation) TryGetCachedSourceUri(sourceUrl, out sourceUri);
         else TryGetHttpUri(sourceUrl, out sourceUri);
-        return ruleSet.ShouldBlock(requestUri, sourceUri, resourceType);
+        return true;
     }
 
     internal string GetCosmeticCss(string pageUrl, bool cacheEvaluation = true)
@@ -482,6 +550,92 @@ internal sealed class AdBlockEngine
         };
     }
 
+    private static readonly string[] TrackerUrlSignals =
+    [
+        "analytics", "telemetry", "beacon", "tracker", "tracking",
+        "pixel", "metrics", "scorecardresearch", "quantserve"
+    ];
+
+    private static readonly string[] AdUrlSignals =
+    [
+        "doubleclick", "googlesyndication", "googleadservices", "pagead",
+        "adservice", "adsystem", "adsense", "adserver", "adroll", "criteo",
+        "taboola", "outbrain", "popads", "popcash", "adsterra", "adnxs",
+        "adform", "pubmatic", "rubiconproject", "openx", "moatads",
+        "banner", "popup", "popunder", "advert", "adunit", "://ads.",
+        ".ads.", "/ads/", "/ads.", "/ads?", "/ad/", "&ads="
+    ];
+
+    private static AdBlockResourceType ParseResourceType(string? resourceType)
+    {
+        if (string.IsNullOrWhiteSpace(resourceType)) return AdBlockResourceType.Other;
+        var trimmed = resourceType.Trim();
+        var mapped = MapResourceType(trimmed);
+        if (mapped != AdBlockResourceType.Other) return mapped;
+        return trimmed.ToLowerInvariant() switch
+        {
+            "document" => AdBlockResourceType.Document,
+            "subdocument" or "sub_frame" or "iframe" or "frame" => AdBlockResourceType.SubDocument,
+            "stylesheet" or "css" => AdBlockResourceType.Stylesheet,
+            "image" or "img" or "favicon" => AdBlockResourceType.Image,
+            "media" or "texttrack" => AdBlockResourceType.Media,
+            "font" => AdBlockResourceType.Font,
+            "script" => AdBlockResourceType.Script,
+            "xmlhttprequest" or "xhr" or "eventsource" => AdBlockResourceType.XmlHttpRequest,
+            "fetch" => AdBlockResourceType.Fetch,
+            "websocket" => AdBlockResourceType.WebSocket,
+            "ping" or "beacon" or "cspviolationreport" => AdBlockResourceType.Ping,
+            _ => AdBlockResourceType.Other
+        };
+    }
+
+    private static string ClassifyBlockCategory(
+        FilterRule matchedRule,
+        Uri requestUri,
+        AdBlockResourceType resourceType)
+    {
+        return matchedRule.SourceCategory switch
+        {
+            FilterSourceCategory.Privacy =>
+                resourceType == AdBlockResourceType.Ping || HasTrackerSignal(requestUri)
+                    ? "Tracker"
+                    : "Privacy",
+            FilterSourceCategory.ScriptAbuse => "Script",
+            FilterSourceCategory.Ad => "Ad",
+            _ => ClassifyByRuleAndRequest(matchedRule, requestUri, resourceType)
+        };
+    }
+
+    private static string ClassifyByRuleAndRequest(
+        FilterRule matchedRule,
+        Uri requestUri,
+        AdBlockResourceType resourceType)
+    {
+        if (HasAdSignal(requestUri)) return "Ad";
+        if (resourceType == AdBlockResourceType.Ping || HasTrackerSignal(requestUri))
+        {
+            return "Tracker";
+        }
+        if (resourceType == AdBlockResourceType.Script) return "Script";
+        if (matchedRule.SourceCategory == FilterSourceCategory.Fallback) return "Ad";
+        return "Network";
+    }
+
+    private static bool HasTrackerSignal(Uri requestUri) =>
+        ContainsAnySignal(requestUri.AbsoluteUri, TrackerUrlSignals);
+
+    private static bool HasAdSignal(Uri requestUri) =>
+        ContainsAnySignal(requestUri.AbsoluteUri, AdUrlSignals);
+
+    private static bool ContainsAnySignal(string value, string[] signals)
+    {
+        foreach (var signal in signals)
+        {
+            if (value.Contains(signal, StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        return false;
+    }
+
     private async Task LoadListsAsync(
         int generation,
         CancellationTokenSource generationCancellation)
@@ -490,12 +644,12 @@ internal sealed class AdBlockEngine
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var cachedFiles = GetCachedListFiles();
-            if (cachedFiles.Count > 0)
+            var cachedSources = GetCachedListSources();
+            if (cachedSources.Count > 0)
             {
                 PublishRuleSetIfCurrent(
                     generation,
-                    await CompileRuleSetAsync(cachedFiles, cancellationToken).ConfigureAwait(false));
+                    await CompileRuleSetAsync(cachedSources, cancellationToken).ConfigureAwait(false));
             }
 
             cancellationToken.ThrowIfCancellationRequested();
@@ -507,12 +661,12 @@ internal sealed class AdBlockEngine
                 if (contentChanged)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    var refreshedFiles = GetCachedListFiles();
-                    if (refreshedFiles.Count > 0)
+                    var refreshedSources = GetCachedListSources();
+                    if (refreshedSources.Count > 0)
                     {
                         PublishRuleSetIfCurrent(
                             generation,
-                            await CompileRuleSetAsync(refreshedFiles, cancellationToken).ConfigureAwait(false));
+                            await CompileRuleSetAsync(refreshedSources, cancellationToken).ConfigureAwait(false));
                     }
                 }
             }
@@ -550,10 +704,13 @@ internal sealed class AdBlockEngine
         }
     }
 
-    private List<string> GetCachedListFiles()
+    private List<string> GetCachedListFiles() =>
+        GetCachedListSources().Select(static source => source.Path).ToList();
+
+    private List<(string Path, FilterSourceCategory Category)> GetCachedListSources()
     {
         SweepAbandonedTemporaryFiles();
-        var files = new List<string>(FilterListSources.Length);
+        var sources = new List<(string Path, FilterSourceCategory Category)>(FilterListSources.Length);
         long aggregateBytes = 0;
         foreach (var source in FilterListSources)
         {
@@ -565,14 +722,14 @@ internal sealed class AdBlockEngine
                     && file.Length is > 0 and <= MaximumFilterListBytes
                     && aggregateBytes + file.Length <= MaximumAggregateFilterBytes)
                 {
-                    files.Add(path);
+                    sources.Add((path, source.Category));
                     aggregateBytes += file.Length;
                 }
             }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
         }
-        return files;
+        return sources;
     }
 
     /// <summary>
@@ -604,18 +761,19 @@ internal sealed class AdBlockEngine
         GetCachedListFiles().Select(Path.GetFileName).OfType<string>().ToArray();
 
     private Task<CompiledRuleSet> CompileRuleSetAsync(
-        IReadOnlyCollection<string> files,
+        IReadOnlyCollection<(string Path, FilterSourceCategory Category)> sources,
         CancellationToken cancellationToken) =>
-        Task.Run(() => CompiledRuleSet.FromLines(
-            BuiltInFallbackRules.Concat(ReadFilterLines(files, cancellationToken)),
-            preprocess: false,
+        Task.Run(() => CompiledRuleSet.FromTaggedLines(
+            BuiltInFallbackRules
+                .Select(static line => (line, FilterSourceCategory.Fallback))
+                .Concat(ReadFilterLines(sources, cancellationToken)),
             cancellationToken), cancellationToken);
 
-    private static IEnumerable<string> ReadFilterLines(
-        IEnumerable<string> files,
+    private static IEnumerable<(string Line, FilterSourceCategory Category)> ReadFilterLines(
+        IEnumerable<(string Path, FilterSourceCategory Category)> sources,
         CancellationToken cancellationToken)
     {
-        var sourceFiles = files.ToArray();
+        var sourceFiles = sources.ToArray();
         var remainingLines = MaximumInputFilterLines;
         for (var sourceIndex = 0; sourceIndex < sourceFiles.Length; sourceIndex++)
         {
@@ -628,8 +786,9 @@ internal sealed class AdBlockEngine
                 MaximumInputLinesPerSource,
                 Math.Max(0, remainingLines - reservedForLater));
             var acceptedFromSource = 0;
+            var source = sourceFiles[sourceIndex];
             foreach (var line in CompiledRuleSet.PreprocessLines(
-                         ReadFilterFileLines(sourceFiles[sourceIndex], cancellationToken)))
+                         ReadFilterFileLines(source.Path, cancellationToken)))
             {
                 if ((acceptedFromSource & 2047) == 0)
                 {
@@ -646,7 +805,7 @@ internal sealed class AdBlockEngine
                 if (acceptedFromSource >= sourceBudget) break;
                 acceptedFromSource++;
                 remainingLines--;
-                yield return trimmed;
+                yield return (trimmed, source.Category);
             }
         }
     }
@@ -1092,7 +1251,7 @@ internal sealed class AdBlockEngine
     private static HttpClient CreateHttpClient()
     {
         var client = new HttpClient { Timeout = TimeSpan.FromSeconds(12) };
-        client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("MishaWeb", "2.4.0"));
+        client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("MishaWeb", "2.4.1"));
         return client;
     }
 
@@ -1314,26 +1473,42 @@ internal sealed class AdBlockEngine
         public static CompiledRuleSet FromLines(
             IEnumerable<string> lines,
             bool preprocess,
+            CancellationToken cancellationToken = default) =>
+            FromTaggedLines(
+                (preprocess ? PreprocessLines(lines) : lines)
+                    .Select(static line => (line, FilterSourceCategory.Unknown)),
+                cancellationToken);
+
+        public static CompiledRuleSet FromTaggedLines(
+            IEnumerable<(string Line, FilterSourceCategory Category)> lines,
             CancellationToken cancellationToken = default)
         {
-            var materialized = new HashSet<string>(StringComparer.Ordinal);
+            var materialized = new Dictionary<string, FilterSourceCategory>(StringComparer.Ordinal);
             var processedLineCount = 0;
-            var sourceLines = preprocess ? PreprocessLines(lines) : lines;
-            foreach (var line in sourceLines)
+            foreach (var entry in lines)
             {
                 if ((processedLineCount++ & 2047) == 0)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                 }
-                var trimmed = line.Trim();
+                var trimmed = entry.Line.Trim();
                 if (trimmed.Length == 0 || trimmed[0] is '!' or '[') continue;
-                materialized.Add(trimmed);
+                if (materialized.TryGetValue(trimmed, out var existingCategory))
+                {
+                    if (existingCategory is FilterSourceCategory.Unknown or FilterSourceCategory.Fallback
+                        && entry.Category is not (FilterSourceCategory.Unknown or FilterSourceCategory.Fallback))
+                    {
+                        materialized[trimmed] = entry.Category;
+                    }
+                    continue;
+                }
+                materialized.Add(trimmed, entry.Category);
                 if (materialized.Count >= MaximumMaterializedRules) break;
             }
 
             var disabledRules = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             processedLineCount = 0;
-            foreach (var line in materialized)
+            foreach (var line in materialized.Keys)
             {
                 if ((processedLineCount++ & 2047) == 0)
                 {
@@ -1361,8 +1536,9 @@ internal sealed class AdBlockEngine
             var droppedRegexRuleCount = 0;
 
             processedLineCount = 0;
-            foreach (var line in EnumerateRulesWithRegexExceptionsFirst(materialized))
+            foreach (var entry in EnumerateRulesWithRegexExceptionsFirst(materialized))
             {
+                var line = entry.Key;
                 if ((processedLineCount++ & 2047) == 0)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -1424,7 +1600,7 @@ internal sealed class AdBlockEngine
                     droppedRegexRuleCount++;
                     continue;
                 }
-                var rule = FilterRule.Parse(line);
+                var rule = FilterRule.Parse(line, entry.Value);
                 if (rule is null)
                 {
                     if (line.Length > 0 && line[0] is not '!' and not '[')
@@ -1507,26 +1683,26 @@ internal sealed class AdBlockEngine
                     droppedRegexRuleCount));
         }
 
-        private static IEnumerable<string> EnumerateRulesWithRegexExceptionsFirst(
-            HashSet<string> materialized)
+        private static IEnumerable<KeyValuePair<string, FilterSourceCategory>> EnumerateRulesWithRegexExceptionsFirst(
+            Dictionary<string, FilterSourceCategory> materialized)
         {
             // Exception rules must consume the bounded regex budget before block
             // rules. Otherwise a list that fills the cap can silently discard a
             // later @@ rule and broaden blocking beyond the authored policy.
-            foreach (var line in materialized)
+            foreach (var entry in materialized)
             {
-                if (line.StartsWith("@@", StringComparison.Ordinal)
-                    && FilterRule.TryGetRegexPattern(line, out _))
+                if (entry.Key.StartsWith("@@", StringComparison.Ordinal)
+                    && FilterRule.TryGetRegexPattern(entry.Key, out _))
                 {
-                    yield return line;
+                    yield return entry;
                 }
             }
-            foreach (var line in materialized)
+            foreach (var entry in materialized)
             {
-                if (!line.StartsWith("@@", StringComparison.Ordinal)
-                    || !FilterRule.TryGetRegexPattern(line, out _))
+                if (!entry.Key.StartsWith("@@", StringComparison.Ordinal)
+                    || !FilterRule.TryGetRegexPattern(entry.Key, out _))
                 {
-                    yield return line;
+                    yield return entry;
                 }
             }
         }
@@ -1598,8 +1774,50 @@ internal sealed class AdBlockEngine
             bool Condition,
             bool ElseSeen);
 
-        public bool ShouldBlock(Uri requestUri, Uri? sourceUri, AdBlockResourceType resourceType)
+        public bool ShouldBlock(Uri requestUri, Uri? sourceUri, AdBlockResourceType resourceType) =>
+            TryEvaluate(requestUri, sourceUri, resourceType, out _, out _);
+
+        public AdBlockMatchResult Evaluate(
+            Uri requestUri,
+            Uri? sourceUri,
+            AdBlockResourceType resourceType)
         {
+            var blocked = TryEvaluate(
+                requestUri,
+                sourceUri,
+                resourceType,
+                out var matchedRule,
+                out var matchedException);
+            if (!blocked || matchedRule is null)
+            {
+                return new AdBlockMatchResult(
+                    Blocked: false,
+                    Category: "None",
+                    Host: requestUri.IdnHost,
+                    RuleKind: matchedException ? "Exception" : "None");
+            }
+
+            var ruleKind = matchedRule.IsRegex
+                ? "Regex"
+                : matchedRule.IsHostAnchored
+                    ? "HostAnchored"
+                    : "Pattern";
+            return new AdBlockMatchResult(
+                Blocked: true,
+                Category: ClassifyBlockCategory(matchedRule, requestUri, resourceType),
+                Host: requestUri.IdnHost,
+                RuleKind: ruleKind);
+        }
+
+        private bool TryEvaluate(
+            Uri requestUri,
+            Uri? sourceUri,
+            AdBlockResourceType resourceType,
+            out FilterRule? matchedRule,
+            out bool matchedException)
+        {
+            matchedRule = null;
+            matchedException = false;
             var suppressGenericBlocking = false;
             if (sourceUri is not null)
             {
@@ -1613,7 +1831,6 @@ internal sealed class AdBlockEngine
 
             var thirdParty = sourceUri is null
                 || !AreSameSite(requestUri.Host, sourceUri.Host);
-            var matchedBlock = false;
             var matchedImportantBlock = false;
             foreach (var rule in blocks.GetCandidates(requestUri))
             {
@@ -1623,17 +1840,23 @@ internal sealed class AdBlockEngine
                     continue;
                 }
 
-                matchedBlock = true;
+                matchedRule ??= rule;
                 if (!rule.Important) continue;
+                matchedRule = rule;
                 matchedImportantBlock = true;
                 break;
             }
-            if (!matchedBlock) return false;
+            if (matchedRule is null) return false;
 
             foreach (var rule in exceptions.GetCandidates(requestUri))
             {
                 if (matchedImportantBlock && !rule.Important) continue;
-                if (rule.Matches(requestUri, sourceUri, resourceType, thirdParty)) return false;
+                if (rule.Matches(requestUri, sourceUri, resourceType, thirdParty))
+                {
+                    matchedRule = rule;
+                    matchedException = true;
+                    return false;
+                }
             }
             return true;
         }
@@ -2243,6 +2466,7 @@ internal sealed class AdBlockEngine
         private readonly string? hostPathPattern;
         private readonly string? networkPattern;
         private readonly bool useHostAndPathTarget;
+        private readonly FilterSourceCategory sourceCategory;
 
         private FilterRule(
             string pattern,
@@ -2260,7 +2484,8 @@ internal sealed class AdBlockEngine
             string[] excludedTargetDomains,
             bool thirdPartyOnly,
             bool firstPartyOnly,
-            bool matchCase)
+            bool matchCase,
+            FilterSourceCategory sourceCategory)
         {
             IndexHost = host;
             hostAnchoredRule = host is not null;
@@ -2276,6 +2501,7 @@ internal sealed class AdBlockEngine
             ThirdPartyOnly = thirdPartyOnly;
             FirstPartyOnly = firstPartyOnly;
             this.matchCase = matchCase;
+            this.sourceCategory = sourceCategory;
             IndexKey = regex is not null
                 ? regexIndexKey
                 : ExtractIndexKey(pattern);
@@ -2324,6 +2550,8 @@ internal sealed class AdBlockEngine
         public bool FirstPartyOnly { get; }
         public bool IsGeneric => includedDomains.Length == 0 && excludedDomains.Length == 0;
         public bool IsRegex => regex is not null;
+        public bool IsHostAnchored => hostAnchoredRule;
+        public FilterSourceCategory SourceCategory => sourceCategory;
         public bool HasRegexIndex => IsRegex && IndexKey is not null;
         public bool HasRestrictiveSourceDomainScope => includedDomains.Length > 0;
 
@@ -2333,7 +2561,9 @@ internal sealed class AdBlockEngine
             IndexHost = null;
         }
 
-        public static FilterRule? Parse(string? input)
+        public static FilterRule? Parse(
+            string? input,
+            FilterSourceCategory sourceCategory = FilterSourceCategory.Unknown)
         {
             if (string.IsNullOrWhiteSpace(input)) return null;
             var line = input.Trim();
@@ -2529,7 +2759,8 @@ internal sealed class AdBlockEngine
                 ToDomainArray(excludedTargetDomains),
                 thirdPartyOnly,
                 firstPartyOnly,
-                matchCase);
+                matchCase,
+                sourceCategory);
         }
 
         public bool Matches(
@@ -3129,5 +3360,5 @@ internal sealed class AdBlockEngine
         string? EntityTag,
         DateTimeOffset? LastModified);
 
-    private sealed record FilterListSource(string FileName, Uri Uri);
+    private sealed record FilterListSource(string FileName, Uri Uri, FilterSourceCategory Category);
 }

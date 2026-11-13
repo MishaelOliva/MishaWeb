@@ -224,6 +224,12 @@ internal sealed class VoiceAudioSettingsDialog : Form
 
         Controls.Add(root);
         NativeUiTheme.Apply(this, okButton);
+        NativeUiTheme.ConfigureModernListBox(
+            siteListBox,
+            46,
+            (index, _) => BuildHostRowVisual(index));
+        sectionDescription.ForeColor = NativeUiTheme.MutedText;
+        SystemColorsChanged += (_, _) => sectionDescription.ForeColor = NativeUiTheme.MutedText;
 
         OnSectionChanged();
         UpdateButtonStates();
@@ -399,12 +405,10 @@ internal sealed class VoiceAudioSettingsDialog : Form
             var normalized = BrowserPolicy.NormalizeExactHost(rawInput);
             if (normalized is null)
             {
-                MessageBox.Show(
+                NativeAlertDialog.ShowInfo(
                     this,
-                    "Please enter a valid hostname (e.g. example.com).",
                     "Invalid host",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
+                    "Please enter a valid hostname (e.g. example.com).");
                 return;
             }
 
@@ -449,12 +453,12 @@ internal sealed class VoiceAudioSettingsDialog : Form
     private void OnClearList()
     {
         var targetListName = listTypePicker.SelectedItem?.ToString() ?? "sites";
-        if (MessageBox.Show(
+        if (NativeAlertDialog.Confirm(
             this,
-            $"Remove all hosts from {targetListName}?",
             "Clear list",
-            MessageBoxButtons.YesNo,
-            MessageBoxIcon.Question) == DialogResult.Yes)
+            $"Remove all hosts from {targetListName}?",
+            confirmText: "Clear",
+            cancelText: "Cancel"))
         {
             GetActiveHostList().Clear();
             PopulateSiteList();
@@ -481,14 +485,41 @@ internal sealed class VoiceAudioSettingsDialog : Form
             }
             catch
             {
-                MessageBox.Show(
+                NativeAlertDialog.ShowInfo(
                     this,
-                    $"Could not open Windows settings. Please open Windows Settings manually to configure device hardware.",
                     "Settings",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
+                    "Could not open Windows settings. Please open Windows Settings manually to configure device hardware.");
             }
         }
+    }
+
+    private ModernListRowVisual BuildHostRowVisual(int index)
+    {
+        var hosts = GetActiveHostList();
+        if (index < 0 || index >= hosts.Count)
+        {
+            return new ModernListRowVisual(string.Empty, string.Empty, string.Empty);
+        }
+
+        var host = hosts[index];
+        var isAllowedList = listTypePicker.SelectedIndex == 0;
+        var statusColor = isAllowedList ? NativeUiTheme.Positive : NativeUiTheme.Negative;
+        var statusText = isAllowedList
+            ? "Allowed"
+            : IsAudioOutputSection ? "Muted" : "Blocked";
+        var detail = IsAudioOutputSection
+            ? (isAllowedList ? "Sound output allowed" : "Sound output suppressed")
+            : (isAllowedList ? "Microphone access allowed" : "Microphone access blocked");
+        var glyph = string.IsNullOrWhiteSpace(host)
+            ? "S"
+            : char.ToUpperInvariant(host.TrimStart()[0]).ToString();
+        return new ModernListRowVisual(
+            host,
+            detail,
+            glyph,
+            statusColor,
+            StatusText: statusText,
+            StatusColor: statusColor);
     }
 
     private void ApplyChanges(bool close)
