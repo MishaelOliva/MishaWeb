@@ -11,9 +11,10 @@ MishaWeb 2.5.0 is a compact native Windows browser built with WinForms and the i
 - Native smart command bar with local favorites/history suggestions and a consistent Google search action
 - Allocation-light local suggestion index that rebuilds only when favorites, history, dismissals, or learned ranking data changes
 - Responsive low-glare toolbar, tabs, menus, and focus states
-- Tabs, middle-click close, duplicate/close-others menu, and reopen-closed-tab
+- Tabs, middle-click close, duplicate/close-others menu, reopen-closed-tab, per-tab site favicons, clickable tab-header audio mute indicators, and Picture-in-Picture support
+- Multi-View workspace (`Single`, `Split`, `Tri`, `Quad`) with draggable horizontal and vertical splitters, per-pane header bars, unique pane-to-tab assignment, and persisted split ratios
 - Text-only command palette with bounded local ranking, MRU tab switching, and persistent pinned tabs
-- Native named sessions, restart-persistent recently closed tabs, and lazy 64-tab session restoration
+- Native named sessions, restart-persistent recently closed tabs, unclean-shutdown tab restoration prompt, and lazy 64-tab session restoration
 - Bare-domain, localhost, IP-address, and search-aware address parsing
 - Back, forward, reload/stop, home, in-page find, zoom, and fullscreen
 - Exact-origin microphone and camera controls, voice and audio input/output settings with strict whitelist policies, saved-permission management, and Windows device/privacy-settings shortcuts
@@ -24,11 +25,11 @@ MishaWeb 2.5.0 is a compact native Windows browser built with WinForms and the i
 - Searchable tab switcher and a saved-items dialog that never loads WebView2 or favicons
 - Private windows with isolated WebView2 InPrivate profiles and no MishaWeb-managed history, favorites, pins, extensions, or session persistence
 - Anchored site information and exact-host shield exceptions with reload guidance
-- Adaptive download popup with pause/resume, open, reveal, cancel, copy-address, remove, and folder actions
+- Adaptive download popup with pause/resume, open, reveal, cancel, copy-address, remove, and folder actions, plus a non-activating download notification toast below the toolbar Downloads button, high-risk executable prompts, and persisted recent download history
 - Native browser-extension manager with Chrome Web Store URL/ID import, local CRX/ZIP and unpacked-package loading, enable/disable, removal, and popup/options access
 - Native print support and PNG viewport capture without an extra renderer or capture library
 - Balanced WebView2 tracking prevention plus EasyList, EasyPrivacy, uBO, and Brave-aligned network and cosmetic filtering
-- Bounded blocker URI/suffix caches, allocation-free candidate traversal, compile diagnostics, and conditional HTTP list refresh
+- Bounded blocker URI/suffix caches, binary compiled-rule snapshot cache (`compiled-rules-v1.bin`), per-request rule attribution, allocation-free candidate traversal, compile diagnostics, and conditional HTTP list refresh
 - Document-start YouTube protection for first-party player ad metadata, feed/player cosmetics, skip controls, and guarded SSAP markers
 - Standard Memory Saver keeps the three most recently used ordinary sites ready without automatic discard or reload, then releases older inactive pages on a bounded schedule
 - Ultra-light may suspend those three recent sites without refreshing them, while discard-first pressure handling trims only older eligible pages and skips audible, downloading, and explicitly protected work
@@ -84,7 +85,7 @@ The earlier lightweight user-script feature remains separate. Place top-level `.
 
 ## Search and privacy
 
-The start page opens with focus in the smart command bar. Empty input shows `SEARCH OR OPEN A SITE`; search terms show Google and `Search`; recognized addresses show `OPEN WEBSITE` and `Open`. Suggestions are local only—MishaWeb never fetches autocomplete or favicons. Typing never replaces unfinished text with a history URL: press `Enter` to submit exactly what you typed, or use `Up` / `Down` and then `Enter` to explicitly open a local suggestion. Search text always uses Google, while complete addresses still open directly. The toolbar omnibox remains available through `Ctrl+L` and `F6`.
+The start page opens with focus in the smart command bar. Empty input shows `SEARCH OR OPEN A SITE`; search terms show Google and `Search`; recognized addresses show `OPEN WEBSITE` and `Open`. Local suggestions cover history, favorites, and open tabs without network access, while optional live search suggestions can be toggled in settings and are disabled in private windows. Typing never replaces unfinished text with a history URL: press `Enter` to submit exactly what you typed, or use `Up` / `Down` and then `Enter` to explicitly open a suggestion. Search text always uses Google, while complete addresses still open directly. The toolbar omnibox remains available through `Ctrl+L` and `F6`.
 
 `Ctrl+Shift+N` opens a private window. Private windows use a dedicated WebView2 InPrivate profile, application defaults, an empty in-memory saved-data view, and no normal-profile extensions or user scripts. MishaWeb does not save their tabs, history, favorites, pins, shield exceptions, or preferences. Downloads, captures, printing, clipboard use, and external applications can still leave data outside the private window.
 
