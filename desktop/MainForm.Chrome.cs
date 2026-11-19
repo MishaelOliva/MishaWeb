@@ -16,12 +16,15 @@ public sealed partial class MainForm
         base.OnHandleCreated(e);
         NativeMethods.ApplyBorderlessResizableStyle(Handle);
         NativeUiTheme.ApplyWindowFrame(this);
-        var palette = ResolveChromeColorPolicy(IsHighContrastActive, isPrivateMode);
-        NativeMethods.TryEnableModernWindowFrame(
-            Handle,
-            palette.ChromeSurface,
-            palette.WindowFrameBorder,
-            palette.WindowFrameText);
+        if (!IsHighContrastActive)
+        {
+            var palette = ResolveChromeColorPolicy(false, isPrivateMode);
+            NativeMethods.TryEnableModernWindowFrame(
+                Handle,
+                palette.ChromeSurface,
+                palette.WindowFrameBorder,
+                palette.WindowFrameText);
+        }
     }
 
     protected override void OnDpiChanged(DpiChangedEventArgs e)
@@ -202,8 +205,26 @@ public sealed partial class MainForm
     private void CheckApplicationInactivity()
     {
         if (isClosing || isWindowMinimized || activeTab is null) return;
+        var threshold = TimeSpan.FromMinutes(AppIdleThresholdMinutes);
+        if (IsHandleCreated
+            && NativeMethods.TryGetLastInputIdleTime(out var osIdleDuration)
+            && osIdleDuration < threshold
+            && NativeMethods.IsForegroundWindowOwnedOrChild(Handle))
+        {
+            var observedInteractionUtc = DateTime.UtcNow - osIdleDuration;
+            if (observedInteractionUtc > lastUserInteractionUtc)
+            {
+                lastUserInteractionUtc = observedInteractionUtc;
+            }
+            if (isAppIdleLowPowerActive)
+            {
+                isAppIdleLowPowerActive = false;
+                ApplyLiveTabMemoryTarget(activeTab, foreground: true);
+            }
+            return;
+        }
         var idleDuration = DateTime.UtcNow - lastUserInteractionUtc;
-        if (idleDuration >= TimeSpan.FromMinutes(AppIdleThresholdMinutes) && !isAppIdleLowPowerActive)
+        if (idleDuration >= threshold && !isAppIdleLowPowerActive)
         {
             isAppIdleLowPowerActive = true;
             ApplyLiveTabMemoryTarget(activeTab, foreground: false);
@@ -507,11 +528,18 @@ public sealed partial class MainForm
 
         if (IsHandleCreated)
         {
-            NativeMethods.TryEnableModernWindowFrame(
-                Handle,
-                palette.ChromeSurface,
-                palette.WindowFrameBorder,
-                palette.WindowFrameText);
+            if (palette.HighContrast)
+            {
+                NativeUiTheme.ApplyWindowFrame(this);
+            }
+            else
+            {
+                NativeMethods.TryEnableModernWindowFrame(
+                    Handle,
+                    palette.ChromeSurface,
+                    palette.WindowFrameBorder,
+                    palette.WindowFrameText);
+            }
         }
         Invalidate(true);
     }
@@ -862,7 +890,7 @@ public sealed partial class MainForm
             Dock = DockStyle.Fill,
             Margin = Padding.Empty,
             Padding = new Padding(3, 0, 3, 0),
-            ColumnCount = 4,
+            ColumnCount = 3,
             RowCount = 1
         };
         TrySetBackColor(omniboxLayout, Color.Transparent, OmniboxColor);
@@ -1264,7 +1292,10 @@ public sealed partial class MainForm
             if (WindowState == FormWindowState.Minimized) downloadNotification?.Dismiss();
             else RepositionDownloadNotification();
             TrackWindowPlacementChange();
-            RunUiTask(HandleWindowStateChangeAsync, "Could not change tab power state");
+            if ((WindowState == FormWindowState.Minimized) != isWindowMinimized)
+            {
+                RunUiTask(HandleWindowStateChangeAsync, "Could not change tab power state");
+            }
         };
         LocationChanged += (_, _) =>
         {
@@ -2747,7 +2778,7 @@ public sealed partial class MainForm
 
     private void HandleMruKeyUp(KeyEventArgs e)
     {
-        if (e.KeyCode == Keys.Control && mruSnapshot is not null)
+        if (e.KeyCode == Keys.ControlKey && mruSnapshot is not null)
         {
             mruSwitcher?.CommitSelection();
         }

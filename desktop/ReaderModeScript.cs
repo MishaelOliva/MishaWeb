@@ -7,13 +7,13 @@ internal static class ReaderModeScript
     public const string Toggle = """
 (() => {
   const id = '__misha_reader_overlay';
-  const priorOverflow = document.documentElement?.dataset?.mishaReaderOverflow;
   const existing = document.getElementById(id);
   if (existing) {
+    const savedOverflow = document.documentElement?.dataset?.mishaReaderOverflow;
     if (typeof existing.__mishaCleanup === 'function') existing.__mishaCleanup();
     existing.remove();
     if (document.documentElement) {
-      document.documentElement.style.overflow = priorOverflow ?? '';
+      document.documentElement.style.overflow = savedOverflow ?? '';
       delete document.documentElement.dataset.mishaReaderOverflow;
     }
     return true;
@@ -39,7 +39,7 @@ internal static class ReaderModeScript
     const text = (element.innerText || '').trim();
     let linkCharacters = 0;
     for (const anchor of element.querySelectorAll('a')) {
-      linkCharacters += (anchor.innerText || '').length;
+      linkCharacters += (anchor.textContent ?? anchor.innerText ?? '').length;
     }
     const paragraphs = element.querySelectorAll('p').length;
     const headings = element.querySelectorAll('h1,h2,h3').length;
@@ -58,9 +58,29 @@ internal static class ReaderModeScript
   }
   if (((winner.innerText || '').trim()).length < 320) return false;
   const clone = winner.cloneNode(true);
-  clone.querySelectorAll('script,style,form,button,input,select,textarea,nav,aside,header,footer,dialog,iframe,video,audio,canvas,[role="navigation"],[role="dialog"]').forEach(node => node.remove());
+  clone.querySelectorAll('script,style,form,button,input,select,textarea,nav,aside,header,footer,dialog,iframe,video,audio,canvas,object,embed,base,meta,link,[role="navigation"],[role="dialog"]').forEach(node => node.remove());
+  const stripInlineEvents = (el) => {
+    if (!el?.attributes) return;
+    for (let i = el.attributes.length - 1; i >= 0; i--) {
+      const attr = el.attributes[i];
+      if (attr && /^on/i.test(attr.name)) el.removeAttribute(attr.name);
+    }
+  };
+  stripInlineEvents(clone);
+  clone.querySelectorAll('*').forEach(stripInlineEvents);
   clone.querySelectorAll('[id]').forEach(node => node.removeAttribute('id'));
-  clone.querySelectorAll('a[href]').forEach(a => { try { a.href = new URL(a.getAttribute('href'), location.href).href; } catch (_) {} });
+  clone.querySelectorAll('a[href]').forEach(a => {
+    try {
+      const resolved = new URL(a.getAttribute('href'), location.href);
+      if (resolved.protocol === 'http:' || resolved.protocol === 'https:') {
+        a.href = resolved.href;
+      } else {
+        a.removeAttribute('href');
+      }
+    } catch (_) {
+      a.removeAttribute('href');
+    }
+  });
   clone.querySelectorAll('img[src]').forEach(img => { try { img.src = new URL(img.getAttribute('src'), location.href).href; } catch (_) {} });
   const text = (clone.innerText || '').trim();
   if (text.length < 240) return false;
@@ -121,7 +141,7 @@ internal static class ReaderModeScript
   try {
     if (typeof localStorage !== 'undefined') {
       const saved = JSON.parse(localStorage.getItem(prefKey) || 'null');
-      if (saved && themes[saved.theme]) prefs.theme = saved.theme;
+      if (saved && typeof saved.theme === 'string' && Object.hasOwn(themes, saved.theme)) prefs.theme = saved.theme;
       if (saved && Number.isInteger(saved.fontIndex) && saved.fontIndex >= 0 && saved.fontIndex < fontSteps.length) prefs.fontIndex = saved.fontIndex;
       if (saved && (saved.width === 'compact' || saved.width === 'wide')) prefs.width = saved.width;
     }
@@ -132,7 +152,23 @@ internal static class ReaderModeScript
     } catch (_) {}
   };
 
-  const wordCount = text.split(/\s+/).filter(Boolean).length;
+  let wordCount = 0;
+  let inWord = false;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    const isSpace = code <= 32
+      || code === 160
+      || (code >= 0x2000 && code <= 0x200B)
+      || code === 0x2028
+      || code === 0x2029
+      || code === 0x3000;
+    if (isSpace) {
+      inWord = false;
+    } else if (!inWord) {
+      inWord = true;
+      wordCount++;
+    }
+  }
   const readMinutes = Math.max(1, Math.round(wordCount / 220));
 
   const overlay = document.createElement('div');
@@ -152,10 +188,11 @@ internal static class ReaderModeScript
   content.querySelectorAll('img').forEach(img => { img.style.maxWidth = '100%'; img.style.height = 'auto'; img.style.borderRadius = '10px'; });
 
   const closeReader = () => {
+    const savedOverflow = document.documentElement?.dataset?.mishaReaderOverflow;
     if (typeof overlay.__mishaCleanup === 'function') overlay.__mishaCleanup();
     overlay.remove();
     if (document.documentElement) {
-      document.documentElement.style.overflow = priorOverflow ?? '';
+      document.documentElement.style.overflow = savedOverflow ?? '';
       delete document.documentElement.dataset.mishaReaderOverflow;
     }
   };

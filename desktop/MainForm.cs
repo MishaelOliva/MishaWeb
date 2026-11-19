@@ -334,11 +334,13 @@ public sealed partial class MainForm : Form
     private bool browserRuntimeUpdateAvailable;
     private MruSwitcherSnapshot<BrowserTab>? mruSnapshot;
     private bool openingMruSwitcher;
+    private static readonly Lazy<Icon> SharedWindowIcon = new(() =>
+        System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application);
     private const int MaximumCachedFaviconHosts = 64;
-    private readonly Dictionary<string, LinkedListNode<(string Host, Bitmap Icon)>> faviconCacheMap =
+    private readonly Dictionary<string, LinkedListNode<(string Host, Bitmap Icon, int Version)>> faviconCacheMap =
         new(StringComparer.OrdinalIgnoreCase);
-    private readonly LinkedList<(string Host, Bitmap Icon)> faviconCacheOrder = new();
-    private long faviconCacheVersion = 1;
+    private readonly LinkedList<(string Host, Bitmap Icon, int Version)> faviconCacheOrder = new();
+    private int faviconVersionSequence;
     private bool findMatchCase;
     private long findOpenGeneration;
     private long findBoxEditGeneration;
@@ -368,8 +370,19 @@ public sealed partial class MainForm : Form
             : Path.GetFullPath(webViewUserDataFolderOverride);
         persistStateOnClose = startBrowserOnShown && !isPrivateMode;
         browserStartupCompleted = !startBrowserOnShown;
-        state = previewState ?? (!isPrivateMode && startBrowserOnShown ? stateStore.Load() : new BrowserState());
-        BrowserStateStore.NormalizeForPersistence(state);
+        if (previewState is not null)
+        {
+            state = previewState;
+            BrowserStateStore.NormalizeForPersistence(state);
+        }
+        else if (!isPrivateMode && startBrowserOnShown)
+        {
+            state = stateStore.Load();
+        }
+        else
+        {
+            state = new BrowserState();
+        }
         priorUncleanShutdown = !isPrivateMode
             && startBrowserOnShown
             && previewState is null
@@ -394,8 +407,11 @@ public sealed partial class MainForm : Form
         darkModeEnabled = state.DarkModeEnabled;
         adBlockEnabled = state.AdBlockEnabled;
 
-        incognitoBadge = new IncognitoBadgeControl(toolTip);
-        incognitoBadge.Click += (_, _) => ShowTransientStatus("Incognito mode: browsing history and data will not be saved");
+        incognitoBadge = isPrivateMode ? new IncognitoBadgeControl(toolTip) : null!;
+        if (isPrivateMode)
+        {
+            incognitoBadge.Click += (_, _) => ShowTransientStatus("Incognito mode: browsing history and data will not be saved");
+        }
 
         Text = isPrivateMode ? "Incognito \u2014 MishaWeb" : "MishaWeb";
         StartPosition = FormStartPosition.Manual;
@@ -423,8 +439,7 @@ public sealed partial class MainForm : Form
         normalWindowState = FormWindowState.Normal;
         BackColor = NativeUiTheme.BrandWine;
         Padding = new Padding(1);
-        Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath)
-            ?? SystemIcons.Application;
+        Icon = SharedWindowIcon.Value;
         FormBorderStyle = FormBorderStyle.None;
         AutoScaleDimensions = new SizeF(96f, 96f);
         AutoScaleMode = AutoScaleMode.Dpi;
@@ -579,6 +594,29 @@ public sealed partial class MainForm : Form
 
     internal bool IsPrivateBrowserWindow => isPrivateMode;
     internal bool IsClosingForApplicationContext => Volatile.Read(ref isClosing);
+    internal bool IsWindowMinimizedForApplicationContext => Volatile.Read(ref isWindowMinimized);
+    internal bool IsPrivateCleanupInProgressForApplicationContext => Volatile.Read(ref privateCleanupInProgress);
+
+    internal void CollectForegroundFrameIds(HashSet<uint> target)
+    {
+        if (isClosing || IsDisposed || isWindowMinimized) return;
+        foreach (var tab in tabs)
+        {
+            if (tab.IsClosed || !IsTabForegroundForLifecycle(tab)) continue;
+            if (tab.Core is not { } core) continue;
+            try
+            {
+                var frameId = core.FrameId;
+                if (frameId != 0) target.Add(frameId);
+            }
+            catch (Exception error) when (
+                error is InvalidOperationException
+                    or COMException
+                    or ObjectDisposedException)
+            {
+            }
+        }
+    }
 
     internal Program.BrowserRestartWindowState CaptureBrowserRestartWindowState() =>
         new(
@@ -1019,10 +1057,23 @@ public sealed partial class MainForm : Form
         return stateStore.Save(state);
     }
 
+    private void StopAllTimers()
+    {
+        memoryTimer.Stop();
+        stateSaveTimer.Stop();
+        transientStatusTimer.Stop();
+        addressSuggestionTimer.Stop();
+        findDebounceTimer.Stop();
+        statusUiTimer.Stop();
+        downloadUiTimer.Stop();
+        downloadGraceTimer.Stop();
+    }
+
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
     {
         if (isClosing) return;
         if (privateCleanupInProgress
+            && !browserProcessRestartApproved
             && e.CloseReason is CloseReason.UserClosing or CloseReason.ApplicationExitCall)
         {
             e.Cancel = true;
@@ -1091,6 +1142,7 @@ public sealed partial class MainForm : Form
         if (isPrivateMode
             && !privateCleanupCompleted
             && !browserProcessRestartApproved
+            && !Program.HasOtherOpenPrivateWindows(this)
             && e.CloseReason is CloseReason.UserClosing or CloseReason.ApplicationExitCall)
         {
             var privateCore = tabs.Select(item => item.Core).FirstOrDefault(item => item is not null);
@@ -1098,10 +1150,7 @@ public sealed partial class MainForm : Form
             {
                 foreach (var download in downloads) DetachDownloadHandlers(download);
                 downloads.Clear();
-                memoryTimer.Stop();
-                stateSaveTimer.Stop();
-                addressSuggestionTimer.Stop();
-                findDebounceTimer.Stop();
+                StopAllTimers();
                 downloadNotification?.Dismiss();
                 e.Cancel = true;
                 privateCleanupInProgress = true;
@@ -1139,20 +1188,15 @@ public sealed partial class MainForm : Form
         CancelAllPendingPermissionRequests();
         DetachBrowserVersionAvailableHandler();
         foreach (var download in downloads) DetachDownloadHandlers(download);
-        memoryTimer.Stop();
-        stateSaveTimer.Stop();
-        transientStatusTimer.Stop();
-        addressSuggestionTimer.Stop();
-        findDebounceTimer.Stop();
-        statusUiTimer.Stop();
-        downloadUiTimer.Stop();
-        downloadGraceTimer.Stop();
+        StopAllTimers();
         downloadNotification?.Dismiss();
         if (isPrivateMode)
         {
             downloads.Clear();
             var privateCore = tabs.Select(item => item.Core).FirstOrDefault(item => item is not null);
-            if (privateCore is not null && !privateCleanupCompleted)
+            if (privateCore is not null
+                && !privateCleanupCompleted
+                && !Program.HasOtherOpenPrivateWindows(this))
             {
                 try { _ = privateCore.Profile.ClearBrowsingDataAsync(CoreWebView2BrowsingDataKinds.AllProfile); }
                 catch { }
@@ -1164,6 +1208,7 @@ public sealed partial class MainForm : Form
     private void DisposeAllTabs()
     {
         CancelTabDrag();
+        activeTabBeforeDrag = null;
         StopFrameSetupQueue();
         activeTab = null;
         workerAdBlockFilterOwner = null;
@@ -1220,7 +1265,12 @@ public sealed partial class MainForm : Form
             statusUiTimer.Dispose();
             downloadUiTimer.Dispose();
             downloadGraceTimer.Dispose();
+            ClearAndDisposeMenuItems(extensionsMenuItem.DropDownItems);
             appMenu.Dispose();
+            if (incognitoBadge is { IsDisposed: false, Parent: null })
+            {
+                incognitoBadge.Dispose();
+            }
             tabMenu.Dispose();
             tabListMenu.Dispose();
             siteInfoMenu.Dispose();
@@ -1318,7 +1368,9 @@ public sealed partial class MainForm : Form
     internal static bool IsAllowedExternalNavigation(string value, bool userInitiated)
     {
         if (!userInitiated
+            || string.IsNullOrWhiteSpace(value)
             || value.Length > BrowserPolicy.MaximumUrlLength
+            || value.Any(char.IsControl)
             || !Uri.TryCreate(value, UriKind.Absolute, out var uri))
         {
             return false;
@@ -1328,6 +1380,7 @@ public sealed partial class MainForm : Form
         // schemes are handled inside Chromium/WebView2 (or represent network
         // transports), so treating them as external could let a replacement
         // document retain the previous HTTPS address in MishaWeb's omnibox.
+        // High-risk Windows OS protocols are also blocked.
         return uri.Scheme.ToLowerInvariant() is not (
             "about"
             or "blob"
@@ -1346,11 +1399,19 @@ public sealed partial class MainForm : Form
             or "file"
             or "filesystem"
             or "ftp"
+            or "hcp"
             or "http"
             or "https"
             or "isolated-app"
             or "javascript"
+            or "mhtml"
             or "ms-browser-extension"
+            or "ms-cxh"
+            or "ms-msdt"
+            or "ms-officecmd"
+            or "ms-settings"
+            or "search-ms"
+            or "shell"
             or "urn"
             or "view-source"
             or "vbscript"

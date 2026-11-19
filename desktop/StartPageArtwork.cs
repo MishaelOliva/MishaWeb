@@ -37,6 +37,7 @@ internal static class StartPageArtwork
     private const long NormalCacheByteBudget = 12L * 1024 * 1024;
     private const long LowSpecCacheByteBudget = 4L * 1024 * 1024;
     private const long LowSpecSourceCooldownMs = 3_000;
+    private static readonly Lazy<bool> IsLowSpecProcess = new(() => SystemResourceInfo.CaptureMemory().IsLowSpecMachine);
     private static readonly object BackdropFrameSync = new();
     private static readonly List<BackdropCacheEntry> BackdropCache = new(MaximumCachedFrames);
     private static long backdropCacheBytes;
@@ -217,8 +218,7 @@ internal static class StartPageArtwork
 
     private static BackdropCacheEntry? EnsureBackdropFrame(Size viewportSize, float dpiX, float dpiY)
     {
-        var memory = SystemResourceInfo.CaptureMemory();
-        var isLowSpec = memory.IsLowSpecMachine;
+        var isLowSpec = IsLowSpecProcess.Value;
         var clampedDpiX = Math.Clamp((int)Math.Round(dpiX), 48, 768);
         var clampedDpiY = Math.Clamp((int)Math.Round(dpiY), 48, 768);
 
@@ -308,10 +308,18 @@ internal static class StartPageArtwork
             targetBytes = entryBytes;
         }
 
-        targetBitmap.SetResolution(frameDpiX, frameDpiY);
-        using (var frameGraphics = Graphics.FromImage(targetBitmap))
+        try
         {
-            DrawBackdropDirect(frameGraphics, new Rectangle(Point.Empty, frameSize));
+            targetBitmap.SetResolution(frameDpiX, frameDpiY);
+            using (var frameGraphics = Graphics.FromImage(targetBitmap))
+            {
+                DrawBackdropDirect(frameGraphics, new Rectangle(Point.Empty, frameSize));
+            }
+        }
+        catch
+        {
+            targetBitmap.Dispose();
+            throw;
         }
 
         backdropSourceLastUsedTick = Environment.TickCount64;
@@ -485,11 +493,19 @@ internal static class StartPageArtwork
                 useEmbeddedColorManagement: false,
                 validateImageData: false);
             var rgb = new Bitmap(decoded.Width, decoded.Height, PixelFormat.Format24bppRgb);
-            rgb.SetResolution(decoded.HorizontalResolution, decoded.VerticalResolution);
-            using var graphics = Graphics.FromImage(rgb);
-            graphics.CompositingMode = CompositingMode.SourceCopy;
-            graphics.DrawImageUnscaledAndClipped(decoded, new Rectangle(Point.Empty, decoded.Size));
-            return rgb;
+            try
+            {
+                rgb.SetResolution(decoded.HorizontalResolution, decoded.VerticalResolution);
+                using var graphics = Graphics.FromImage(rgb);
+                graphics.CompositingMode = CompositingMode.SourceCopy;
+                graphics.DrawImageUnscaledAndClipped(decoded, new Rectangle(Point.Empty, decoded.Size));
+                return rgb;
+            }
+            catch
+            {
+                rgb.Dispose();
+                throw;
+            }
         }
         catch
         {
@@ -550,7 +566,7 @@ internal static class StartPageArtwork
             bounds.Top + 0.5f,
             Math.Max(1f, bounds.Width - 1f),
             Math.Max(1f, bounds.Height - 1f));
-        using var path = CreateRoundedPath(markBounds, Math.Min(bounds.Width, bounds.Height) * 0.28f);
+        using var path = NativeUiTheme.CreateRoundedPath(markBounds, Math.Min(bounds.Width, bounds.Height) * 0.28f);
 
         if (SystemInformation.HighContrast)
         {
@@ -585,8 +601,8 @@ internal static class StartPageArtwork
             markBounds.Top + (markBounds.Height * 0.13f),
             markBounds.Width * 0.19f,
             markBounds.Height * 0.43f);
-        using var leftEarPath = CreateRoundedPath(leftEar, leftEar.Width / 2f);
-        using var rightEarPath = CreateRoundedPath(rightEar, rightEar.Width / 2f);
+        using var leftEarPath = NativeUiTheme.CreateRoundedPath(leftEar, leftEar.Width / 2f);
+        using var rightEarPath = NativeUiTheme.CreateRoundedPath(rightEar, rightEar.Width / 2f);
         using var bunnyBrush = new SolidBrush(bunnyColor);
         graphics.FillPath(bunnyBrush, leftEarPath);
         graphics.FillPath(bunnyBrush, rightEarPath);
@@ -645,7 +661,7 @@ internal static class StartPageArtwork
             bounds.Top + 0.5f,
             Math.Max(1f, bounds.Width - 1f),
             Math.Max(1f, bounds.Height - 1f));
-        using var path = CreateRoundedPath(iconBounds, Math.Min(bounds.Width, bounds.Height) * 0.3f);
+        using var path = NativeUiTheme.CreateRoundedPath(iconBounds, Math.Min(bounds.Width, bounds.Height) * 0.3f);
         var primary = action == StartPageAction.ShowTabs ? Orchid : Pink;
         var secondary = action == StartPageAction.ShowTabs ? Pink : Orchid;
 
@@ -701,7 +717,7 @@ internal static class StartPageArtwork
             Math.Max(2f, bounds.Width - 1f),
             Math.Max(2f, bounds.Height - 1f));
         var radius = Math.Min(pillBounds.Width, pillBounds.Height) * 0.45f;
-        using var path = CreateRoundedPath(pillBounds, radius);
+        using var path = NativeUiTheme.CreateRoundedPath(pillBounds, radius);
 
         if (SystemInformation.HighContrast)
         {
@@ -786,7 +802,7 @@ internal static class StartPageArtwork
                     bounds.Top + padY + (row * (tileH + gap)),
                     tileW,
                     tileH);
-                using var tilePath = CreateRoundedPath(tile, radius);
+                using var tilePath = NativeUiTheme.CreateRoundedPath(tile, radius);
                 graphics.DrawPath(pen, tilePath);
             }
         }
@@ -822,7 +838,7 @@ internal static class StartPageArtwork
             bounds.Top + (bounds.Height * 0.2f),
             bounds.Width * 0.53f,
             bounds.Height * 0.46f);
-        using (var backPath = CreateRoundedPath(back, 3.5f * scale))
+        using (var backPath = NativeUiTheme.CreateRoundedPath(back, 3.5f * scale))
         {
             graphics.DrawPath(pen, backPath);
         }
@@ -832,7 +848,7 @@ internal static class StartPageArtwork
             bounds.Top + (bounds.Height * 0.34f),
             bounds.Width * 0.58f,
             bounds.Height * 0.46f);
-        using var frontPath = CreateRoundedPath(front, 3.5f * scale);
+        using var frontPath = NativeUiTheme.CreateRoundedPath(front, 3.5f * scale);
         graphics.DrawPath(pen, frontPath);
         graphics.DrawLine(
             pen,
@@ -875,8 +891,8 @@ internal static class StartPageArtwork
             top,
             6f * scale,
             12f * scale);
-        using var leftEarPath = CreateRoundedPath(leftEar, leftEar.Width / 2f);
-        using var rightEarPath = CreateRoundedPath(rightEar, rightEar.Width / 2f);
+        using var leftEarPath = NativeUiTheme.CreateRoundedPath(leftEar, leftEar.Width / 2f);
+        using var rightEarPath = NativeUiTheme.CreateRoundedPath(rightEar, rightEar.Width / 2f);
         using var outline = new Pen(Color.FromArgb(112, NativeUiTheme.Focus), Math.Max(1f, 1.2f * scale))
         {
             StartCap = LineCap.Round,
@@ -905,25 +921,6 @@ internal static class StartPageArtwork
             new PointF(bounds.Left + (bounds.Width * 0.8f), bounds.Top + (bounds.Height * 0.12f)),
             new PointF(bounds.Left + (bounds.Width * 0.92f), bounds.Top + (bounds.Height * 0.44f))
         ]);
-        path.CloseFigure();
-        return path;
-    }
-
-    private static GraphicsPath CreateRoundedPath(RectangleF bounds, float radius)
-    {
-        var path = new GraphicsPath();
-        if (bounds.Width <= 1f || bounds.Height <= 1f)
-        {
-            path.AddRectangle(bounds);
-            return path;
-        }
-
-        var safeRadius = Math.Max(1f, Math.Min(radius, Math.Min(bounds.Width, bounds.Height) / 2f));
-        var diameter = safeRadius * 2f;
-        path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
-        path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
-        path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
-        path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
         path.CloseFigure();
         return path;
     }

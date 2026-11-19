@@ -54,8 +54,8 @@ internal static class CommunicationCompatibilityPolicy
 
         if (!TryGetProvider(topLevelUrl, out var provider)) return false;
 
-        var host = requestUri.IdnHost.TrimEnd('.');
-        return ProviderTransportHosts[provider].Any(root => HostMatches(host, root));
+        var host = requestUri.IdnHost.AsSpan().TrimEnd('.');
+        return MatchesAnyProviderHost(host, ProviderTransportHosts[provider]);
     }
 
     public static bool ShouldProtectBackgroundTab(
@@ -69,10 +69,10 @@ internal static class CommunicationCompatibilityPolicy
     public static bool IsProviderTransportHost(string? host)
     {
         if (string.IsNullOrWhiteSpace(host)) return false;
-        var normalized = host.TrimEnd('.');
+        var normalized = host.AsSpan().TrimEnd('.');
         for (var i = 0; i < ProviderTransportHosts.Length; i++)
         {
-            if (ProviderTransportHosts[i].Any(root => HostMatches(normalized, root))) return true;
+            if (MatchesAnyProviderHost(normalized, ProviderTransportHosts[i])) return true;
         }
         return false;
     }
@@ -102,8 +102,8 @@ internal static class CommunicationCompatibilityPolicy
             return false;
         }
 
-        var host = requestUri.IdnHost.TrimEnd('.');
-        return ProviderTransportHosts[provider].Any(root => HostMatches(host, root));
+        var host = requestUri.IdnHost.AsSpan().TrimEnd('.');
+        return MatchesAnyProviderHost(host, ProviderTransportHosts[provider]);
     }
 
     public static bool IsTrustedPopup(
@@ -119,17 +119,13 @@ internal static class CommunicationCompatibilityPolicy
         {
             return TryGetProvider(sourceUrl, out _);
         }
-        if (targetUrl.StartsWith("blob:", StringComparison.OrdinalIgnoreCase))
-        {
-            targetUrl = targetUrl[5..];
-        }
 
         return TryGetProvider(sourceUrl, out var sourceProvider)
-            && TryGetProvider(targetUrl, out var targetProvider)
+            && TryGetProvider(targetUrl, out var targetProvider, allowBlob: true)
             && sourceProvider == targetProvider;
     }
 
-    private static bool TryGetProvider(string? url, out int provider)
+    private static bool TryGetProvider(string? url, out int provider, bool allowBlob = false)
     {
         provider = -1;
         if (string.IsNullOrWhiteSpace(url))
@@ -137,7 +133,7 @@ internal static class CommunicationCompatibilityPolicy
             return false;
         }
 
-        if (url.StartsWith("blob:", StringComparison.OrdinalIgnoreCase))
+        if (allowBlob && url.StartsWith("blob:", StringComparison.OrdinalIgnoreCase))
         {
             url = url[5..];
         }
@@ -149,25 +145,33 @@ internal static class CommunicationCompatibilityPolicy
             return false;
         }
 
-        var host = uri.IdnHost.TrimEnd('.');
+        var host = uri.IdnHost.AsSpan().TrimEnd('.');
         for (var providerIndex = 0; providerIndex < ProviderHosts.Length; providerIndex++)
         {
-            foreach (var root in ProviderHosts[providerIndex])
+            if (MatchesAnyProviderHost(host, ProviderHosts[providerIndex]))
             {
-                if (HostMatches(host, root))
-                {
-                    provider = providerIndex;
-                    return true;
-                }
+                provider = providerIndex;
+                return true;
             }
         }
 
         return false;
     }
 
-    private static bool HostMatches(string host, string root)
+    private static bool MatchesAnyProviderHost(ReadOnlySpan<char> host, string[] roots)
     {
-        return host.Equals(root, StringComparison.OrdinalIgnoreCase)
-            || host.EndsWith('.' + root, StringComparison.OrdinalIgnoreCase);
+        foreach (var root in roots)
+        {
+            if (HostMatches(host, root)) return true;
+        }
+        return false;
+    }
+
+    private static bool HostMatches(ReadOnlySpan<char> host, string root)
+    {
+        if (host.Equals(root, StringComparison.OrdinalIgnoreCase)) return true;
+        return host.Length > root.Length
+            && host[host.Length - root.Length - 1] == '.'
+            && host[^root.Length..].Equals(root, StringComparison.OrdinalIgnoreCase);
     }
 }

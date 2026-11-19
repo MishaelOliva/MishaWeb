@@ -12,10 +12,10 @@ internal sealed record VoiceAudioSettingsResult(
 
 internal sealed class VoiceAudioSettingsDialog : Form
 {
-    private static readonly Font PickerFont = new("Segoe UI", 10f, FontStyle.Bold);
-    private static readonly Font DescriptionFont = new("Segoe UI", 9f, FontStyle.Italic);
-    private static readonly Font ExplanationFont = new("Segoe UI", 9f);
-    private static readonly Font SiteListFont = new("Segoe UI", 9.5f);
+    private static readonly Font PickerFont = NativeUiTheme.GetSharedFont("Segoe UI", 10f, FontStyle.Bold);
+    private static readonly Font DescriptionFont = NativeUiTheme.GetSharedFont("Segoe UI", 9f, FontStyle.Italic);
+    private static readonly Font ExplanationFont = NativeUiTheme.GetSharedFont("Segoe UI", 9f);
+    private static readonly Font SiteListFont = NativeUiTheme.GetSharedFont("Segoe UI", 9.5f);
 
     private readonly string? currentHost;
     private readonly Action<VoiceAudioSettingsResult> saveCallback;
@@ -181,6 +181,15 @@ internal sealed class VoiceAudioSettingsDialog : Form
         siteListBox.Font = SiteListFont;
         siteListBox.AccessibleName = "Configured sites list";
         siteListBox.SelectedIndexChanged += (_, _) => UpdateButtonStates();
+        siteListBox.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode == Keys.Delete)
+            {
+                OnRemoveSite();
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+            }
+        };
         listAndButtons.Controls.Add(siteListBox, 0, 0);
 
         var sideButtons = new FlowLayoutPanel
@@ -223,6 +232,8 @@ internal sealed class VoiceAudioSettingsDialog : Form
         root.Controls.Add(actions, 0, 7);
 
         Controls.Add(root);
+        AcceptButton = okButton;
+        CancelButton = cancelButton;
         NativeUiTheme.Apply(this, okButton);
         NativeUiTheme.ConfigureModernListBox(
             siteListBox,
@@ -383,12 +394,15 @@ internal sealed class VoiceAudioSettingsDialog : Form
         {
             addCurrentSiteButton.Enabled = false;
             addCurrentSiteButton.Text = "Add current site";
+            addCurrentSiteButton.AccessibleName = "Add current site";
         }
         else
         {
             var alreadyInList = activeList.Any(h => BrowserPolicy.IsExactHost(h, currentHost));
             addCurrentSiteButton.Enabled = !alreadyInList;
-            addCurrentSiteButton.Text = $"Add {currentHost}";
+            var displayHost = TextSafety.TruncateWithEllipsis(currentHost, 24);
+            addCurrentSiteButton.Text = $"Add {displayHost}";
+            addCurrentSiteButton.AccessibleName = $"Add {currentHost}";
         }
     }
 

@@ -16,13 +16,17 @@ internal static class PublicSuffixRules
         LoadRules,
         LazyThreadSafetyMode.ExecutionAndPublication);
 
+    internal static void Warmup() => _ = Rules.Value;
+
     internal static string GetSiteKey(string host)
     {
         var value = host.AsSpan().Trim().TrimEnd('.');
         if (value.Length == 0 || IPAddress.TryParse(value, out _)) return new string(value);
 
-        var normalized = BrowserPolicy.NormalizeExactHost(new string(value))
-            ?? new string(value).ToLowerInvariant();
+        var normalized = IsCleanLowercaseAsciiHost(value)
+            ? (value.Length == host.Length ? host : new string(value))
+            : BrowserPolicy.NormalizeExactHost(new string(value))
+                ?? new string(value).ToLowerInvariant();
         var span = normalized.AsSpan();
         if (!span.Contains('.')) return normalized;
 
@@ -105,10 +109,43 @@ internal static class PublicSuffixRules
                 continue;
             }
 
-            var normalized = BrowserPolicy.NormalizeExactHost(line);
+            var normalized = IsCleanLowercaseAsciiHost(line.AsSpan())
+                ? line
+                : BrowserPolicy.NormalizeExactHost(line);
             if (normalized is not null) destination.Add(normalized);
         }
         return new RuleSet(exact, wildcards, exceptions);
+    }
+
+    private static bool IsCleanLowercaseAsciiHost(ReadOnlySpan<char> span)
+    {
+        if (span.Length is 0 or > 253) return false;
+        var labelLength = 0;
+        var hasLetter = false;
+        for (var i = 0; i < span.Length; i++)
+        {
+            var ch = span[i];
+            if (ch == '.')
+            {
+                if (labelLength is 0 or > 63 || span[i - 1] == '-') return false;
+                labelLength = 0;
+                continue;
+            }
+            if (ch is >= 'a' and <= 'z')
+            {
+                hasLetter = true;
+            }
+            else if (ch == '-')
+            {
+                if (labelLength == 0) return false;
+            }
+            else if (ch is not (>= '0' and <= '9'))
+            {
+                return false;
+            }
+            labelLength++;
+        }
+        return hasLetter && labelLength is > 0 and <= 63 && span[^1] != '-';
     }
 
     private sealed record RuleSet(

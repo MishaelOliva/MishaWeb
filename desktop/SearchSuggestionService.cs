@@ -27,15 +27,18 @@ internal sealed class SearchSuggestionService
     {
         AutomaticDecompression = DecompressionMethods.All,
         PooledConnectionLifetime = TimeSpan.FromMinutes(5),
-        ConnectTimeout = TimeSpan.FromMilliseconds(1000)
+        ConnectTimeout = TimeSpan.FromMilliseconds(1000),
+        UseCookies = false,
+        AllowAutoRedirect = false
     };
 
     private readonly HttpClient httpClient;
     private readonly TimeProvider timeProvider;
+    private readonly TimeSpan requestTimeout;
     private readonly object stateSync = new();
     private readonly ConcurrentDictionary<string, (DateTimeOffset FetchedAt, string[] Suggestions)> cache =
         new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, Task<IReadOnlyList<string>>> inFlightRequests =
+    private readonly ConcurrentDictionary<string, Lazy<Task<IReadOnlyList<string>>>> inFlightRequests =
         new(StringComparer.OrdinalIgnoreCase);
     private DateTimeOffset backoffUntilUtc = DateTimeOffset.MinValue;
     private int consecutiveFailures;
@@ -63,9 +66,10 @@ internal sealed class SearchSuggestionService
     {
         ArgumentNullException.ThrowIfNull(handler);
         this.timeProvider = timeProvider ?? TimeProvider.System;
+        this.requestTimeout = requestTimeout ?? TimeSpan.FromMilliseconds(1200);
         httpClient = new HttpClient(handler, disposeHandler)
         {
-            Timeout = requestTimeout ?? TimeSpan.FromMilliseconds(1200)
+            Timeout = this.requestTimeout
         };
     }
 
@@ -128,13 +132,12 @@ internal sealed class SearchSuggestionService
 
         // Coalesce concurrent identical lookups without coupling caller cancellation
         // tokens to the shared network request.
-        var sharedTask = inFlightRequests.GetOrAdd(
-            cacheKey,
-            static (key, state) => state.Service.FetchAndCacheAsync(
-                key,
-                state.ProviderId,
-                state.Query),
-            (Service: this, ProviderId: normalizedProviderId, Query: normalizedQuery));
+        Lazy<Task<IReadOnlyList<string>>>? created = null;
+        created = new Lazy<Task<IReadOnlyList<string>>>(
+            () => FetchAndCacheAsync(cacheKey, normalizedProviderId, normalizedQuery, created!),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+        var sharedEntry = inFlightRequests.GetOrAdd(cacheKey, created);
+        var sharedTask = sharedEntry.Value;
 
         try
         {
@@ -149,7 +152,8 @@ internal sealed class SearchSuggestionService
     private async Task<IReadOnlyList<string>> FetchAndCacheAsync(
         string cacheKey,
         string providerId,
-        string normalizedQuery)
+        string normalizedQuery,
+        Lazy<Task<IReadOnlyList<string>>> entry)
     {
         try
         {
@@ -157,9 +161,12 @@ internal sealed class SearchSuggestionService
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
             request.Headers.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
 
+            using var timeoutCts = new CancellationTokenSource(requestTimeout);
+            var timeoutToken = timeoutCts.Token;
             using var response = await httpClient.SendAsync(
                 request,
-                HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
+                HttpCompletionOption.ResponseHeadersRead,
+                timeoutToken).ConfigureAwait(false);
 
             if (!response.IsSuccessStatusCode)
             {
@@ -178,8 +185,11 @@ internal sealed class SearchSuggestionService
                 return Array.Empty<string>();
             }
 
-            await using var rawStream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false);
-            var (pooledBuffer, byteCount) = await ReadBoundedPooledBytesAsync(rawStream, MaximumResponseBytes).ConfigureAwait(false);
+            await using var rawStream = await response.Content.ReadAsStreamAsync(timeoutToken).ConfigureAwait(false);
+            var (pooledBuffer, byteCount) = await ReadBoundedPooledBytesAsync(
+                rawStream,
+                MaximumResponseBytes,
+                timeoutToken).ConfigureAwait(false);
             if (pooledBuffer is null)
             {
                 RecordFailure();
@@ -200,9 +210,9 @@ internal sealed class SearchSuggestionService
                 ArrayPool<byte>.Shared.Return(pooledBuffer);
             }
         }
-        catch (TaskCanceledException)
+        catch (OperationCanceledException)
         {
-            // HttpClient.Timeout fires TaskCanceledException on the shared un-canceled task.
+            // Request/body timeout fires OperationCanceledException on the shared un-canceled task.
             RecordFailure();
             return Array.Empty<string>();
         }
@@ -222,7 +232,7 @@ internal sealed class SearchSuggestionService
         }
         finally
         {
-            inFlightRequests.TryRemove(cacheKey, out _);
+            inFlightRequests.TryRemove(KeyValuePair.Create(cacheKey, entry));
         }
     }
 
@@ -246,7 +256,10 @@ internal sealed class SearchSuggestionService
             + Uri.EscapeDataString(normalizedQuery);
     }
 
-    private static async Task<(byte[]? Buffer, int Length)> ReadBoundedPooledBytesAsync(Stream stream, int maxBytes)
+    private static async Task<(byte[]? Buffer, int Length)> ReadBoundedPooledBytesAsync(
+        Stream stream,
+        int maxBytes,
+        CancellationToken cancellationToken)
     {
         var buffer = ArrayPool<byte>.Shared.Rent(Math.Min(4096, maxBytes));
         var totalRead = 0;
@@ -259,7 +272,9 @@ internal sealed class SearchSuggestionService
                     if (totalRead >= maxBytes)
                     {
                         var overflowProbe = new byte[1];
-                        var extra = await stream.ReadAsync(overflowProbe.AsMemory(0, 1)).ConfigureAwait(false);
+                        var extra = await stream.ReadAsync(
+                            overflowProbe.AsMemory(0, 1),
+                            cancellationToken).ConfigureAwait(false);
                         if (extra > 0)
                         {
                             ArrayPool<byte>.Shared.Return(buffer);
@@ -275,14 +290,18 @@ internal sealed class SearchSuggestionService
                 }
 
                 var maxStep = Math.Min(buffer.Length - totalRead, maxBytes - totalRead);
-                var read = await stream.ReadAsync(buffer.AsMemory(totalRead, maxStep)).ConfigureAwait(false);
+                var read = await stream.ReadAsync(
+                    buffer.AsMemory(totalRead, maxStep),
+                    cancellationToken).ConfigureAwait(false);
                 if (read == 0) return (buffer, totalRead);
                 totalRead += read;
 
                 if (totalRead == maxBytes)
                 {
                     var overflowProbe = new byte[1];
-                    var extra = await stream.ReadAsync(overflowProbe.AsMemory(0, 1)).ConfigureAwait(false);
+                    var extra = await stream.ReadAsync(
+                        overflowProbe.AsMemory(0, 1),
+                        cancellationToken).ConfigureAwait(false);
                     if (extra > 0)
                     {
                         ArrayPool<byte>.Shared.Return(buffer);

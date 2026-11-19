@@ -36,7 +36,6 @@ internal static class AdBlockDocumentScript
             }
             const disableForDocument = () => {
                 enabledForDocument = false;
-                try { window.__mishaStopYouTubeRuntime?.(); } catch (_) { }
                 document.getElementById(styleId)?.remove();
                 document.getElementById(remoteStyleId)?.remove();
             };
@@ -161,7 +160,7 @@ internal static class AdBlockDocumentScript
                 };
         """;
 
-    public const string Source =
+    public static readonly string Source =
         "(() => {\n"
         + SharedYouTubeBootstrapPrefix
         + "\n"
@@ -216,11 +215,12 @@ internal static class AdBlockDocumentScript
                 for (const observer of bootstrapObservers) observer.disconnect();
                 bootstrapObservers.length = 0;
             };
+            const controlChannel = '__MISHA_ADBLOCK_CONTROL_CHANNEL__';
             const isEnabled = () => window.__mishaAdBlockEnabled !== false;
-            window.__mishaStopYouTubeRuntime = () => {
+            window.addEventListener(controlChannel, () => {
                 stopBootstrapObservers();
                 stopYouTubeRuntime();
-            };
+            });
         """
         + "\n"
         + SharedYouTubeBody
@@ -1029,7 +1029,10 @@ internal static class AdBlockDocumentScript
                                                 cache: firstArg.cache,
                                                 redirect: firstArg.redirect,
                                                 referrer: firstArg.referrer,
+                                                referrerPolicy: firstArg.referrerPolicy,
                                                 integrity: firstArg.integrity,
+                                                keepalive: firstArg.keepalive,
+                                                signal: firstArg.signal,
                                                 body: rewritten
                                             };
                                             const newReq = new Request(firstArg.url, init);
@@ -1424,19 +1427,21 @@ internal static class AdBlockDocumentScript
                     && current > transportRecoveryBaselineTime + 0.1;
                 const bufferAdvanced = transportRecoveryAttempt > 0
                     && bufferedEnd > transportRecoveryBaselineBufferedEnd + 0.25;
-                const observed = (snapshot || createPlayerSnapshot(player)).refresh();
-                const state = observed.state;
-                const stats = observed.stats;
-                const bufferHealth = parseBufferHealthSeconds(stats?.buffer_health_seconds);
-                const strictPlayable = transportRecoveryAttempt > 0
-                    && playerResponse?.playabilityStatus?.status === 'OK'
-                    && state?.isBuffering === false
-                    && hasUsableResolution(stats?.resolution)
-                    && bufferHealth !== null
-                    && bufferHealth > 0
-                    && !hasMatchingTransportError(playerResponse)
-                    && video.readyState >= 3
-                    && (video.paused === false || bufferedEnd > current + 0.05);
+                let strictPlayable = false;
+                if (transportRecoveryAttempt > 0 && !currentAdvanced && !bufferAdvanced) {
+                    const observed = (snapshot || createPlayerSnapshot(player)).refresh();
+                    const state = observed.state;
+                    const stats = observed.stats;
+                    const bufferHealth = parseBufferHealthSeconds(stats?.buffer_health_seconds);
+                    strictPlayable = playerResponse?.playabilityStatus?.status === 'OK'
+                        && state?.isBuffering === false
+                        && hasUsableResolution(stats?.resolution)
+                        && bufferHealth !== null
+                        && bufferHealth > 0
+                        && !hasMatchingTransportError(playerResponse)
+                        && video.readyState >= 3
+                        && (video.paused === false || bufferedEnd > current + 0.05);
+                }
                 const ready = transportRecoveryAttempt > 0
                     ? currentAdvanced || bufferAdvanced || strictPlayable
                     : current > transportRecoveryBaselineTime + 0.1;
@@ -2006,23 +2011,24 @@ internal static class AdBlockDocumentScript
             };
             const onUserInteraction = event => {
                 if (!event.isTrusted || !isYouTubeWatch()) return;
-                const video = document.querySelector('video.html5-main-video, video');
-                if (!video) return;
 
                 if (event.type === 'keydown') {
-                    if (event.key === ' ' || event.key === 'k' || event.key === 'K') {
-                        const tag = event.target?.tagName?.toLowerCase();
-                        if (tag === 'input' || tag === 'textarea' || event.target?.isContentEditable) return;
-                        userManuallyPaused = !video.paused;
-                        if (!userManuallyPaused) {
-                            lastPlayAttempt = 0;
-                            triggerInstantPlay();
-                        }
+                    if (event.key !== ' ' && event.key !== 'k' && event.key !== 'K') return;
+                    const tag = event.target?.tagName?.toLowerCase();
+                    if (tag === 'input' || tag === 'textarea' || event.target?.isContentEditable) return;
+                    const video = document.querySelector('video.html5-main-video, video');
+                    if (!video) return;
+                    userManuallyPaused = !video.paused;
+                    if (!userManuallyPaused) {
+                        lastPlayAttempt = 0;
+                        triggerInstantPlay();
                     }
                     return;
                 }
 
                 if (event.type === 'click') {
+                    const video = document.querySelector('video.html5-main-video, video');
+                    if (!video) return;
                     const largePlay = event.target?.closest?.('.ytp-large-play-button');
                     if (largePlay) {
                         userManuallyPaused = false;

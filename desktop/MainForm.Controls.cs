@@ -56,29 +56,42 @@ public sealed partial class MainForm
             base.OnPaint(e);
             if (Width < 8 || Height < 8) return;
 
+            var scale = Math.Max(1f, DeviceDpi / 96f);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            var shadowBounds = new RectangleF(3, 3, Width - 6, Height - 5);
-            using (var shadowPath = CreateRoundedPath(shadowBounds, 9f))
+            var shadowBounds = new RectangleF(
+                3f * scale,
+                3f * scale,
+                Math.Max(2f, Width - (6f * scale)),
+                Math.Max(2f, Height - (5f * scale)));
+            using (var shadowPath = NativeUiTheme.CreateRoundedPath(shadowBounds, 9f * scale))
             using (var shadowBrush = new SolidBrush(Color.FromArgb(76, Color.Black)))
             {
                 e.Graphics.FillPath(shadowBrush, shadowPath);
             }
 
-            var tabBounds = new RectangleF(1, 1, Width - 5, Height - 5);
-            using (var tabPath = CreateRoundedPath(tabBounds, 9f))
+            var tabBounds = new RectangleF(
+                1f * scale,
+                1f * scale,
+                Math.Max(2f, Width - (5f * scale)),
+                Math.Max(2f, Height - (5f * scale)));
+            using (var tabPath = NativeUiTheme.CreateRoundedPath(tabBounds, 9f * scale))
             using (var fillBrush = new SolidBrush(highContrast
                 ? Color.FromArgb(232, SystemColors.Highlight)
                 : Color.FromArgb(224, NativeUiTheme.SurfaceRaised)))
             using (var borderPen = new Pen(
                 highContrast ? SystemColors.HighlightText : AccentColor,
-                highContrast ? 2f : 1.5f))
+                (highContrast ? 2f : 1.5f) * scale))
             {
                 e.Graphics.FillPath(fillBrush, tabPath);
                 e.Graphics.DrawPath(borderPen, tabPath);
             }
 
             var foreground = highContrast ? SystemColors.HighlightText : PageTextColor;
-            var textBounds = new Rectangle(12, 1, Math.Max(1, Width - 42), Math.Max(1, Height - 6));
+            var textBounds = new Rectangle(
+                (int)Math.Round(12f * scale),
+                (int)Math.Round(1f * scale),
+                Math.Max(1, Width - (int)Math.Round(42f * scale)),
+                Math.Max(1, Height - (int)Math.Round(6f * scale)));
             TextRenderer.DrawText(
                 e.Graphics,
                 title,
@@ -90,32 +103,23 @@ public sealed partial class MainForm
                     | TextFormatFlags.SingleLine
                     | TextFormatFlags.VerticalCenter);
 
-            using var closePen = new Pen(foreground, 1.4f);
-            var closeCenterX = Width - 20;
-            var closeCenterY = (Height - 3) / 2;
-            e.Graphics.DrawLine(closePen, closeCenterX - 3, closeCenterY - 3, closeCenterX + 3, closeCenterY + 3);
-            e.Graphics.DrawLine(closePen, closeCenterX + 3, closeCenterY - 3, closeCenterX - 3, closeCenterY + 3);
+            using var closePen = new Pen(foreground, Math.Max(1.1f, 1.4f * scale));
+            var closeCenterX = Width - (20f * scale);
+            var closeCenterY = (Height - (3f * scale)) / 2f;
+            var arm = 3f * scale;
+            e.Graphics.DrawLine(closePen, closeCenterX - arm, closeCenterY - arm, closeCenterX + arm, closeCenterY + arm);
+            e.Graphics.DrawLine(closePen, closeCenterX + arm, closeCenterY - arm, closeCenterX - arm, closeCenterY + arm);
 
-            using var accentPen = new Pen(highContrast ? SystemColors.HighlightText : AccentColor, 2f);
-            e.Graphics.DrawLine(accentPen, 10, Height - 4, Math.Max(10, Width - 12), Height - 4);
-        }
-
-        private static GraphicsPath CreateRoundedPath(RectangleF bounds, float radius)
-        {
-            var path = new GraphicsPath();
-            var diameter = Math.Min(radius * 2f, Math.Min(bounds.Width, bounds.Height));
-            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180f, 90f);
-            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270f, 90f);
-            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0f, 90f);
-            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90f, 90f);
-            path.CloseFigure();
-            return path;
+            using var accentPen = new Pen(highContrast ? SystemColors.HighlightText : AccentColor, Math.Max(1.5f, 2f * scale));
+            var accentY = Height - (4f * scale);
+            var accentLeft = 10f * scale;
+            e.Graphics.DrawLine(accentPen, accentLeft, accentY, Math.Max(accentLeft, Width - (12f * scale)), accentY);
         }
     }
 
     private sealed class TabHeader : UserControl
     {
-        private static readonly Font TabMonogramFont = new("Segoe UI Semibold", 8f, FontStyle.Bold);
+        private static readonly Font TabMonogramFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 8f, FontStyle.Bold);
         private readonly ToolTip toolTip;
         private bool isSelected;
         private bool isHovered;
@@ -139,6 +143,7 @@ public sealed partial class MainForm
         private Bitmap? faviconBitmap;
         private string? hostMonogram;
         private bool isWebTab;
+        private bool hasState;
 
         public bool IsPrivateMode { get; set; }
 
@@ -231,6 +236,20 @@ public sealed partial class MainForm
             bool muted,
             bool pinned)
         {
+            if (hasState
+                && string.Equals(currentTitle, title, StringComparison.Ordinal)
+                && isSelected == selected
+                && isSuspended == suspended
+                && isLoading == loading
+                && isDiscarded == discarded
+                && keepAwake == protectedInBackground
+                && isAudible == audible
+                && isMuted == muted
+                && isPinned == pinned)
+            {
+                return;
+            }
+            hasState = true;
             currentTitle = title;
             isSelected = selected;
             isSuspended = suspended;
@@ -277,10 +296,23 @@ public sealed partial class MainForm
             ApplyVisualState();
         }
 
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            Margin = new Padding(0, 0, ScalePx(4), 0);
+            ApplyVisualState();
+        }
+
+        protected override void OnDpiChangedAfterParent(EventArgs e)
+        {
+            base.OnDpiChangedAfterParent(e);
+            Margin = new Padding(0, 0, ScalePx(4), 0);
+            ApplyVisualState();
+        }
+
         protected override void OnResize(EventArgs e)
         {
             base.OnResize(e);
-            Region = null;
             ApplyVisualState();
         }
 
@@ -312,42 +344,45 @@ public sealed partial class MainForm
             Invalidate();
         }
 
-        private bool ShouldShowCloseButton() => !isDragging && !isPinned && (isSelected || isHovered || Width >= 170);
+        private float DpiScale => Math.Max(1f, DeviceDpi / 96f);
 
-        private RectangleF GetCloseButtonBounds() => new(Math.Max(4f, Width - 25f), Math.Max(1f, (Height - 20f) / 2f), 20f, 20f);
+        private int ScalePx(int logicalValue) => Math.Max(1, (int)Math.Round(logicalValue * DpiScale));
+
+        private bool ShouldShowCloseButton() => !isDragging && !isPinned && (isSelected || isHovered || Width >= ScalePx(170));
+
+        private RectangleF GetCloseButtonBounds()
+        {
+            var s = DpiScale;
+            var size = 20f * s;
+            return new(Math.Max(4f * s, Width - (25f * s)), Math.Max(1f * s, (Height - size) / 2f), size, size);
+        }
 
         private RectangleF GetCloseButtonHitBounds()
         {
+            var s = DpiScale;
             var bounds = GetCloseButtonBounds();
-            bounds.Inflate(3f, 3f);
+            bounds.Inflate(3f * s, 3f * s);
             return bounds;
         }
 
         private bool ShouldShowAudioButton() => (isAudible || isMuted) && !isDragging;
 
-        private RectangleF GetAudioButtonBounds() => new(6f, Math.Max(1f, (Height - 16f) / 2f), 16f, 16f);
+        private RectangleF GetAudioButtonBounds()
+        {
+            var s = DpiScale;
+            var size = 16f * s;
+            return new(6f * s, Math.Max(1f * s, (Height - size) / 2f), size, size);
+        }
 
         private RectangleF GetAudioButtonHitBounds()
         {
+            var s = DpiScale;
             var bounds = GetAudioButtonBounds();
-            bounds.Inflate(2f, 4f);
+            bounds.Inflate(2f * s, 4f * s);
             return bounds;
         }
 
         private bool HasFaviconVisual() => faviconBitmap is not null || (isWebTab && !string.IsNullOrEmpty(hostMonogram));
-
-        private static GraphicsPath CreateTabRoundedPath(RectangleF bounds, float radius)
-        {
-            var safeRadius = Math.Max(1f, Math.Min(radius, Math.Min(bounds.Width, bounds.Height) / 2f));
-            var diameter = safeRadius * 2f;
-            var path = new GraphicsPath();
-            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180f, 90f);
-            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270f, 90f);
-            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0f, 90f);
-            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90f, 90f);
-            path.CloseFigure();
-            return path;
-        }
 
         protected override void OnPaintBackground(PaintEventArgs e)
         {
@@ -361,6 +396,7 @@ public sealed partial class MainForm
             e.Graphics.Clear(stripHostColor);
             if (Width <= 4 || Height <= 4) return;
 
+            var s = DpiScale;
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.CompositingQuality = CompositingQuality.HighQuality;
             e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
@@ -368,21 +404,21 @@ public sealed partial class MainForm
             var effectiveAccent = HighContrast
                 ? SystemColors.HighlightText
                 : IsPrivateMode ? NativeUiTheme.Lavender : AccentColor;
-            var topInset = isMaximized ? 1f : 1.5f;
+            var topInset = isMaximized ? 1f : 1.5f * s;
             var pillBounds = new RectangleF(
-                1f,
+                1f * s,
                 topInset,
-                Math.Max(1f, Width - 2f),
-                Math.Max(1f, Height - topInset - 1.5f));
-            var pillRadius = Math.Min(8f, pillBounds.Height / 2f);
-            using var pillPath = CreateTabRoundedPath(pillBounds, pillRadius);
+                Math.Max(1f, Width - (2f * s)),
+                Math.Max(1f, Height - topInset - (1.5f * s)));
+            var pillRadius = Math.Min(8f * s, pillBounds.Height / 2f);
+            using var pillPath = NativeUiTheme.CreateRoundedPath(pillBounds, pillRadius);
 
             if (HighContrast)
             {
                 var highlighted = isSelected || isHovered;
                 using var hcFill = new SolidBrush(highlighted ? SystemColors.Highlight : SystemColors.Control);
                 e.Graphics.FillPath(hcFill, pillPath);
-                using var hcBorder = new Pen(highlighted ? SystemColors.HighlightText : SystemColors.WindowText, isSelected ? 1.5f : 1f);
+                using var hcBorder = new Pen(highlighted ? SystemColors.HighlightText : SystemColors.WindowText, (isSelected ? 1.5f : 1f) * s);
                 e.Graphics.DrawPath(hcBorder, pillPath);
             }
             else
@@ -411,7 +447,7 @@ public sealed partial class MainForm
 
                     if (isSelected || isHovered)
                     {
-                        var specHeight = Math.Max(4f, pillBounds.Height * 0.48f);
+                        var specHeight = Math.Max(4f * s, pillBounds.Height * 0.48f);
                         var specRect = new RectangleF(pillBounds.X, pillBounds.Y, pillBounds.Width, specHeight + 1f);
                         using var specBrush = new LinearGradientBrush(
                             specRect,
@@ -422,7 +458,7 @@ public sealed partial class MainForm
 
                         if (isSelected)
                         {
-                            var causticHeight = Math.Max(4f, pillBounds.Height * 0.28f);
+                            var causticHeight = Math.Max(4f * s, pillBounds.Height * 0.28f);
                             var causticRect = new RectangleF(
                                 pillBounds.X,
                                 pillBounds.Bottom - causticHeight,
@@ -447,25 +483,25 @@ public sealed partial class MainForm
                     Color.FromArgb(isSelected ? 228 : isHovered ? 138 : 44, 255, 230, 246),
                     Color.FromArgb(isSelected ? 152 : isHovered ? 62 : 16, effectiveAccent),
                     LinearGradientMode.Vertical);
-                using var rimPen = new Pen(rimBrush, isSelected ? 1.25f : 0.9f);
+                using var rimPen = new Pen(rimBrush, (isSelected ? 1.25f : 0.9f) * s);
                 e.Graphics.DrawPath(rimPen, pillPath);
 
-                if (isSelected && pillBounds.Width > 26f)
+                if (isSelected && pillBounds.Width > 26f * s)
                 {
-                    var barWidth = Math.Min(pillBounds.Width - 20f, Math.Max(18f, pillBounds.Width * 0.42f));
+                    var barWidth = Math.Min(pillBounds.Width - (20f * s), Math.Max(18f * s, pillBounds.Width * 0.42f));
                     var barLeft = pillBounds.Left + ((pillBounds.Width - barWidth) / 2f);
-                    using var glowBar = new Pen(effectiveAccent, 2f)
+                    using var glowBar = new Pen(effectiveAccent, 2f * s)
                     {
                         StartCap = LineCap.Round,
                         EndCap = LineCap.Round
                     };
-                    e.Graphics.DrawLine(glowBar, barLeft, pillBounds.Bottom - 0.5f, barLeft + barWidth, pillBounds.Bottom - 0.5f);
+                    e.Graphics.DrawLine(glowBar, barLeft, pillBounds.Bottom - (0.5f * s), barLeft + barWidth, pillBounds.Bottom - (0.5f * s));
                 }
             }
 
             if (isDragging)
             {
-                using var dragOutline = new Pen(effectiveAccent, 1f)
+                using var dragOutline = new Pen(effectiveAccent, 1f * s)
                 {
                     DashStyle = DashStyle.Dash
                 };
@@ -479,8 +515,8 @@ public sealed partial class MainForm
                 var audioBounds = GetAudioButtonBounds();
                 if (isAudioHovered || isAudioPressed)
                 {
-                    var pillRect = RectangleF.Inflate(audioBounds, 2f, 2f);
-                    using var hoverPath = CreateTabRoundedPath(pillRect, 6f);
+                    var pillRect = RectangleF.Inflate(audioBounds, 2f * s, 2f * s);
+                    using var hoverPath = NativeUiTheme.CreateRoundedPath(pillRect, 6f * s);
                     using var hoverFill = new SolidBrush(
                         HighContrast
                             ? SystemColors.Highlight
@@ -495,19 +531,23 @@ public sealed partial class MainForm
                     e.Graphics,
                     audioBounds,
                     audioColor,
-                    isMuted);
+                    isMuted,
+                    s);
 
-                if (hasFaviconVisual && Width >= 115)
+                if (hasFaviconVisual && Width >= ScalePx(115))
                 {
+                    var iconSide = 16f * s;
                     DrawFaviconOrMonogram(
                         e.Graphics,
-                        new RectangleF(26f, Math.Max(1f, (Height - 16f) / 2f), 16f, 16f));
+                        new RectangleF(26f * s, Math.Max(1f * s, (Height - iconSide) / 2f), iconSide, iconSide),
+                        s);
                 }
             }
             else if (hasFaviconVisual)
             {
-                var iconBounds = new RectangleF(8f, Math.Max(1f, (Height - 16f) / 2f), 16f, 16f);
-                DrawFaviconOrMonogram(e.Graphics, iconBounds);
+                var iconSide = 16f * s;
+                var iconBounds = new RectangleF(8f * s, Math.Max(1f * s, (Height - iconSide) / 2f), iconSide, iconSide);
+                DrawFaviconOrMonogram(e.Graphics, iconBounds, s);
                 if (isLoading || isDiscarded || isSuspended || keepAwake)
                 {
                     var stateColor = HighContrast
@@ -516,7 +556,8 @@ public sealed partial class MainForm
                             ? AccentColor
                             : isDiscarded ? NegativeColor : keepAwake ? PositiveColor : MutedTextColor;
                     using var stateBrush = new SolidBrush(stateColor);
-                    e.Graphics.FillEllipse(stateBrush, iconBounds.Right - 4f, iconBounds.Bottom - 4f, 5f, 5f);
+                    var dotSize = 5f * s;
+                    e.Graphics.FillEllipse(stateBrush, iconBounds.Right - (4f * s), iconBounds.Bottom - (4f * s), dotSize, dotSize);
                 }
             }
             else if (isLoading || isDiscarded || isSuspended || keepAwake)
@@ -527,12 +568,13 @@ public sealed partial class MainForm
                         ? AccentColor
                         : isDiscarded ? NegativeColor : keepAwake ? PositiveColor : MutedTextColor;
                 using var stateBrush = new SolidBrush(stateColor);
-                e.Graphics.FillEllipse(stateBrush, 9f, Math.Max(1f, (Height - 6f) / 2f), 6f, 6f);
+                var dotSize = 6f * s;
+                e.Graphics.FillEllipse(stateBrush, 9f * s, Math.Max(1f * s, (Height - dotSize) / 2f), dotSize, dotSize);
             }
 
             var showClose = ShouldShowCloseButton();
-            var titleLeft = Math.Max(10, Padding.Left);
-            var titleRightReserve = showClose ? 29 : 10;
+            var titleLeft = Math.Max(ScalePx(10), Padding.Left);
+            var titleRightReserve = showClose ? ScalePx(29) : ScalePx(10);
             var titleBounds = new Rectangle(
                 titleLeft,
                 0,
@@ -568,7 +610,7 @@ public sealed partial class MainForm
                     e.Graphics.FillEllipse(closeFill, closeBounds);
                     if (!HighContrast)
                     {
-                        using var closeRim = new Pen(Color.FromArgb(172, 255, 232, 246), 1f);
+                        using var closeRim = new Pen(Color.FromArgb(172, 255, 232, 246), 1f * s);
                         e.Graphics.DrawEllipse(closeRim, closeBounds);
                     }
                 }
@@ -576,8 +618,8 @@ public sealed partial class MainForm
                 var crossColor = HighContrast
                     ? (isCloseHovered || isSelected ? SystemColors.HighlightText : SystemColors.ControlText)
                     : (isCloseHovered || isClosePressed) ? Color.White : isSelected ? PageTextColor : MutedTextColor;
-                var inset = 5.6f;
-                using var crossPen = new Pen(crossColor, 1.6f)
+                var inset = 5.6f * s;
+                using var crossPen = new Pen(crossColor, 1.6f * s)
                 {
                     StartCap = LineCap.Round,
                     EndCap = LineCap.Round
@@ -606,11 +648,11 @@ public sealed partial class MainForm
             }
         }
 
-        private void DrawFaviconOrMonogram(Graphics graphics, RectangleF bounds)
+        private void DrawFaviconOrMonogram(Graphics graphics, RectangleF bounds, float scale)
         {
             if (faviconBitmap is not null)
             {
-                using var clipPath = CreateTabRoundedPath(bounds, 4f);
+                using var clipPath = NativeUiTheme.CreateRoundedPath(bounds, 4f * scale);
                 var state = graphics.Save();
                 try
                 {
@@ -626,10 +668,10 @@ public sealed partial class MainForm
             }
 
             if (string.IsNullOrEmpty(hostMonogram)) return;
-            using var pillPath = CreateTabRoundedPath(bounds, 5f);
+            using var pillPath = NativeUiTheme.CreateRoundedPath(bounds, 5f * scale);
             if (HighContrast)
             {
-                using var hcBorder = new Pen(isSelected ? SystemColors.HighlightText : SystemColors.WindowText, 1f);
+                using var hcBorder = new Pen(isSelected ? SystemColors.HighlightText : SystemColors.WindowText, 1f * scale);
                 graphics.DrawPath(hcBorder, pillPath);
                 TextRenderer.DrawText(
                     graphics,
@@ -651,7 +693,7 @@ public sealed partial class MainForm
             {
                 graphics.FillPath(badgeBrush, pillPath);
             }
-            using var badgeRim = new Pen(Color.FromArgb(145, IsPrivateMode ? NativeUiTheme.Lavender : NativeUiTheme.Focus), 0.9f);
+            using var badgeRim = new Pen(Color.FromArgb(145, IsPrivateMode ? NativeUiTheme.Lavender : NativeUiTheme.Focus), 0.9f * scale);
             graphics.DrawPath(badgeRim, pillPath);
             TextRenderer.DrawText(
                 graphics,
@@ -666,10 +708,11 @@ public sealed partial class MainForm
             Graphics graphics,
             RectangleF bounds,
             Color color,
-            bool muted)
+            bool muted,
+            float scale)
         {
             var centerY = bounds.Top + (bounds.Height / 2f);
-            using var pen = new Pen(color, 1.55f)
+            using var pen = new Pen(color, 1.55f * scale)
             {
                 StartCap = LineCap.Round,
                 EndCap = LineCap.Round,
@@ -677,36 +720,36 @@ public sealed partial class MainForm
             };
             var speaker = new[]
             {
-                new PointF(bounds.Left + 1f, centerY - 2f),
-                new PointF(bounds.Left + 4f, centerY - 2f),
-                new PointF(bounds.Left + 7f, centerY - 5f),
-                new PointF(bounds.Left + 7f, centerY + 5f),
-                new PointF(bounds.Left + 4f, centerY + 2f),
-                new PointF(bounds.Left + 1f, centerY + 2f)
+                new PointF(bounds.Left + (1f * scale), centerY - (2f * scale)),
+                new PointF(bounds.Left + (4f * scale), centerY - (2f * scale)),
+                new PointF(bounds.Left + (7f * scale), centerY - (5f * scale)),
+                new PointF(bounds.Left + (7f * scale), centerY + (5f * scale)),
+                new PointF(bounds.Left + (4f * scale), centerY + (2f * scale)),
+                new PointF(bounds.Left + (1f * scale), centerY + (2f * scale))
             };
             graphics.DrawPolygon(pen, speaker);
 
             if (muted)
             {
-                graphics.DrawLine(pen, bounds.Left + 10f, centerY - 3f, bounds.Right - 1f, centerY + 3f);
-                graphics.DrawLine(pen, bounds.Right - 1f, centerY - 3f, bounds.Left + 10f, centerY + 3f);
+                graphics.DrawLine(pen, bounds.Left + (10f * scale), centerY - (3f * scale), bounds.Right - (1f * scale), centerY + (3f * scale));
+                graphics.DrawLine(pen, bounds.Right - (1f * scale), centerY - (3f * scale), bounds.Left + (10f * scale), centerY + (3f * scale));
                 return;
             }
 
             graphics.DrawArc(
                 pen,
-                bounds.Left + 5.5f,
-                centerY - 4f,
-                6.5f,
-                8f,
+                bounds.Left + (5.5f * scale),
+                centerY - (4f * scale),
+                6.5f * scale,
+                8f * scale,
                 -55f,
                 110f);
             graphics.DrawArc(
                 pen,
-                bounds.Left + 6.5f,
-                centerY - 6f,
-                8.5f,
-                12f,
+                bounds.Left + (6.5f * scale),
+                centerY - (6f * scale),
+                8.5f * scale,
+                12f * scale,
                 -55f,
                 110f);
         }
@@ -856,12 +899,12 @@ public sealed partial class MainForm
                 : isHovered ? hoverBackground : idleBackground;
             var hasAudioState = isAudible || isMuted;
             var hasFaviconVisual = HasFaviconVisual();
-            var showSplitFaviconWithAudio = hasAudioState && hasFaviconVisual && Width >= 115;
+            var showSplitFaviconWithAudio = hasAudioState && hasFaviconVisual && Width >= ScalePx(115);
             var leftPadding = hasAudioState
-                ? (showSplitFaviconWithAudio ? 45 : 25)
+                ? (showSplitFaviconWithAudio ? ScalePx(45) : ScalePx(25))
                 : hasFaviconVisual
-                    ? 28
-                    : (isLoading || isDiscarded || isSuspended || keepAwake ? 20 : 10);
+                    ? ScalePx(28)
+                    : (isLoading || isDiscarded || isSuspended || keepAwake ? ScalePx(20) : ScalePx(10));
             Padding = new Padding(leftPadding, 0, 0, 0);
             BackColor = background;
             Invalidate();
@@ -937,6 +980,8 @@ public sealed partial class MainForm
         public EventHandler<object>? StateChangedHandler { get; set; }
         public EventHandler<object>? BytesReceivedChangedHandler { get; set; }
         public EventHandler<object>? EstimatedEndTimeChangedHandler { get; set; }
+        public bool? LastKnownFileExists { get; set; }
+        public long LastFileExistsCheckedAtTick { get; set; }
     }
 
     private static class NativeMethods
@@ -987,6 +1032,25 @@ public sealed partial class MainForm
         private const uint SwpFrameChanged = 0x0020;
         private const int TmeLeave = 0x00000002;
         private const int TmeNonClient = 0x00000010;
+        private const uint GaRoot = 2;
+        private const uint GaRootOwner = 3;
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsChild(IntPtr hWndParent, IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetLastInputInfo(ref LastInputInfo plii);
 
         [DllImport("user32.dll")]
         public static extern IntPtr MonitorFromWindow(IntPtr window, int flags);
@@ -1191,6 +1255,7 @@ public sealed partial class MainForm
             Color borderColor,
             Color textColor)
         {
+            if (SystemInformation.HighContrast) return;
             try
             {
                 var darkMode = 1;
@@ -1208,6 +1273,41 @@ public sealed partial class MainForm
             {
                 // DWM is unavailable only on unsupported legacy Windows configurations.
             }
+        }
+
+        public static bool TryGetLastInputIdleTime(out TimeSpan idleTime)
+        {
+            var info = new LastInputInfo { Size = (uint)Marshal.SizeOf<LastInputInfo>() };
+            if (!GetLastInputInfo(ref info))
+            {
+                idleTime = TimeSpan.Zero;
+                return false;
+            }
+            var elapsedMs = unchecked((uint)Environment.TickCount - info.DwTime);
+            idleTime = TimeSpan.FromMilliseconds(elapsedMs);
+            return true;
+        }
+
+        public static bool IsForegroundWindowOwnedOrChild(IntPtr mainWindow)
+        {
+            var foreground = GetForegroundWindow();
+            if (foreground == IntPtr.Zero) return false;
+            if (foreground == mainWindow
+                || IsChild(mainWindow, foreground)
+                || GetAncestor(foreground, GaRoot) == mainWindow
+                || GetAncestor(foreground, GaRootOwner) == mainWindow)
+            {
+                return true;
+            }
+            _ = GetWindowThreadProcessId(foreground, out var processId);
+            return processId == Environment.ProcessId;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LastInputInfo
+        {
+            public uint Size;
+            public uint DwTime;
         }
 
         private static int ToColorRef(Color color)
@@ -1274,7 +1374,7 @@ public sealed partial class MainForm
 
     private sealed class IncognitoBadgeControl : Control
     {
-        private static readonly Font BadgeFont = new("Segoe UI Semibold", 8.2f, FontStyle.Regular);
+        private static readonly Font BadgeFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 8.2f);
         private readonly ToolTip toolTip;
         private bool isHovered;
 
@@ -1285,13 +1385,14 @@ public sealed partial class MainForm
                 ControlStyles.AllPaintingInWmPaint
                 | ControlStyles.OptimizedDoubleBuffer
                 | ControlStyles.ResizeRedraw
+                | ControlStyles.Selectable
                 | ControlStyles.UserPaint,
                 true);
-            TabStop = false;
+            TabStop = true;
             Size = new Size(82, 26);
             Margin = new Padding(2, 3, 2, 3);
             Cursor = Cursors.Hand;
-            AccessibleRole = AccessibleRole.StaticText;
+            AccessibleRole = AccessibleRole.PushButton;
             AccessibleName = "Incognito browsing";
             AccessibleDescription = "No browsing history, cookies, or site data will be saved.";
             toolTip.SetToolTip(this, "Incognito mode: browsing history, cookies, and site data are deleted when all incognito windows close.");
@@ -1299,51 +1400,85 @@ public sealed partial class MainForm
             MouseLeave += (_, _) => { isHovered = false; Invalidate(); };
         }
 
+        protected override void OnGotFocus(EventArgs e)
+        {
+            base.OnGotFocus(e);
+            Invalidate();
+        }
+
+        protected override void OnLostFocus(EventArgs e)
+        {
+            base.OnLostFocus(e);
+            Invalidate();
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            if (e.KeyCode is Keys.Enter or Keys.Space)
+            {
+                OnClick(EventArgs.Empty);
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+            }
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
+            var highContrast = SystemInformation.HighContrast;
             var g = e.Graphics;
+            g.Clear(Parent?.BackColor ?? (highContrast ? SystemColors.Control : ChromeColor));
+            if (Width <= 4 || Height <= 4) return;
+
+            var scale = Math.Max(1f, DeviceDpi / 96f);
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            var bounds = new Rectangle(0, 0, Width - 1, Height - 1);
-            using var path = CreateRoundedRectanglePath(bounds, 7);
-            var backColor = isHovered ? Color.FromArgb(56, 24, 66) : Color.FromArgb(42, 18, 50);
+            var bounds = new RectangleF(0.5f, 0.5f, Math.Max(2f, Width - 1f), Math.Max(2f, Height - 1f));
+            using var path = NativeUiTheme.CreateRoundedPath(bounds, Math.Min(7f * scale, bounds.Height * 0.45f));
+
+            var highlighted = highContrast && (isHovered || Focused);
+            var backColor = highContrast
+                ? (highlighted ? SystemColors.Highlight : SystemColors.Control)
+                : (isHovered ? Color.FromArgb(56, 24, 66) : Color.FromArgb(42, 18, 50));
+            var borderColor = highContrast
+                ? (Focused && ShowFocusCues ? SystemColors.Highlight : SystemColors.WindowText)
+                : (Focused && ShowFocusCues ? NativeUiTheme.Focus : isHovered ? NativeUiTheme.Lavender : Color.FromArgb(120, 60, 148));
+            var fgColor = highContrast
+                ? (highlighted ? SystemColors.HighlightText : SystemColors.ControlText)
+                : NativeUiTheme.Lavender;
+
             using var brush = new SolidBrush(backColor);
-            using var borderPen = new Pen(isHovered ? NativeUiTheme.Lavender : Color.FromArgb(120, 60, 148), 1f);
+            using var borderPen = new Pen(borderColor, (Focused && ShowFocusCues ? 1.5f : 1f) * scale);
             g.FillPath(brush, path);
             g.DrawPath(borderPen, path);
 
             // Draw stealth glasses icon
-            using var lensPen = new Pen(NativeUiTheme.Lavender, 1.4f);
-            var midY = Height / 2;
-            g.DrawEllipse(lensPen, 8, midY - 4, 7, 7);
-            g.DrawEllipse(lensPen, 17, midY - 4, 7, 7);
-            g.DrawLine(lensPen, 14, midY - 2, 18, midY - 2);
+            using var lensPen = new Pen(fgColor, Math.Max(1.1f, 1.4f * scale));
+            var midY = Height / 2f;
+            var lensSize = 7f * scale;
+            g.DrawEllipse(lensPen, 8f * scale, midY - (4f * scale), lensSize, lensSize);
+            g.DrawEllipse(lensPen, 17f * scale, midY - (4f * scale), lensSize, lensSize);
+            g.DrawLine(lensPen, 14f * scale, midY - (2f * scale), 18f * scale, midY - (2f * scale));
 
             // Draw "Incognito" text
-            var textBounds = new Rectangle(27, 0, Width - 29, Height);
+            var textLeft = (int)Math.Round(27f * scale);
+            var textBounds = new Rectangle(textLeft, 0, Math.Max(1, Width - textLeft - (int)Math.Round(2f * scale)), Height);
             TextRenderer.DrawText(
                 g,
                 "Incognito",
                 BadgeFont,
                 textBounds,
-                NativeUiTheme.Lavender,
+                fgColor,
                 TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPadding);
-        }
 
-        private static GraphicsPath CreateRoundedRectanglePath(Rectangle bounds, int radius)
-        {
-            var path = new GraphicsPath();
-            var diameter = radius * 2;
-            var arc = new Rectangle(bounds.Location, new Size(diameter, diameter));
-            path.AddArc(arc, 180, 90);
-            arc.X = bounds.Right - diameter;
-            path.AddArc(arc, 270, 90);
-            arc.Y = bounds.Bottom - diameter;
-            path.AddArc(arc, 0, 90);
-            arc.X = bounds.Left;
-            path.AddArc(arc, 90, 90);
-            path.CloseFigure();
-            return path;
+            if (Focused && ShowFocusCues)
+            {
+                var focusBounds = Rectangle.Inflate(ClientRectangle, -2, -2);
+                if (focusBounds.Width > 2 && focusBounds.Height > 2)
+                {
+                    ControlPaint.DrawFocusRectangle(g, focusBounds, fgColor, backColor);
+                }
+            }
         }
     }
     private sealed class FirstClickSelectTextBox : TextBox
@@ -1617,6 +1752,8 @@ public sealed partial class MainForm
         private static readonly Color HoverSurfaceColor = NativeUiTheme.Hover;
         private static readonly Color PressedSurfaceColor = NativeUiTheme.Pressed;
         private static readonly Color FocusStrokeColor = NativeUiTheme.Focus;
+        private static readonly Font MatchCaseFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 9.2f);
+        private static readonly Font QuestionFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 9f);
         private bool isHovered;
         private bool isPressed;
         private bool isActiveToggle;
@@ -1751,7 +1888,7 @@ public sealed partial class MainForm
             {
                 surfaceBounds.Inflate(-2f, -2f);
             }
-            using var surfacePath = CreateRoundedPath(surfaceBounds, Scale(IsOmniboxEmbedded ? Math.Min(CornerRadius, 8) : CornerRadius));
+            using var surfacePath = NativeUiTheme.CreateRoundedPath(surfaceBounds, Scale(IsOmniboxEmbedded ? Math.Min(CornerRadius, 8) : CornerRadius));
             var highlighted = HighContrast && Enabled && (isPressed || isHovered || isActiveToggle);
             if (HighContrast)
             {
@@ -1892,7 +2029,7 @@ public sealed partial class MainForm
                     {
                         if (text.Equals("stop", StringComparison.Ordinal))
                         {
-                            using var stopPath = CreateRoundedPath(
+                            using var stopPath = NativeUiTheme.CreateRoundedPath(
                                 new RectangleF(
                                     center.X - (bounds.Width * 0.27f),
                                     center.Y - (bounds.Height * 0.27f),
@@ -1930,7 +2067,7 @@ public sealed partial class MainForm
                             roof,
                             new PointF(bounds.Right - (bounds.Width * 0.13f), center.Y - (bounds.Height * 0.02f))
                         ]);
-                    using (var house = CreateRoundedPath(
+                    using (var house = NativeUiTheme.CreateRoundedPath(
                         new RectangleF(
                             bounds.Left + (bounds.Width * 0.22f),
                             center.Y - (bounds.Height * 0.02f),
@@ -2024,14 +2161,10 @@ public sealed partial class MainForm
                     break;
                 case ChromeIconKind.MatchCase:
                     {
-                        using var caseFont = new Font(
-                            "Segoe UI Semibold",
-                            Math.Max(7.5f, 9.2f * scale),
-                            FontStyle.Regular);
                         TextRenderer.DrawText(
                             graphics,
                             "Aa",
-                            caseFont,
+                            MatchCaseFont,
                             ClientRectangle,
                             color,
                             TextFormatFlags.HorizontalCenter
@@ -2137,7 +2270,7 @@ public sealed partial class MainForm
                 TextRenderer.DrawText(
                     graphics,
                     "?",
-                    GetQuestionFont(scale),
+                    QuestionFont,
                     Rectangle.Round(bounds),
                     color,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
@@ -2148,24 +2281,6 @@ public sealed partial class MainForm
                 graphics.DrawEllipse(ring, bounds);
                 using var fill = new SolidBrush(color);
                 graphics.FillEllipse(fill, center.X - (2.2f * scale), center.Y - (2.2f * scale), 4.4f * scale, 4.4f * scale);
-            }
-        }
-
-        private static readonly object QuestionFontSync = new();
-        private static float cachedQuestionFontScale = -1f;
-        private static Font? cachedQuestionFont;
-
-        private static Font GetQuestionFont(float scale)
-        {
-            lock (QuestionFontSync)
-            {
-                if (cachedQuestionFont is null || Math.Abs(cachedQuestionFontScale - scale) > 0.001f)
-                {
-                    var nextFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 9f * scale);
-                    cachedQuestionFont = nextFont;
-                    cachedQuestionFontScale = scale;
-                }
-                return cachedQuestionFont;
             }
         }
 
@@ -2186,19 +2301,6 @@ public sealed partial class MainForm
         private new float Scale(float value)
         {
             return Math.Max(0.5f, value * DeviceDpi / 96f);
-        }
-
-        private static GraphicsPath CreateRoundedPath(RectangleF bounds, float radius)
-        {
-            var path = new GraphicsPath();
-            var safeRadius = Math.Max(1f, Math.Min(radius, Math.Min(bounds.Width, bounds.Height) / 2f));
-            var diameter = safeRadius * 2f;
-            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
-            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
-            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
-            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
-            path.CloseFigure();
-            return path;
         }
     }
 
@@ -2512,22 +2614,23 @@ public sealed partial class MainForm
         protected override void OnResize(EventArgs eventargs)
         {
             base.OnResize(eventargs);
-            Region = null;
             Invalidate();
         }
 
         protected override void OnPaintBackground(PaintEventArgs e)
         {
             e.Graphics.Clear(Parent?.BackColor ?? (HighContrast ? SystemColors.Window : ToolbarColor));
-            if (Width <= 2 || Height <= 2) return;
+            if (Width <= 4 || Height <= 4) return;
 
+            var scale = Math.Max(1f, DeviceDpi / 96f);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            var bounds = new RectangleF(0.5f, 0.5f, Math.Max(1f, Width - 1f), Math.Max(1f, Height - 1f));
-            using var path = CreateRoundedPath(bounds, CornerRadius);
+            var bounds = new RectangleF(0.5f, 0.5f, Math.Max(2f, Width - 1f), Math.Max(2f, Height - 1f));
+            var radius = Math.Min(CornerRadius * scale, Math.Min(bounds.Width, bounds.Height) / 2f);
+            using var path = NativeUiTheme.CreateRoundedPath(bounds, radius);
             if (HighContrast)
             {
                 using var fill = new SolidBrush(SystemColors.Window);
-                using var border = new Pen(IsFocused ? SystemColors.Highlight : SystemColors.WindowText, IsFocused ? 2f : 1f);
+                using var border = new Pen(IsFocused ? SystemColors.Highlight : SystemColors.WindowText, (IsFocused ? 2f : 1f) * scale);
                 e.Graphics.FillPath(fill, path);
                 e.Graphics.DrawPath(border, path);
                 return;
@@ -2542,7 +2645,7 @@ public sealed partial class MainForm
             try
             {
                 e.Graphics.SetClip(path, CombineMode.Intersect);
-                var topRect = new RectangleF(bounds.X, bounds.Y, bounds.Width, 3.5f);
+                var topRect = new RectangleF(bounds.X, bounds.Y, bounds.Width, 3.5f * scale);
                 using var topSheen = new LinearGradientBrush(
                     topRect,
                     Color.FromArgb(IsFocused ? 68 : 44, 255, 240, 250),
@@ -2550,7 +2653,8 @@ public sealed partial class MainForm
                     LinearGradientMode.Vertical);
                 e.Graphics.FillRectangle(topSheen, topRect);
 
-                var bottomRect = new RectangleF(bounds.X, bounds.Bottom - 3.5f, bounds.Width, 4f);
+                var bottomHeight = 4f * scale;
+                var bottomRect = new RectangleF(bounds.X, bounds.Bottom - (3.5f * scale), bounds.Width, bottomHeight);
                 using var bottomCaustic = new LinearGradientBrush(
                     bottomRect,
                     Color.FromArgb(0, FillColor),
@@ -2568,35 +2672,23 @@ public sealed partial class MainForm
                 Color.FromArgb(IsFocused ? 235 : 172, 255, 228, 246),
                 Color.FromArgb(IsFocused ? 195 : 96, IsFocused ? FocusBorderColor : NativeUiTheme.Accent),
                 LinearGradientMode.Vertical);
-            using var outerBorder = new Pen(outerRimBrush, IsFocused ? 1.6f : 1.1f);
+            using var outerBorder = new Pen(outerRimBrush, (IsFocused ? 1.6f : 1.1f) * scale);
             e.Graphics.DrawPath(outerBorder, path);
 
+            var innerInset = 1.1f * scale;
             var innerBounds = bounds;
-            innerBounds.Inflate(-1.1f, -1.1f);
-            if (innerBounds.Width > 6f && innerBounds.Height > 6f)
+            innerBounds.Inflate(-innerInset, -innerInset);
+            if (innerBounds.Width > 6f * scale && innerBounds.Height > 6f * scale)
             {
-                using var innerPath = CreateRoundedPath(innerBounds, Math.Max(2f, CornerRadius - 1.1f));
+                using var innerPath = NativeUiTheme.CreateRoundedPath(innerBounds, Math.Max(2f, radius - innerInset));
                 using var innerRimBrush = new LinearGradientBrush(
                     innerBounds,
                     Color.FromArgb(IsFocused ? 95 : 58, 255, 255, 255),
                     Color.FromArgb(18, FocusBorderColor),
                     LinearGradientMode.Vertical);
-                using var innerBorder = new Pen(innerRimBrush, 1f);
+                using var innerBorder = new Pen(innerRimBrush, 1f * scale);
                 e.Graphics.DrawPath(innerBorder, innerPath);
             }
-        }
-
-        private static GraphicsPath CreateRoundedPath(RectangleF bounds, float radius)
-        {
-            var safeRadius = Math.Max(1f, Math.Min(radius, Math.Min(bounds.Width, bounds.Height) / 2f));
-            var diameter = safeRadius * 2f;
-            var path = new GraphicsPath();
-            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180f, 90f);
-            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270f, 90f);
-            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0f, 90f);
-            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90f, 90f);
-            path.CloseFigure();
-            return path;
         }
     }
 

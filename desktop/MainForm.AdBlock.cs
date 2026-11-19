@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using Microsoft.Win32;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -206,9 +207,92 @@ public sealed partial class MainForm
         return false;
     }
 
+    private readonly ConditionalWeakTable<CoreWebView2, Dictionary<string, string>> installedUserScriptIdsByCore = new();
+
+    private Dictionary<string, string> GetOrCreateUserScriptIdMap(CoreWebView2 core) =>
+        installedUserScriptIdsByCore.GetValue(core, static _ => new Dictionary<string, string>(StringComparer.Ordinal));
+
+    private void PruneOffScopeDocumentScripts(
+        BrowserTab tab,
+        CoreWebView2 core,
+        string? targetUrl,
+        bool allowSynchronousScan)
+    {
+        var targetHost = string.IsNullOrWhiteSpace(targetUrl) ? string.Empty : HostFromUrl(targetUrl);
+        if (tab.YouTubeDocumentScriptId is not null
+            && (!adBlockEnabled || string.IsNullOrWhiteSpace(targetUrl) || !IsYouTubeHost(targetHost)))
+        {
+            TryRemoveAdBlockScript(
+                core,
+                tab.YouTubeDocumentScriptId,
+                "Could not remove an off-scope YouTube document shield");
+            tab.YouTubeDocumentScriptId = null;
+        }
+
+        if (tab.ChromeStoreBridgeScriptId is not null
+            && !ShouldEnableChromeStoreInstallBridge(targetUrl, isPrivateMode))
+        {
+            TryRemoveAdBlockScript(
+                core,
+                tab.ChromeStoreBridgeScriptId,
+                "Could not remove an off-scope Web Store install bridge");
+            tab.ChromeStoreBridgeScriptId = null;
+        }
+
+        if (!installedUserScriptIdsByCore.TryGetValue(core, out var userScriptIds) || userScriptIds.Count == 0)
+        {
+            if (isPrivateMode || string.IsNullOrWhiteSpace(targetUrl))
+            {
+                tab.InstalledUserScriptKeys.Clear();
+            }
+            return;
+        }
+
+        var desiredScripts = isPrivateMode || string.IsNullOrWhiteSpace(targetUrl)
+            ? Array.Empty<(string Key, string Script)>()
+            : allowSynchronousScan
+                ? browserExtensions.GetScriptsForUrl(targetUrl)
+                : browserExtensions.GetCachedScriptsForUrl(targetUrl);
+        if (desiredScripts.Count == 0)
+        {
+            foreach (var (installedKey, scriptId) in userScriptIds.ToArray())
+            {
+                TryRemoveAdBlockScript(core, scriptId, "Could not remove an off-scope user script");
+                userScriptIds.Remove(installedKey);
+                tab.InstalledUserScriptKeys.Remove(installedKey);
+            }
+            return;
+        }
+
+        HashSet<string>? desiredKeys = null;
+        foreach (var (installedKey, scriptId) in userScriptIds.ToArray())
+        {
+            desiredKeys ??= desiredScripts.Select(item => item.Key).ToHashSet(StringComparer.Ordinal);
+            if (desiredKeys.Contains(installedKey)) continue;
+            TryRemoveAdBlockScript(core, scriptId, "Could not remove an off-scope or updated user script");
+            userScriptIds.Remove(installedKey);
+            tab.InstalledUserScriptKeys.Remove(installedKey);
+        }
+    }
+
     private async Task EnsureUrlScopedScriptsRegisteredAsync(BrowserTab tab, string? url)
     {
-        if (isClosing || tab.IsClosed || tab.Core is not { } core || string.IsNullOrWhiteSpace(url))
+        if (isClosing || tab.IsClosed || tab.Core is not { } core)
+        {
+            return;
+        }
+
+        if (!isPrivateMode)
+        {
+            await browserExtensions.EnsureScriptsLoadedAsync();
+            if (isClosing || tab.IsClosed || !ReferenceEquals(tab.Core, core))
+            {
+                return;
+            }
+        }
+
+        PruneOffScopeDocumentScripts(tab, core, url, allowSynchronousScan: true);
+        if (string.IsNullOrWhiteSpace(url))
         {
             return;
         }
@@ -250,13 +334,21 @@ public sealed partial class MainForm
                 }
             }
 
+            var userScriptIds = GetOrCreateUserScriptIdMap(core);
             foreach (var (key, script) in browserExtensions.GetScriptsForUrl(url))
             {
                 if (tab.IsClosed || !ReferenceEquals(tab.Core, core) || isClosing) break;
                 if (!tab.InstalledUserScriptKeys.Add(key)) continue;
                 try
                 {
-                    await core.AddScriptToExecuteOnDocumentCreatedAsync(script);
+                    var scriptId = await core.AddScriptToExecuteOnDocumentCreatedAsync(script);
+                    if (tab.IsClosed || !ReferenceEquals(tab.Core, core) || isClosing)
+                    {
+                        TryRemoveAdBlockScript(core, scriptId, "Could not remove a stale user script");
+                        tab.InstalledUserScriptKeys.Remove(key);
+                        break;
+                    }
+                    userScriptIds[key] = scriptId;
                 }
                 catch (Exception error)
                 {
@@ -434,26 +526,39 @@ public sealed partial class MainForm
             && tab.Core is { } scopedNavigationCore)
         {
             var targetUri = e.Uri;
-            tab.PendingScopedScriptNavigationUrl = targetUri;
-            tab.PendingFileNavigationUrl = pendingFileNavigation;
-            e.Cancel = true;
-            RunUiTask(
-                async () =>
-                {
-                    await EnsureUrlScopedScriptsRegisteredAsync(tab, targetUri);
-                    if (isClosing
-                        || tab.IsClosed
-                        || !ReferenceEquals(tab.Core, scopedNavigationCore))
+            if (IsPostNavigation(e))
+            {
+                RunUiTask(
+                    () => EnsureUrlScopedScriptsRegisteredAsync(tab, targetUri),
+                    "Navigation script setup failed");
+            }
+            else
+            {
+                tab.PendingScopedScriptNavigationUrl = targetUri;
+                tab.PendingFileNavigationUrl = pendingFileNavigation;
+                e.Cancel = true;
+                RunUiTask(
+                    async () =>
                     {
-                        return;
-                    }
-                    NavigateTabCore(tab, targetUri);
-                },
-                "Navigation script setup failed");
-            return;
+                        await EnsureUrlScopedScriptsRegisteredAsync(tab, targetUri);
+                        if (isClosing
+                            || tab.IsClosed
+                            || !ReferenceEquals(tab.Core, scopedNavigationCore))
+                        {
+                            return;
+                        }
+                        NavigateTabCore(tab, targetUri);
+                    },
+                    "Navigation script setup failed");
+                return;
+            }
         }
 
         tab.PendingScopedScriptNavigationUrl = null;
+        if (tab.Core is { } activeNavigationCore)
+        {
+            PruneOffScopeDocumentScripts(tab, activeNavigationCore, e.Uri, allowSynchronousScan: false);
+        }
         ClearTabHoverStatus(tab);
         StopFindSession(tab);
         tab.ReaderModeActive = false;
@@ -534,6 +639,19 @@ public sealed partial class MainForm
         UpdateTabHeader(tab);
     }
 
+    private static bool IsPostNavigation(CoreWebView2NavigationStartingEventArgs e)
+    {
+        try
+        {
+            var headers = e.RequestHeaders;
+            return headers.Contains("Content-Type") || headers.Contains("Content-Length");
+        }
+        catch (Exception error) when (error is ArgumentException or COMException or InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
     private void OnWebResourceRequested(
         BrowserTab tab,
         CoreWebView2WebResourceRequestedEventArgs e)
@@ -542,44 +660,61 @@ public sealed partial class MainForm
 
         var request = e.Request;
         var requestUri = request.Uri;
+        Uri.TryCreate(requestUri, UriKind.Absolute, out var parsedRequestUri);
         var requestHeaders = request.Headers;
         var resourceContext = e.ResourceContext;
         var requestedSourceKind = e.RequestedSourceKind;
         var topLevelUrl = !string.IsNullOrEmpty(tab.Url) && !tab.IsStartPage
             ? tab.Url
             : (tab.Core?.Source ?? tab.Url);
+        Uri.TryCreate(topLevelUrl, UriKind.Absolute, out var parsedTopLevelUri);
         var documentSource = (requestedSourceKind & DocumentRequestSources) != 0;
         var workerSource = (requestedSourceKind & WorkerRequestSources) != 0;
+        var documentGeneration = tab.DocumentNavigationGeneration;
         var resourceType = MapResourceType(
             resourceContext,
             resourceContext == CoreWebView2WebResourceContext.Document
                 ? GetRequestHeader(requestHeaders, "Sec-Fetch-Dest")
                 : null,
             resourceContext == CoreWebView2WebResourceContext.Document
-                && tab.AdBlockSubframeUrls.Contains(requestUri, tab.DocumentNavigationGeneration));
+                && tab.AdBlockSubframeUrls.GetRemaining(documentGeneration) > 0
+                && tab.AdBlockSubframeUrls.Contains(requestUri, documentGeneration));
         var sourceUrl = GetAdBlockSourceUrl(
             tab,
             requestHeaders,
             requestedSourceKind,
             resourceType,
             topLevelUrl,
+            parsedTopLevelUri,
+            documentGeneration,
+            out var parsedSourceUri,
             out var requestSourceAttributed);
         if (adBlockExceptionHosts.Count > 0
-            && (IsExceptionHost(HostFromUrl(requestUri))
-                || (documentSource && IsExceptionHost(HostFromUrl(topLevelUrl)))
-                || IsExceptionHost(HostFromUrl(sourceUrl)))) return;
+            && ((parsedRequestUri is not null
+                    ? IsExceptionHost(parsedRequestUri)
+                    : IsExceptionHost(HostFromUrl(requestUri)))
+                || (documentSource && IsExceptionHost(parsedTopLevelUri))
+                || IsExceptionHost(parsedSourceUri))) return;
         // A media stream is not an ad simply because it comes from one of
         // YouTube's rotating googlevideo hosts. Filter-list false positives
         // here produce the exact black/error player which a reload may hide.
         // Keep the narrow player bootstrap and videoplayback transport alive;
         // ad response pruning and player-side skip logic still handle ads.
-        if (ShouldBypassYouTubePlaybackRequest(topLevelUrl, sourceUrl, requestUri, resourceType)) return;
-        if (ShouldBypassCommunicationRequest(topLevelUrl, sourceUrl, requestUri, resourceType, workerSource)) return;
+        if (ShouldBypassYouTubePlaybackRequest(parsedTopLevelUri, parsedSourceUri, parsedRequestUri, resourceType)) return;
+        if (ShouldBypassCommunicationRequest(
+                parsedTopLevelUri,
+                topLevelUrl,
+                parsedSourceUri,
+                sourceUrl,
+                parsedRequestUri,
+                requestUri,
+                resourceType,
+                workerSource)) return;
         if (resourceType is AdBlockResourceType.WebSocket or AdBlockResourceType.Media)
         {
-            var topLevelOrigin = NormalizePermissionOrigin(topLevelUrl);
+            var topLevelOrigin = NormalizePermissionOrigin(parsedTopLevelUri);
             var requestSourceOrigin = requestSourceAttributed
-                ? NormalizePermissionOrigin(sourceUrl)
+                ? NormalizePermissionOrigin(parsedSourceUri)
                 : null;
             var sourceMatchesGrantedOrigin = tab.HasMediaCapturePermissionForOrigin(requestSourceOrigin);
             var topLevelMatchesGrantedOrigin = tab.HasMediaCapturePermissionForOrigin(topLevelOrigin);
@@ -589,7 +724,9 @@ public sealed partial class MainForm
             var compatibilityPageUrl = workerSource || hasDistinctRequestSource
                 ? sourceUrl
                 : topLevelUrl;
-            var compatibilityOrigin = NormalizePermissionOrigin(compatibilityPageUrl);
+            var compatibilityOrigin = workerSource || hasDistinctRequestSource
+                ? requestSourceOrigin
+                : topLevelOrigin;
             var mediaPermissionGranted = workerSource
                 ? requestSourceAttributed
                     && compatibilityOrigin is not null && tabs.Any(item =>
@@ -612,11 +749,22 @@ public sealed partial class MainForm
             cacheEvaluation: !isPrivateMode);
         if (!evaluation.Blocked) return;
 
-        e.Response = CreateBlockedResourceResponse(resourceType, requestUri, topLevelUrl, requestHeaders);
+        e.Response = CreateBlockedResourceResponse(
+            resourceType,
+            requestUri,
+            topLevelUrl,
+            requestHeaders,
+            parsedRequestUri,
+            parsedTopLevelUri);
         tab.RecordBlockedAttempt(evaluation);
         if (tab.BlockedRequestCount == 1) ShowTransientStatus("Shield blocked ad and tracker requests");
         else if (activeTab == tab && !statusUiTimer.Enabled) statusUiTimer.Start();
     }
+
+    private static bool IsHttpUri(Uri? uri, string rawUrl) =>
+        uri is not null
+        && rawUrl.Length <= BrowserPolicy.MaximumUrlLength
+        && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
 
     private string GetAdBlockSourceUrl(
         BrowserTab tab,
@@ -624,17 +772,21 @@ public sealed partial class MainForm
         CoreWebView2WebResourceRequestSourceKinds sourceKind,
         AdBlockResourceType resourceType,
         string topLevelUrl,
+        Uri? parsedTopLevelUri,
+        long documentGeneration,
+        out Uri? parsedSourceUri,
         out bool sourceWasAttributed)
     {
         sourceWasAttributed = false;
         var isWorkerSource = (sourceKind & WorkerRequestSources) != 0;
         if (!isWorkerSource
             && resourceType is not (AdBlockResourceType.WebSocket or AdBlockResourceType.Media)
-            && tab.AdBlockSubframeUrls.Remaining == 0
+            && tab.AdBlockSubframeUrls.GetRemaining(documentGeneration) == 0
             && tab.FrameOrigins.Count == 0
-            && BrowserPolicy.IsHttpUrl(topLevelUrl))
+            && IsHttpUri(parsedTopLevelUri, topLevelUrl))
         {
             sourceWasAttributed = true;
+            parsedSourceUri = parsedTopLevelUri;
             return topLevelUrl;
         }
         foreach (var name in RequestSourceHeaderNames)
@@ -643,9 +795,12 @@ public sealed partial class MainForm
             {
                 if (!headers.Contains(name)) continue;
                 var value = headers.GetHeader(name);
-                if (BrowserPolicy.IsHttpUrl(value))
+                if (value.Length <= BrowserPolicy.MaximumUrlLength
+                    && Uri.TryCreate(value, UriKind.Absolute, out var headerUri)
+                    && (headerUri.Scheme == Uri.UriSchemeHttp || headerUri.Scheme == Uri.UriSchemeHttps))
                 {
                     sourceWasAttributed = true;
+                    parsedSourceUri = headerUri;
                     return value;
                 }
             }
@@ -657,11 +812,13 @@ public sealed partial class MainForm
             // Worker events are environment-wide and may be raised on a tab
             // unrelated to the worker. Unknown is safer than pretending the
             // request target is its own first-party source.
+            parsedSourceUri = null;
             return string.Empty;
         }
         // Reuse the top-level URL the caller already resolved. Reading
         // CoreWebView2.Source is a marshalled COM getter on the UI thread and
         // this handler runs for every subresource of every page.
+        parsedSourceUri = parsedTopLevelUri;
         return topLevelUrl;
     }
 
@@ -696,6 +853,9 @@ public sealed partial class MainForm
         private long recordedGeneration = -1;
 
         public int Remaining => urls.Count;
+
+        public int GetRemaining(long documentGeneration) =>
+            recordedGeneration == documentGeneration ? urls.Count : 0;
 
         public void Record(string url, long documentGeneration)
         {
@@ -839,12 +999,26 @@ public sealed partial class MainForm
         string? requestUrl,
         AdBlockResourceType resourceType)
     {
-        if (string.IsNullOrWhiteSpace(requestUrl))
+        if (string.IsNullOrWhiteSpace(requestUrl)
+            || !Uri.TryCreate(requestUrl, UriKind.Absolute, out var request))
         {
             return false;
         }
 
-        if (!Uri.TryCreate(requestUrl, UriKind.Absolute, out var request))
+        Uri? topUri = null;
+        Uri? srcUri = null;
+        if (!string.IsNullOrWhiteSpace(topLevelUrl)) Uri.TryCreate(topLevelUrl, UriKind.Absolute, out topUri);
+        if (!string.IsNullOrWhiteSpace(sourceUrl)) Uri.TryCreate(sourceUrl, UriKind.Absolute, out srcUri);
+        return ShouldBypassYouTubePlaybackRequest(topUri, srcUri, request, resourceType);
+    }
+
+    private static bool ShouldBypassYouTubePlaybackRequest(
+        Uri? topLevelUri,
+        Uri? sourceUri,
+        Uri? request,
+        AdBlockResourceType resourceType)
+    {
+        if (request is null)
         {
             return false;
         }
@@ -885,12 +1059,8 @@ public sealed partial class MainForm
                 or AdBlockResourceType.Other;
         }
 
-        var topLevelIsYouTube = !string.IsNullOrWhiteSpace(topLevelUrl)
-            && Uri.TryCreate(topLevelUrl, UriKind.Absolute, out var topUri)
-            && IsYouTubeHost(topUri.Host);
-        var sourceIsYouTube = !string.IsNullOrWhiteSpace(sourceUrl)
-            && Uri.TryCreate(sourceUrl, UriKind.Absolute, out var srcUri)
-            && IsYouTubeHost(srcUri.Host);
+        var topLevelIsYouTube = topLevelUri is not null && IsYouTubeHost(topLevelUri.Host);
+        var sourceIsYouTube = sourceUri is not null && IsYouTubeHost(sourceUri.Host);
 
         if (topLevelIsYouTube || sourceIsYouTube)
         {
@@ -910,6 +1080,35 @@ public sealed partial class MainForm
         AdBlockResourceType resourceType,
         bool workerSource)
     {
+        if (string.IsNullOrWhiteSpace(requestUrl)
+            || !Uri.TryCreate(requestUrl, UriKind.Absolute, out var requestUri))
+        {
+            return false;
+        }
+
+        return ShouldBypassCommunicationRequest(
+            topLevelUri: null,
+            topLevelUrl: topLevelUrl,
+            sourceUri: null,
+            sourceUrl: sourceUrl,
+            requestUri: requestUri,
+            requestUrl: requestUrl,
+            resourceType: resourceType,
+            workerSource: workerSource);
+    }
+
+    private static bool ShouldBypassCommunicationRequest(
+        Uri? topLevelUri,
+        string? topLevelUrl,
+        Uri? sourceUri,
+        string? sourceUrl,
+        Uri? requestUri,
+        string? requestUrl,
+        AdBlockResourceType resourceType,
+        bool workerSource)
+    {
+        _ = topLevelUri;
+        _ = sourceUri;
         if (resourceType is not (AdBlockResourceType.WebSocket
                 or AdBlockResourceType.Media
                 or AdBlockResourceType.XmlHttpRequest
@@ -921,24 +1120,33 @@ public sealed partial class MainForm
             return false;
         }
 
-        var targetUrl = !string.IsNullOrEmpty(topLevelUrl) && !topLevelUrl.Equals("about:blank", StringComparison.OrdinalIgnoreCase)
-            ? topLevelUrl
-            : sourceUrl;
-
-        if (CommunicationCompatibilityPolicy.ShouldBypassCommunicationRequest(targetUrl, requestUrl, resourceType))
+        if (requestUri is null
+            || requestUri.Scheme is not ("https" or "wss")
+            || !CommunicationCompatibilityPolicy.IsProviderTransportHost(requestUri.IdnHost))
         {
-            return true;
+            return false;
         }
 
-        if (workerSource && Uri.TryCreate(requestUrl, UriKind.Absolute, out var reqUri))
+        string? targetUrl;
+        if (workerSource)
         {
-            if (CommunicationCompatibilityPolicy.IsProviderTransportHost(reqUri.IdnHost))
-            {
-                return true;
-            }
+            // Worker requests carry their true origin in sourceUrl (Origin/Referer)
+            // when available; only fall back to topLevelUrl if unattributed.
+            targetUrl = !string.IsNullOrEmpty(sourceUrl) && !sourceUrl.Equals("about:blank", StringComparison.OrdinalIgnoreCase)
+                ? sourceUrl
+                : topLevelUrl;
+        }
+        else
+        {
+            targetUrl = !string.IsNullOrEmpty(topLevelUrl) && !topLevelUrl.Equals("about:blank", StringComparison.OrdinalIgnoreCase)
+                ? topLevelUrl
+                : sourceUrl;
         }
 
-        return false;
+        return CommunicationCompatibilityPolicy.ShouldBypassCommunicationRequest(
+            targetUrl,
+            requestUrl,
+            resourceType);
     }
 
     // AdBlockDocumentScript.cs runs its YouTube runtime on every YouTube-owned
@@ -983,27 +1191,51 @@ public sealed partial class MainForm
 
     internal static bool IsAdNetworkHost(string? host) => IsHostWithinDomains(host, AdNetworkStubDomains);
 
-    private static bool IsYouTubeUrl(string? url) =>
-        !string.IsNullOrWhiteSpace(url)
-        && Uri.TryCreate(url, UriKind.Absolute, out var uri)
+    private static bool IsYouTubeUri(Uri? uri) =>
+        uri is not null
         && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
         && IsYouTubeHost(uri.Host);
+
+    private static string? NormalizePermissionOrigin(Uri? uri)
+    {
+        if (uri is null
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
+            || string.IsNullOrWhiteSpace(uri.Host)
+            || !string.IsNullOrEmpty(uri.UserInfo))
+        {
+            return null;
+        }
+        var host = uri.HostNameType == UriHostNameType.IPv6
+            ? $"[{uri.IdnHost}]"
+            : uri.IdnHost;
+        var port = uri.IsDefaultPort ? string.Empty : $":{uri.Port}";
+        return $"{uri.Scheme.ToLowerInvariant()}://{host}{port}";
+    }
 
     private CoreWebView2WebResourceResponse? CreateBlockedResourceResponse(
         AdBlockResourceType resourceType,
         string? requestUrl = null,
         string? topLevelUrl = null,
-        CoreWebView2HttpRequestHeaders? requestHeaders = null)
+        CoreWebView2HttpRequestHeaders? requestHeaders = null,
+        Uri? parsedRequestUri = null,
+        Uri? parsedTopLevelUri = null)
     {
         if (environment is null) return null;
+        if (parsedRequestUri is null && !string.IsNullOrWhiteSpace(requestUrl))
+        {
+            Uri.TryCreate(requestUrl, UriKind.Absolute, out parsedRequestUri);
+        }
+        if (parsedTopLevelUri is null && !string.IsNullOrWhiteSpace(topLevelUrl))
+        {
+            Uri.TryCreate(topLevelUrl, UriKind.Absolute, out parsedTopLevelUri);
+        }
         // Shape the stub after the parsed host, never after a substring of the
         // URL text. "https://myyoutube.com/" contains "youtube.com" as a
         // substring, and answering that site's fetch with a fabricated
         // /pagead/id payload would hand a non-YouTube page a YouTube response.
-        var isYouTubeContext = IsYouTubeUrl(topLevelUrl)
-            || IsYouTubeUrl(requestUrl)
-            || (Uri.TryCreate(requestUrl, UriKind.Absolute, out var adRequest)
-                && IsAdNetworkHost(adRequest.IdnHost));
+        var isYouTubeContext = IsYouTubeUri(parsedTopLevelUri)
+            || IsYouTubeUri(parsedRequestUri)
+            || (parsedRequestUri is not null && IsAdNetworkHost(parsedRequestUri.IdnHost));
 
         if (isYouTubeContext)
         {
@@ -1013,7 +1245,7 @@ public sealed partial class MainForm
             // into the stub response headers.
             var headerOrigin = NormalizePermissionOrigin(
                 requestHeaders is not null ? GetRequestHeader(requestHeaders, "Origin") : null);
-            var topLevelOrigin = NormalizePermissionOrigin(topLevelUrl);
+            var topLevelOrigin = NormalizePermissionOrigin(parsedTopLevelUri);
             origin = headerOrigin ?? topLevelOrigin ?? origin;
 
             if (requestUrl is not null && requestUrl.Contains("/pagead/id", StringComparison.OrdinalIgnoreCase))
@@ -1413,9 +1645,11 @@ public sealed partial class MainForm
         await frame.ExecuteScriptAsync(css.Length == 0
             ? CreateCosmeticStyleRemovalScript()
             : CreateCosmeticStyleScript(
+                adBlocker,
                 css,
                 ruleHostUrl,
-                requireMatchingHost: BrowserPolicy.IsHttpUrl(frameUrl)));
+                requireMatchingHost: BrowserPolicy.IsHttpUrl(frameUrl),
+                cacheSerialization: !isPrivateMode));
     }
 
     private async Task ApplyAdBlockCosmeticsAsync(BrowserTab tab)
@@ -1423,6 +1657,7 @@ public sealed partial class MainForm
         var core = tab.Core;
         if (core is null || tab.IsClosed || isClosing) return;
         var pageUrl = core.Source;
+        var documentGeneration = tab.DocumentNavigationGeneration;
         var exception = !adBlockEnabled || IsExceptionHost(HostFromUrl(pageUrl));
         if (exception)
         {
@@ -1434,6 +1669,7 @@ public sealed partial class MainForm
         if (!adBlockEnabled
             || tab.IsClosed
             || tab.Core != core
+            || tab.DocumentNavigationGeneration != documentGeneration
             || !BrowserPolicy.UrlEquals(core.Source, pageUrl)
             || IsExceptionHost(HostFromUrl(core.Source)))
         {
@@ -1444,57 +1680,149 @@ public sealed partial class MainForm
         if (!adBlockEnabled
             || tab.IsClosed
             || tab.Core != core
+            || tab.DocumentNavigationGeneration != documentGeneration
+            || !BrowserPolicy.UrlEquals(core.Source, pageUrl)
             || IsExceptionHost(HostFromUrl(core.Source))) return;
         await core.ExecuteScriptAsync(css.Length == 0
             ? CreateCosmeticStyleRemovalScript()
-            : CreateCosmeticStyleScript(css, pageUrl));
+            : CreateCosmeticStyleScript(
+                adBlocker,
+                css,
+                pageUrl,
+                cacheSerialization: !isPrivateMode));
     }
 
     private const int MaximumCachedSerializedCosmeticCssEntries = 32;
-    private static readonly object SerializedCosmeticCssCacheSync = new();
-    private static readonly Dictionary<string, LinkedListNode<(string Css, string Serialized)>> SerializedCosmeticCssCacheMap =
-        new(MaximumCachedSerializedCosmeticCssEntries, StringComparer.Ordinal);
-    private static readonly LinkedList<(string Css, string Serialized)> SerializedCosmeticCssCacheOrder = new();
+    private static readonly ConditionalWeakTable<AdBlockEngine, SerializedCosmeticCssCache> CosmeticCssCachesByEngine = new();
 
-    private static string GetOrSerializeCosmeticCss(string css)
+    private readonly record struct CosmeticCssCacheKey(string Host, int CssLength);
+    private readonly record struct CachedCosmeticCssEntry(CosmeticCssCacheKey Key, string RawCss, string Serialized);
+
+    private sealed class SerializedCosmeticCssCache
     {
-        lock (SerializedCosmeticCssCacheSync)
+        private readonly object sync = new();
+        private readonly Dictionary<CosmeticCssCacheKey, LinkedListNode<CachedCosmeticCssEntry>> SerializedCosmeticCssCacheMap =
+            new(MaximumCachedSerializedCosmeticCssEntries);
+        private readonly LinkedList<CachedCosmeticCssEntry> order = new();
+        private readonly CachedCosmeticCssEntry[] recentIdentities = new CachedCosmeticCssEntry[4];
+        private int nextIdentitySlot;
+        private bool lastReady;
+        private AdBlockCompileDiagnostics lastDiagnostics;
+
+        public string GetOrSerialize(AdBlockEngine engine, string pageUrl, string css)
         {
-            if (SerializedCosmeticCssCacheMap.TryGetValue(css, out var existingNode))
+            var host = HostFromUrl(pageUrl).ToLowerInvariant();
+            var key = new CosmeticCssCacheKey(host, css.Length);
+            var isReady = engine.IsReady;
+            var diagnostics = engine.LastCompileDiagnostics;
+
+            lock (sync)
             {
-                SerializedCosmeticCssCacheOrder.Remove(existingNode);
-                SerializedCosmeticCssCacheOrder.AddLast(existingNode);
-                return existingNode.Value.Serialized;
+                if (isReady != lastReady || diagnostics != lastDiagnostics)
+                {
+                    ClearLocked();
+                    lastReady = isReady;
+                    lastDiagnostics = diagnostics;
+                }
+
+                for (var i = 0; i < recentIdentities.Length; i++)
+                {
+                    if (ReferenceEquals(recentIdentities[i].RawCss, css))
+                    {
+                        return recentIdentities[i].Serialized;
+                    }
+                }
+
+                if (SerializedCosmeticCssCacheMap.TryGetValue(key, out var existingNode)
+                    && ReferenceEquals(existingNode.Value.RawCss, css))
+                {
+                    order.Remove(existingNode);
+                    order.AddLast(existingNode);
+                    return existingNode.Value.Serialized;
+                }
+            }
+
+            var serialized = JsonSerializer.Serialize(css, BrowserStateJsonContext.Default.String);
+            lock (sync)
+            {
+                if (engine.IsReady != isReady || engine.LastCompileDiagnostics != diagnostics)
+                {
+                    ClearLocked();
+                    lastReady = engine.IsReady;
+                    lastDiagnostics = engine.LastCompileDiagnostics;
+                    return serialized;
+                }
+
+                if (SerializedCosmeticCssCacheMap.TryGetValue(key, out var existingNode))
+                {
+                    if (ReferenceEquals(existingNode.Value.RawCss, css))
+                    {
+                        order.Remove(existingNode);
+                        order.AddLast(existingNode);
+                        return existingNode.Value.Serialized;
+                    }
+                    order.Remove(existingNode);
+                    SerializedCosmeticCssCacheMap.Remove(key);
+                }
+
+                while (SerializedCosmeticCssCacheMap.Count >= MaximumCachedSerializedCosmeticCssEntries
+                       && order.First is { } oldest)
+                {
+                    order.RemoveFirst();
+                    SerializedCosmeticCssCacheMap.Remove(oldest.Value.Key);
+                }
+
+                var entry = new CachedCosmeticCssEntry(key, css, serialized);
+                var node = order.AddLast(entry);
+                SerializedCosmeticCssCacheMap[key] = node;
+                recentIdentities[nextIdentitySlot++ & 3] = entry;
+                return serialized;
             }
         }
 
-        var serialized = JsonSerializer.Serialize(css, BrowserStateJsonContext.Default.String);
-        lock (SerializedCosmeticCssCacheSync)
+        public void Clear()
         {
-            if (SerializedCosmeticCssCacheMap.TryGetValue(css, out var existingNode))
-            {
-                SerializedCosmeticCssCacheOrder.Remove(existingNode);
-                SerializedCosmeticCssCacheOrder.AddLast(existingNode);
-                return existingNode.Value.Serialized;
-            }
-            while (SerializedCosmeticCssCacheMap.Count >= MaximumCachedSerializedCosmeticCssEntries
-                   && SerializedCosmeticCssCacheOrder.First is { } oldest)
-            {
-                SerializedCosmeticCssCacheOrder.RemoveFirst();
-                SerializedCosmeticCssCacheMap.Remove(oldest.Value.Css);
-            }
-            var node = SerializedCosmeticCssCacheOrder.AddLast((css, serialized));
-            SerializedCosmeticCssCacheMap[css] = node;
-            return serialized;
+            lock (sync) ClearLocked();
+        }
+
+        private void ClearLocked()
+        {
+            SerializedCosmeticCssCacheMap.Clear();
+            order.Clear();
+            Array.Clear(recentIdentities);
+        }
+    }
+
+    private static string GetOrSerializeCosmeticCss(
+        AdBlockEngine engine,
+        string pageUrl,
+        string css,
+        bool cacheSerialization)
+    {
+        if (!cacheSerialization)
+        {
+            return JsonSerializer.Serialize(css, BrowserStateJsonContext.Default.String);
+        }
+        var cache = CosmeticCssCachesByEngine.GetValue(engine, static _ => new SerializedCosmeticCssCache());
+        return cache.GetOrSerialize(engine, pageUrl, css);
+    }
+
+    private static void ClearCosmeticCssCache(AdBlockEngine engine)
+    {
+        if (CosmeticCssCachesByEngine.TryGetValue(engine, out var cache))
+        {
+            cache.Clear();
         }
     }
 
     private static string CreateCosmeticStyleScript(
+        AdBlockEngine engine,
         string css,
         string pageUrl,
-        bool requireMatchingHost = true)
+        bool requireMatchingHost = true,
+        bool cacheSerialization = true)
     {
-        var serializedCss = GetOrSerializeCosmeticCss(css);
+        var serializedCss = GetOrSerializeCosmeticCss(engine, pageUrl, css, cacheSerialization);
         var serializedPageUrl = JsonSerializer.Serialize(pageUrl, BrowserStateJsonContext.Default.String);
         // The guard used to compare the full URL, so a client-side redirect or a
         // History API rewrite before DOMContentLoaded silently dropped the whole
@@ -1639,6 +1967,7 @@ public sealed partial class MainForm
         }
         else
         {
+            ClearCosmeticCssCache(adBlocker);
             foreach (var tab in tabs.Where(item => item.Core is not null))
             {
                 RemoveAdBlockFiltering(tab);
@@ -1651,6 +1980,24 @@ public sealed partial class MainForm
         SavePreferences();
         ShowTransientStatus(adBlockEnabled ? "Ad and tracker blocker on" : "Ad and tracker blocker off");
         UpdateStatus();
+    }
+
+    private bool IsExceptionHost(Uri? uri)
+    {
+        if (adBlockExceptionHosts.Count == 0 || uri is null || string.IsNullOrWhiteSpace(uri.Host))
+        {
+            return false;
+        }
+        if (uri.HostNameType == UriHostNameType.Dns)
+        {
+            var host = uri.IdnHost.TrimEnd('.');
+            return host.Length > 0 && adBlockExceptionHosts.Contains(host);
+        }
+        if (uri.HostNameType == UriHostNameType.IPv4)
+        {
+            return adBlockExceptionHosts.Contains(uri.Host);
+        }
+        return IsExceptionHost(uri.Host);
     }
 
     private bool IsExceptionHost(string host)
@@ -1692,23 +2039,28 @@ public sealed partial class MainForm
             ShowTransientStatus($"Shield disabled for {normalized}");
         }
 
-        RefreshAdBlockPagePolicies();
-        foreach (var matchingTab in tabs.Where(item =>
-                     !item.IsClosed
-                     && !item.IsStartPage
-                     && item.Core is not null
-                     && BrowserPolicy.IsExactHost(HostFromUrl(item.Core.Source ?? item.Url), normalized)).ToArray())
+        var matchingTabs = tabs.Where(item =>
+                !item.IsClosed
+                && !item.IsStartPage
+                && item.Core is not null
+                && BrowserPolicy.IsExactHost(HostFromUrl(item.Core.Source ?? item.Url), normalized))
+            .ToArray();
+        var excludedTabs = matchingTabs.Length > 0
+            ? new HashSet<BrowserTab>(matchingTabs, ReferenceEqualityComparer.Instance)
+            : null;
+        RefreshAdBlockPagePolicies(excludedTabs);
+        foreach (var matchingTab in matchingTabs)
         {
             matchingTab.ResetBlockedStats();
             RunUiTask(
                 async () =>
                 {
                     if (matchingTab.Core is null) return;
-                    if (shieldEnabled && adBlockEnabled)
+                    if (adBlockEnabled)
                     {
                         await InstallAdBlockPageScriptsAsync(matchingTab);
                     }
-                    else if (!shieldEnabled)
+                    if (!shieldEnabled)
                     {
                         await DisableAdBlockForCurrentDocumentAsync(matchingTab);
                     }
@@ -1849,10 +2201,13 @@ public sealed partial class MainForm
         ShowTransientStatus($"Site preferences reset for {host}");
     }
 
-    private void RefreshAdBlockPagePolicies()
+    private void RefreshAdBlockPagePolicies(IReadOnlySet<BrowserTab>? excludedTabs = null)
     {
         if (!adBlockEnabled) return;
-        foreach (var tab in tabs.Where(item => item.Core is not null && !item.IsClosed))
+        foreach (var tab in tabs.Where(item =>
+                     item.Core is not null
+                     && !item.IsClosed
+                     && (excludedTabs is null || !excludedTabs.Contains(item))))
         {
             RunUiTask(
                 () => InstallAdBlockPageScriptsAsync(tab),

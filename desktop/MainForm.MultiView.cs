@@ -79,9 +79,12 @@ public sealed partial class MainForm
     {
         if (tab is null || tab.IsClosed) return false;
         if (tab == activeTab) return true;
-        return multiViewState.IsMultiViewActive
-            && !isDomFullScreen
-            && multiViewState.ContainsTab(tab.Id);
+        if (!multiViewState.IsMultiViewActive || isDomFullScreen) return false;
+        if (multiViewState.IsFocusedPaneMaximized)
+        {
+            return multiViewState.FocusedTabId == tab.Id;
+        }
+        return multiViewState.ContainsTab(tab.Id);
     }
 
     private bool IsTabForegroundForLifecycle(BrowserTab tab) =>
@@ -232,6 +235,7 @@ public sealed partial class MainForm
         var tab = FindTabById(multiViewState.FocusedTabId);
         if (tab is null || tab.IsClosed) return;
 
+        tab.BackgroundReductionGeneration++;
         var previous = activeTab != tab ? activeTab : null;
         if (previous is not null)
         {
@@ -241,8 +245,10 @@ public sealed partial class MainForm
 
         activeTab = tab;
         tab.LastActiveUtc = DateTime.UtcNow;
+        tab.ConsecutiveSuspendFailures = 0;
         if (!restoringSession) mruTabs.ObserveActivation(tab);
         ResumeTab(tab);
+        SyncDomFullScreenFromActiveTab();
 
         if (previous is not null) UpdateTabHeader(previous);
         UpdateTabHeader(tab);
@@ -254,6 +260,11 @@ public sealed partial class MainForm
         UpdateNavigationChrome();
         UpdateStatus();
         RefreshLiveTabMemoryTargets();
+        RefreshMemorySweepTimer();
+        if (previous is not null && !IsTabVisibleInAnyPane(previous))
+        {
+            QueueBackgroundTabReduction(previous);
+        }
 
         if (findBar.Visible && findBox.TextLength > 0 && tab.Core is not null)
         {
@@ -448,7 +459,7 @@ public sealed partial class MainForm
             multiViewState.SetSingle(baseTab.Id);
         }
 
-        var newTab = await OpenNewTabAsync(targetUrl, activate: false);
+        var newTab = await OpenNewTabAsync(targetUrl, activate: false, trimWhenDiscarded: false);
         if (newTab is null || isClosing || newTab.IsClosed) return;
 
         if (multiViewState.Preset == MultiViewPreset.Quad)
@@ -848,6 +859,7 @@ public sealed partial class MainForm
         {
             await Task.WhenAll(restoreTasks);
         }
+        if (isClosing || IsDisposed) return false;
 
         FocusMultiViewPane(multiViewState.FocusedPaneIndex, focusContent: false);
         ApplyMultiViewLayout();

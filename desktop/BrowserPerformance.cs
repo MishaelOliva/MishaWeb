@@ -67,8 +67,7 @@ internal static class BrowserPerformance
                                     options = { capture: options, passive: true };
                                 } else if (typeof options === 'object' && options !== null) {
                                     if (options.passive === undefined) {
-                                        try { options.passive = true; }
-                                        catch (_) { options = Object.assign({}, options, { passive: true }); }
+                                        options = Object.assign({}, options, { passive: true });
                                     }
                                 } else {
                                     options = { passive: true };
@@ -141,7 +140,10 @@ internal static class BrowserPerformance
                             // Prune oldest if at capacity to prevent memory leaks in SPAs
                             if (activePreconnectLinks.length >= maxPreconnectCount) {
                                 const oldest = activePreconnectLinks.shift();
-                                if (oldest) oldest.forEach(el => el.remove());
+                                if (oldest) {
+                                    preconnectedOrigins.delete(oldest.origin);
+                                    oldest.links.forEach(el => el.remove());
+                                }
                             }
 
                             const dnsEl = document.createElement('link');
@@ -152,10 +154,9 @@ internal static class BrowserPerformance
                             const preconnectEl = document.createElement('link');
                             preconnectEl.rel = 'preconnect';
                             preconnectEl.href = targetOrigin;
-                            preconnectEl.crossOrigin = 'anonymous';
                             head.appendChild(preconnectEl);
 
-                            activePreconnectLinks.push([dnsEl, preconnectEl]);
+                            activePreconnectLinks.push({ origin: targetOrigin, links: [dnsEl, preconnectEl] });
                         } catch (_) {}
                     }, 65);
                 }, { passive: true });

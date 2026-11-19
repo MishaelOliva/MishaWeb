@@ -371,7 +371,16 @@ public sealed partial class MainForm
             && item.ActiveDownloads == 0
             && !item.IsDiscarded))
         {
-            TrimAllProcessMemory(allowManagedGc: false);
+            systemMemory = SystemResourceInfo.CaptureMemory();
+            var allWindowsMinimized = Program.AreAllOpenWindowsMinimized(this);
+            var hasSuspendedTabs = tabs.Any(item => !item.IsClosed && item.IsSuspended);
+            var underMemoryPressure = systemMemory.IsValid && systemMemory.MemoryLoadPercent >= 75;
+            var desiredEcoQoS = allWindowsMinimized ? 1 : 0;
+            var ecoQoSChanged = Volatile.Read(ref lastAppliedRendererEcoQoS) != desiredEcoQoS;
+            if (isWindowMinimized || hasSuspendedTabs || underMemoryPressure || ecoQoSChanged)
+            {
+                TrimAllProcessMemory(allowManagedGc: false);
+            }
             RefreshMemorySweepTimer();
             nextLifecycleScanAt = DateTimeOffset.MinValue;
             return;
@@ -418,7 +427,8 @@ public sealed partial class MainForm
             {
                 if (decision.Id < 0 || decision.Id >= snapshotTabs.Length) continue;
                 var tab = snapshotTabs[decision.Id];
-                if (isClosing || tab.IsClosed) return;
+                if (isClosing) return;
+                if (tab.IsClosed) continue;
                 var currentMode = TabLifecyclePolicy.ResolveMode(memorySaverEnabled, ultraLightEnabled);
                 if (currentMode != mode) break;
                 try
@@ -468,16 +478,57 @@ public sealed partial class MainForm
         }
     }
 
+    private static long globalEcoQoSGeneration;
+    private static int lastAppliedRendererEcoQoS = -1;
+
+    private void ClearRendererEfficiencyModeImmediately()
+    {
+        Interlocked.Increment(ref globalEcoQoSGeneration);
+        Volatile.Write(ref lastAppliedRendererEcoQoS, 0);
+        if (environment is not { } activeEnvironment) return;
+
+        List<int>? rendererPids = null;
+        try
+        {
+            var processInfos = activeEnvironment.GetProcessInfos();
+            if (processInfos is { Count: > 0 })
+            {
+                rendererPids = new List<int>(processInfos.Count);
+                foreach (var processInfo in processInfos)
+                {
+                    if (processInfo.Kind == CoreWebView2ProcessKind.Renderer && processInfo.ProcessId > 0)
+                    {
+                        rendererPids.Add(processInfo.ProcessId);
+                    }
+                }
+            }
+        }
+        catch (Exception error)
+        {
+            stateStore.Log("Could not inspect WebView2 renderers on restore", error);
+        }
+
+        if (rendererPids is not { Count: > 0 }) return;
+        _ = Task.Run(() =>
+        {
+            foreach (var pid in rendererPids)
+            {
+                SystemResourceInfo.TrySetProcessEfficiencyMode(pid, enable: false);
+            }
+        });
+    }
+
     private void TrimAllProcessMemory(bool includeActiveForeground = false, bool allowManagedGc = false)
     {
         if (isClosing) return;
-        if (Interlocked.CompareExchange(ref processTrimInFlight, 1, 0) != 0) return;
 
         var trimCurrent = includeActiveForeground || isWindowMinimized;
         var hasSuspendedTabs = tabs.Any(item => !item.IsClosed && item.IsSuspended);
         var underMemoryPressure = systemMemory.IsValid && systemMemory.MemoryLoadPercent >= 75;
         var shouldTrimWorkingSets = trimCurrent || allowManagedGc || hasSuspendedTabs || underMemoryPressure;
-        var throttleRenderersForEcoQoS = isWindowMinimized;
+        var throttleRenderersForEcoQoS = Program.AreAllOpenWindowsMinimized(this);
+        var desiredEcoQoS = throttleRenderersForEcoQoS ? 1 : 0;
+        var ecoQoSChanged = Volatile.Read(ref lastAppliedRendererEcoQoS) != desiredEcoQoS;
         var shouldCollectGc = false;
         if (allowManagedGc)
         {
@@ -489,39 +540,121 @@ public sealed partial class MainForm
             }
         }
 
-        List<(int ProcessId, bool IsRenderer)>? childProcesses = null;
-        if (environment is { } activeEnvironment)
+        if (!shouldTrimWorkingSets && !shouldCollectGc && !ecoQoSChanged) return;
+        if (Interlocked.CompareExchange(ref processTrimInFlight, 1, 0) != 0) return;
+
+        var foregroundFrameIds = !trimCurrent && shouldTrimWorkingSets
+            ? Program.CollectForegroundFrameIds(this)
+            : null;
+        var capturedEcoQoSGeneration = Volatile.Read(ref globalEcoQoSGeneration);
+        var activeEnvironment = environment;
+
+        _ = TrimAllProcessMemoryAsync(
+            activeEnvironment,
+            trimCurrent,
+            shouldTrimWorkingSets,
+            throttleRenderersForEcoQoS,
+            desiredEcoQoS,
+            ecoQoSChanged,
+            shouldCollectGc,
+            foregroundFrameIds,
+            capturedEcoQoSGeneration);
+    }
+
+    private async Task TrimAllProcessMemoryAsync(
+        CoreWebView2Environment? activeEnvironment,
+        bool trimCurrent,
+        bool shouldTrimWorkingSets,
+        bool throttleRenderersForEcoQoS,
+        int desiredEcoQoS,
+        bool ecoQoSChanged,
+        bool shouldCollectGc,
+        HashSet<uint>? foregroundFrameIds,
+        long capturedEcoQoSGeneration)
+    {
+        try
         {
-            try
+            List<(int ProcessId, bool IsRenderer, bool ShouldTrim)>? childProcesses = null;
+            if (activeEnvironment is not null && !isClosing && !IsDisposed)
             {
-                var processInfos = activeEnvironment.GetProcessInfos();
-                if (processInfos is { Count: > 0 })
+                var usedExtended = false;
+                if (foregroundFrameIds is { Count: > 0 })
                 {
-                    childProcesses = new List<(int ProcessId, bool IsRenderer)>(processInfos.Count);
-                    foreach (var processInfo in processInfos)
+                    try
                     {
-                        if (!trimCurrent && processInfo.Kind == CoreWebView2ProcessKind.Gpu)
+                        var extendedInfos = await activeEnvironment.GetProcessExtendedInfosAsync();
+                        usedExtended = true;
+                        if (extendedInfos is { Count: > 0 })
                         {
-                            continue;
+                            childProcesses = new List<(int ProcessId, bool IsRenderer, bool ShouldTrim)>(extendedInfos.Count);
+                            foreach (var extendedInfo in extendedInfos)
+                            {
+                                var processInfo = extendedInfo.ProcessInfo;
+                                if (!trimCurrent && processInfo.Kind == CoreWebView2ProcessKind.Gpu)
+                                {
+                                    continue;
+                                }
+                                if (processInfo.ProcessId <= 0) continue;
+
+                                var isRenderer = processInfo.Kind == CoreWebView2ProcessKind.Renderer;
+                                var isForegroundRenderer = false;
+                                if (isRenderer && extendedInfo.AssociatedFrameInfos is { Count: > 0 } frames)
+                                {
+                                    foreach (var frame in frames)
+                                    {
+                                        if (foregroundFrameIds.Contains(frame.FrameId))
+                                        {
+                                            isForegroundRenderer = true;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                childProcesses.Add((
+                                    processInfo.ProcessId,
+                                    isRenderer,
+                                    shouldTrimWorkingSets && !isForegroundRenderer));
+                            }
                         }
-                        if (processInfo.ProcessId > 0)
+                    }
+                    catch
+                    {
+                        usedExtended = false;
+                    }
+                }
+
+                if (!usedExtended && !isClosing && !IsDisposed)
+                {
+                    try
+                    {
+                        var processInfos = activeEnvironment.GetProcessInfos();
+                        if (processInfos is { Count: > 0 })
                         {
-                            childProcesses.Add((
-                                processInfo.ProcessId,
-                                processInfo.Kind == CoreWebView2ProcessKind.Renderer));
+                            var skipRendererTrim = !trimCurrent && foregroundFrameIds is { Count: > 0 };
+                            childProcesses = new List<(int ProcessId, bool IsRenderer, bool ShouldTrim)>(processInfos.Count);
+                            foreach (var processInfo in processInfos)
+                            {
+                                if (!trimCurrent && processInfo.Kind == CoreWebView2ProcessKind.Gpu)
+                                {
+                                    continue;
+                                }
+                                if (processInfo.ProcessId <= 0) continue;
+                                var isRenderer = processInfo.Kind == CoreWebView2ProcessKind.Renderer;
+                                childProcesses.Add((
+                                    processInfo.ProcessId,
+                                    isRenderer,
+                                    shouldTrimWorkingSets && (!skipRendererTrim || !isRenderer)));
+                            }
                         }
+                    }
+                    catch (Exception error)
+                    {
+                        stateStore.Log("Could not inspect WebView2 child processes", error);
                     }
                 }
             }
-            catch (Exception error)
-            {
-                stateStore.Log("Could not inspect WebView2 child processes", error);
-            }
-        }
 
-        _ = Task.Run(() =>
-        {
-            try
+            await Task.Run(() =>
             {
                 if (shouldCollectGc)
                 {
@@ -533,28 +666,42 @@ public sealed partial class MainForm
                 }
                 if (childProcesses is not null)
                 {
-                    foreach (var (pid, isRenderer) in childProcesses)
+                    var appliedEcoQoS = false;
+                    foreach (var (pid, isRenderer, shouldTrimProcess) in childProcesses)
                     {
                         if (isRenderer)
                         {
-                            SystemResourceInfo.TrySetProcessEfficiencyMode(pid, throttleRenderersForEcoQoS);
+                            if (throttleRenderersForEcoQoS
+                                && Volatile.Read(ref globalEcoQoSGeneration) != capturedEcoQoSGeneration)
+                            {
+                                // A window un-minimized while this sweep was queued.
+                            }
+                            else if (ecoQoSChanged || !throttleRenderersForEcoQoS)
+                            {
+                                SystemResourceInfo.TrySetProcessEfficiencyMode(pid, throttleRenderersForEcoQoS);
+                                appliedEcoQoS = true;
+                            }
                         }
-                        if (shouldTrimWorkingSets)
+                        if (shouldTrimProcess)
                         {
                             SystemResourceInfo.TrimProcessWorkingSet(pid);
                         }
                     }
+                    if (appliedEcoQoS && Volatile.Read(ref globalEcoQoSGeneration) == capturedEcoQoSGeneration)
+                    {
+                        Volatile.Write(ref lastAppliedRendererEcoQoS, desiredEcoQoS);
+                    }
                 }
-            }
-            catch (Exception error)
-            {
-                stateStore.Log("Could not trim process memory", error);
-            }
-            finally
-            {
-                Volatile.Write(ref processTrimInFlight, 0);
-            }
-        });
+            });
+        }
+        catch (Exception error)
+        {
+            stateStore.Log("Could not trim process memory", error);
+        }
+        finally
+        {
+            Volatile.Write(ref processTrimInFlight, 0);
+        }
     }
 
     private async Task<bool> TrySuspendTabAsync(
@@ -808,37 +955,59 @@ public sealed partial class MainForm
         if (minimized)
         {
             CancelTabDrag();
-            var minimizingTab = activeTab;
-            if (minimizingTab?.View is not null) minimizingTab.View.Visible = false;
-            if (minimizingTab?.StartPageView is not null)
+            var minimizingTabs = new List<BrowserTab>(4);
+            if (multiViewState.IsMultiViewActive && !isDomFullScreen)
             {
-                minimizingTab.StartPageView.Visible = false;
+                foreach (var visibleId in multiViewState.GetVisibleTabIds())
+                {
+                    var paneTab = FindTabById(visibleId);
+                    if (paneTab is not null && !paneTab.IsClosed && !minimizingTabs.Contains(paneTab))
+                    {
+                        minimizingTabs.Add(paneTab);
+                    }
+                }
             }
-            if (minimizingTab is not null)
+            if (activeTab is not null && !activeTab.IsClosed && !minimizingTabs.Contains(activeTab))
             {
-                minimizingTab.LastActiveUtc = DateTime.UtcNow;
+                minimizingTabs.Add(activeTab);
+            }
+
+            var minimizedAtUtc = DateTime.UtcNow;
+            foreach (var minimizingTab in minimizingTabs)
+            {
+                if (minimizingTab.View is not null) minimizingTab.View.Visible = false;
+                if (minimizingTab.StartPageView is not null)
+                {
+                    minimizingTab.StartPageView.Visible = false;
+                }
+                minimizingTab.LastActiveUtc = minimizedAtUtc;
                 minimizingTab.ConsecutiveSuspendFailures = 0;
                 ApplyLiveTabMemoryTarget(minimizingTab, foreground: false);
             }
-            if (TabLifecyclePolicy.ResolveMode(memorySaverEnabled, ultraLightEnabled) == TabLifecycleMode.Ultra
-                && minimizingTab is not null)
+            if (TabLifecyclePolicy.ResolveMode(memorySaverEnabled, ultraLightEnabled) == TabLifecycleMode.Ultra)
             {
-                var mode = TabLifecyclePolicy.ResolveMode(memorySaverEnabled, ultraLightEnabled);
-                var suspended = await TrySuspendTabAsync(
-                    minimizingTab,
-                    includeActiveTab: true,
-                    expectedMode: mode);
-                if (transitionGeneration != windowStateGeneration || !isWindowMinimized || isClosing)
+                foreach (var minimizingTab in minimizingTabs)
                 {
-                    return;
+                    if (minimizingTab.IsClosed) continue;
+                    var mode = TabLifecyclePolicy.ResolveMode(memorySaverEnabled, ultraLightEnabled);
+                    if (mode != TabLifecycleMode.Ultra) break;
+                    var suspended = await TrySuspendTabAsync(
+                        minimizingTab,
+                        includeActiveTab: true,
+                        expectedMode: mode);
+                    if (transitionGeneration != windowStateGeneration || !isWindowMinimized || isClosing)
+                    {
+                        return;
+                    }
+                    if (!suspended) TryDiscardTabAfterFailedSuspend(minimizingTab);
                 }
-                if (!suspended) TryDiscardTabAfterFailedSuspend(minimizingTab);
             }
             TrimAllProcessMemory(includeActiveForeground: true, allowManagedGc: true);
             RefreshMemorySweepTimer();
             return;
         }
 
+        ClearRendererEfficiencyModeImmediately();
         UpdateWindowControls();
         if (activeTab is not null)
         {
@@ -890,7 +1059,7 @@ public sealed partial class MainForm
         RefreshMemorySweepTimer();
     }
 
-    private void SetResourceMode(TabLifecycleMode mode)
+    private void SetResourceMode(TabLifecycleMode mode, string? statusOverride = null)
     {
         var normalizedMode = mode switch
         {
@@ -912,7 +1081,7 @@ public sealed partial class MainForm
         RefreshMemorySweepTimer();
         SavePreferences();
         RefreshNativeStartPages();
-        ShowTransientStatus(normalizedMode switch
+        ShowTransientStatus(statusOverride ?? normalizedMode switch
         {
             TabLifecycleMode.Ultra => "Ultra-light selected — 3 recent sites won't reload",
             TabLifecycleMode.Standard => "Memory saver selected — 3 recent sites stay ready",
@@ -931,66 +1100,38 @@ public sealed partial class MainForm
 
     private void ToggleMemorySaver()
     {
-        memorySaverEnabled = !memorySaverEnabled;
-        ResetSuspendFailureCounts();
-        if (!memorySaverEnabled)
-        {
-            ultraLightEnabled = false;
-            foreach (var tab in tabs.Where(item => item.IsSuspended)) ResumeTab(tab);
-        }
-        RefreshLiveTabMemoryTargets();
-        RefreshMemorySweepTimer();
-        SavePreferences();
-        RefreshNativeStartPages();
-        ShowTransientStatus(memorySaverEnabled ? "Memory saver on" : "Memory saver off");
+        var nextMode = memorySaverEnabled ? TabLifecycleMode.Off : TabLifecycleMode.Standard;
+        SetResourceMode(nextMode, nextMode == TabLifecycleMode.Standard ? "Memory saver on" : "Memory saver off");
     }
 
     private void ToggleUltraLightMode()
     {
-        ultraLightEnabled = !ultraLightEnabled;
-        if (ultraLightEnabled) memorySaverEnabled = true;
-        else
+        if (ultraLightEnabled)
         {
             foreach (var tab in tabs.Where(item => item.IsSuspended)) ResumeTab(tab);
+            SetResourceMode(TabLifecycleMode.Standard, "Ultra-light mode off");
+            return;
         }
-        ResetSuspendFailureCounts();
-        RefreshLiveTabMemoryTargets();
-        ReleaseInactiveNativeStartPagesForUltra();
-        RefreshMemorySweepTimer();
-        SavePreferences();
-        RefreshNativeStartPages();
-        ShowTransientStatus(ultraLightEnabled
-            ? "Ultra-light mode on \u2014 very old inactive tabs may reload"
-            : "Ultra-light mode off");
+
+        SetResourceMode(
+            TabLifecycleMode.Ultra,
+            "Ultra-light mode on \u2014 very old inactive tabs may reload");
     }
 
     private void CycleResourceMode()
     {
-        if (ultraLightEnabled)
+        var nextMode = ultraLightEnabled
+            ? TabLifecycleMode.Off
+            : memorySaverEnabled
+                ? TabLifecycleMode.Ultra
+                : TabLifecycleMode.Standard;
+        var mode = nextMode switch
         {
-            ultraLightEnabled = false;
-            memorySaverEnabled = false;
-            foreach (var tab in tabs.Where(item => item.IsSuspended)) ResumeTab(tab);
-        }
-        else if (memorySaverEnabled)
-        {
-            ultraLightEnabled = true;
-        }
-        else
-        {
-            memorySaverEnabled = true;
-        }
-
-        ResetSuspendFailureCounts();
-        RefreshLiveTabMemoryTargets();
-        ReleaseInactiveNativeStartPagesForUltra();
-        RefreshMemorySweepTimer();
-        SavePreferences();
-        RefreshNativeStartPages();
-        var mode = ultraLightEnabled
-            ? "Ultra-light mode"
-            : memorySaverEnabled ? "Memory saver" : "Resource saver off";
-        ShowTransientStatus($"{mode} selected");
+            TabLifecycleMode.Ultra => "Ultra-light mode",
+            TabLifecycleMode.Standard => "Memory saver",
+            _ => "Resource saver off"
+        };
+        SetResourceMode(nextMode, $"{mode} selected");
     }
 
     private void ResetSuspendFailureCounts()

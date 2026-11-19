@@ -178,6 +178,37 @@ internal static class Program
             : applicationContext.RequestBrowserProcessRestart(requestingWindow);
     }
 
+    internal static bool AreAllOpenWindowsMinimized(MainForm window)
+    {
+        ArgumentNullException.ThrowIfNull(window);
+        var applicationContext = Volatile.Read(ref currentApplicationContext);
+        if (applicationContext is not null && applicationContext.ContainsWindow(window))
+        {
+            return applicationContext.AreAllWindowsMinimized();
+        }
+        return window.IsWindowMinimizedForApplicationContext;
+    }
+
+    internal static bool HasOtherOpenPrivateWindows(MainForm window)
+    {
+        ArgumentNullException.ThrowIfNull(window);
+        var applicationContext = Volatile.Read(ref currentApplicationContext);
+        return applicationContext is not null && applicationContext.HasOtherOpenPrivateWindows(window);
+    }
+
+    internal static HashSet<uint> CollectForegroundFrameIds(MainForm fallbackWindow)
+    {
+        ArgumentNullException.ThrowIfNull(fallbackWindow);
+        var applicationContext = Volatile.Read(ref currentApplicationContext);
+        if (applicationContext is not null && applicationContext.ContainsWindow(fallbackWindow))
+        {
+            return applicationContext.CollectForegroundFrameIds();
+        }
+        var frameIds = new HashSet<uint>();
+        fallbackWindow.CollectForegroundFrameIds(frameIds);
+        return frameIds;
+    }
+
     private static SingleInstanceIdentity GetCurrentUserSingleInstanceIdentity()
     {
         using var windowsIdentity = WindowsIdentity.GetCurrent();
@@ -636,6 +667,7 @@ internal static class Program
         private readonly List<MainForm> windows = new();
         private readonly Func<MainForm, BrowserRestartGuard, bool> confirmRestart;
         private readonly Func<int, bool> launchRestartSuccessor;
+        private readonly bool usesCustomSuccessorLauncher;
         private readonly Action exitThread;
         private readonly Func<MainForm, bool> persistRestartSession;
         private readonly Func<MainForm> createNormalWindow;
@@ -654,6 +686,7 @@ internal static class Program
             Action<MainForm>? showNormalWindow = null)
         {
             this.confirmRestart = confirmRestart ?? ConfirmBrowserProcessRestart;
+            usesCustomSuccessorLauncher = launchRestartSuccessor is not null;
             this.launchRestartSuccessor = launchRestartSuccessor ?? LaunchRestartSuccessor;
             this.exitThread = exitThread ?? ExitThread;
             this.persistRestartSession = persistRestartSession
@@ -692,6 +725,76 @@ internal static class Program
                 window.FormClosed += OnWindowClosed;
                 return true;
             }
+        }
+
+        internal bool ContainsWindow(MainForm window)
+        {
+            ArgumentNullException.ThrowIfNull(window);
+            lock (sync)
+            {
+                return windows.Contains(window);
+            }
+        }
+
+        internal bool AreAllWindowsMinimized()
+        {
+            lock (sync)
+            {
+                if (windows.Count == 0) return true;
+                foreach (var window in windows)
+                {
+                    if (window.IsDisposed
+                        || window.Disposing
+                        || window.IsClosingForApplicationContext)
+                    {
+                        continue;
+                    }
+                    if (!window.IsWindowMinimizedForApplicationContext) return false;
+                }
+                return true;
+            }
+        }
+
+        internal bool HasOtherOpenPrivateWindows(MainForm window)
+        {
+            ArgumentNullException.ThrowIfNull(window);
+            lock (sync)
+            {
+                foreach (var candidate in windows)
+                {
+                    if (ReferenceEquals(candidate, window)
+                        || candidate.IsDisposed
+                        || candidate.Disposing
+                        || !candidate.IsPrivateBrowserWindow
+                        || candidate.IsClosingForApplicationContext
+                        || candidate.IsPrivateCleanupInProgressForApplicationContext)
+                    {
+                        continue;
+                    }
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        internal HashSet<uint> CollectForegroundFrameIds()
+        {
+            MainForm[] candidates;
+            lock (sync)
+            {
+                candidates = windows
+                    .Where(window => !window.IsDisposed
+                        && !window.Disposing
+                        && !window.IsClosingForApplicationContext
+                        && !window.IsWindowMinimizedForApplicationContext)
+                    .ToArray();
+            }
+            var frameIds = new HashSet<uint>();
+            foreach (var window in candidates)
+            {
+                window.CollectForegroundFrameIds(frameIds);
+            }
+            return frameIds;
         }
 
         internal BrowserRestartGuard CaptureBrowserRestartGuard()
@@ -808,8 +911,29 @@ internal static class Program
                 return BrowserRestartRequestResult.SessionSaveFailed;
             }
 
-            if (!launchRestartSuccessor(Environment.ProcessId))
+            Process? successorProcess = null;
+            var launched = false;
+            try
             {
+                if (usesCustomSuccessorLauncher)
+                {
+                    launched = launchRestartSuccessor(Environment.ProcessId);
+                }
+                else
+                {
+                    successorProcess = LaunchRestartSuccessorProcess(Environment.ProcessId);
+                    launched = successorProcess is not null;
+                }
+            }
+            catch (Exception error)
+            {
+                Debug.WriteLine($"MishaWeb could not launch its restart successor: {error}");
+                launched = false;
+            }
+
+            if (!launched)
+            {
+                successorProcess?.Dispose();
                 foreach (var candidate in candidates) candidate.CancelPreparedBrowserProcessRestart();
                 lock (sync) restartInProgress = false;
                 return BrowserRestartRequestResult.LaunchFailed;
@@ -819,28 +943,49 @@ internal static class Program
             // last so its normal FormClosing path writes the restorable session after
             // every process-wide restart has been approved.
             var anyWindowRefusedClose = false;
-            foreach (var window in candidates.OrderBy(window => window.IsPrivateBrowserWindow ? 0 : 1))
+            try
             {
-                if (window.IsDisposed || window.Disposing) continue;
-                window.PrepareForBrowserProcessRestart();
-                window.Close();
-                if (!window.IsDisposed && !window.Disposing)
+                foreach (var window in candidates.OrderBy(window => window.IsPrivateBrowserWindow ? 0 : 1))
                 {
-                    anyWindowRefusedClose = true;
-                }
-            }
-
-            if (anyWindowRefusedClose)
-            {
-                foreach (var candidate in candidates)
-                {
-                    if (!candidate.IsDisposed && !candidate.Disposing)
+                    if (window.IsDisposed || window.Disposing) continue;
+                    window.PrepareForBrowserProcessRestart();
+                    window.Close();
+                    if (!window.IsDisposed && !window.Disposing)
                     {
-                        candidate.CancelPreparedBrowserProcessRestart();
+                        anyWindowRefusedClose = true;
                     }
                 }
-                lock (sync) restartInProgress = false;
-                return BrowserRestartRequestResult.Canceled;
+
+                if (anyWindowRefusedClose)
+                {
+                    if (successorProcess is not null)
+                    {
+                        try
+                        {
+                            if (!successorProcess.HasExited)
+                            {
+                                successorProcess.Kill(entireProcessTree: true);
+                            }
+                        }
+                        catch (Exception error)
+                        {
+                            Debug.WriteLine($"MishaWeb could not terminate an unattached restart successor: {error}");
+                        }
+                    }
+                    foreach (var candidate in candidates)
+                    {
+                        if (!candidate.IsDisposed && !candidate.Disposing)
+                        {
+                            candidate.CancelPreparedBrowserProcessRestart();
+                        }
+                    }
+                    lock (sync) restartInProgress = false;
+                    return BrowserRestartRequestResult.Canceled;
+                }
+            }
+            finally
+            {
+                successorProcess?.Dispose();
             }
 
             return BrowserRestartRequestResult.Started;
@@ -907,25 +1052,42 @@ internal static class Program
             if (!dispatcher.InvokeRequired) return CreateOrRouteNormalWindow(address);
 
             var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var timedOut = 0;
             try
             {
                 dispatcher.BeginInvoke((Action)(() =>
                 {
-                    try { completion.TrySetResult(CreateOrRouteNormalWindow(address)); }
+                    if (Volatile.Read(ref timedOut) != 0)
+                    {
+                        completion.TrySetResult(false);
+                        return;
+                    }
+                    try
+                    {
+                        completion.TrySetResult(CreateOrRouteNormalWindow(
+                            address,
+                            () => Volatile.Read(ref timedOut) != 0));
+                    }
                     catch (Exception error) { completion.TrySetException(error); }
                 }));
-                if (!completion.Task.Wait(PrivateOnlyUiHandoffTimeout)) return false;
+                if (!completion.Task.Wait(PrivateOnlyUiHandoffTimeout))
+                {
+                    Interlocked.Exchange(ref timedOut, 1);
+                    return false;
+                }
                 return completion.Task.GetAwaiter().GetResult();
             }
             catch (Exception error)
             {
+                Interlocked.Exchange(ref timedOut, 1);
                 Debug.WriteLine($"MishaWeb could not create a normal handoff window: {error}");
                 return false;
             }
         }
 
-        private bool CreateOrRouteNormalWindow(string? address)
+        private bool CreateOrRouteNormalWindow(string? address, Func<bool>? isTimedOut = null)
         {
+            if (isTimedOut?.Invoke() == true) return false;
             MainForm? existingNormal;
             lock (sync)
             {
@@ -938,7 +1100,7 @@ internal static class Program
             }
             if (existingNormal is not null)
             {
-                return existingNormal.ReceiveExternalNavigation(address);
+                return isTimedOut?.Invoke() != true && existingNormal.ReceiveExternalNavigation(address);
             }
 
             MainForm? created = null;
@@ -947,10 +1109,11 @@ internal static class Program
             try
             {
                 created = createNormalWindow();
-                if (created.IsPrivateBrowserWindow) return false;
+                if (created.IsPrivateBrowserWindow || isTimedOut?.Invoke() == true) return false;
                 registered = Register(created);
-                if (!registered) return false;
+                if (!registered || isTimedOut?.Invoke() == true) return false;
                 showNormalWindow(created);
+                if (isTimedOut?.Invoke() == true) return false;
                 accepted = created.ReceiveExternalNavigation(address);
                 return accepted;
             }
@@ -1077,12 +1240,18 @@ internal static class Program
 
         private static bool LaunchRestartSuccessor(int predecessorProcessId)
         {
+            using var successor = LaunchRestartSuccessorProcess(predecessorProcessId);
+            return successor is not null;
+        }
+
+        private static Process? LaunchRestartSuccessorProcess(int predecessorProcessId)
+        {
             try
             {
                 var executablePath = Environment.ProcessPath;
                 if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath))
                 {
-                    return false;
+                    return null;
                 }
 
                 long? predecessorStartTimeUtcTicks = null;
@@ -1100,13 +1269,12 @@ internal static class Program
                     executablePath,
                     predecessorProcessId,
                     predecessorStartTimeUtcTicks);
-                using var successor = Process.Start(startInfo);
-                return successor is not null;
+                return Process.Start(startInfo);
             }
             catch (Exception error)
             {
                 Debug.WriteLine($"MishaWeb could not launch its restart successor: {error}");
-                return false;
+                return null;
             }
         }
 

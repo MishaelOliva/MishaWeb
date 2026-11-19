@@ -290,9 +290,9 @@ internal static class MultiViewLayoutEngine
             return new MultiViewComputedLayout(
                 state.Preset,
                 state.PaneCount,
-                [Rectangle.Empty],
-                [Rectangle.Empty],
-                [Rectangle.Empty],
+                new Rectangle[state.PaneCount],
+                new Rectangle[state.PaneCount],
+                new Rectangle[state.PaneCount],
                 Array.Empty<MultiViewSplitterDescriptor>());
         }
 

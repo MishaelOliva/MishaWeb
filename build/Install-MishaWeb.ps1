@@ -3,17 +3,18 @@
     All-in-One Installer for MishaWeb Browser Engine.
 
 .DESCRIPTION
-    Downloads the entire MishaWeb repository from GitHub, installs and sets up
-    the application in the user's local programs directory, creates Desktop and Start Menu
-    shortcuts, and displays an 'Installation Finished' completion dialog with a checkbox
-    to immediately launch MishaWeb.exe.
+    Installs and sets up MishaWeb in the user's local programs directory, preferring
+    verified GitHub Release artifacts (or a local repository build) over mutable branch
+    sources, creates Desktop and Start Menu shortcuts, and displays a completion dialog.
 #>
 
 [CmdletBinding()]
 param(
     [string]$InstallPath = (Join-Path $env:LOCALAPPDATA 'Programs\MishaWeb'),
     [string]$RepoUrl = 'https://github.com/MishaelOliva/browser-engine',
-    [string]$Branch = 'main',
+    [string]$Branch = '',
+    [string]$ReleaseTag = 'v2.5.0',
+    [string]$ExpectedSha256 = '',
     [switch]$ForceDownload,
     [switch]$NoGui
 )
@@ -25,20 +26,276 @@ $ProgressPreference = 'Continue'
 # Enable TLS 1.2 / 1.3
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
 
+function Assert-ValidGitHubRepoUrl {
+    param([Parameter(Mandatory = $true)][string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        throw 'RepoUrl cannot be empty.'
+    }
+
+    [Uri]$parsed = $null
+    if (-not [Uri]::TryCreate($Url.Trim(), [UriKind]::Absolute, [ref]$parsed)) {
+        throw "RepoUrl '$Url' is not a valid absolute URI."
+    }
+
+    if ($parsed.Scheme -ne 'https' -or
+        -not [string]::Equals($parsed.Host, 'github.com', [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::IsNullOrEmpty($parsed.UserInfo) -or
+        -not [string]::IsNullOrEmpty($parsed.Query) -or
+        -not [string]::IsNullOrEmpty($parsed.Fragment) -or
+        -not $parsed.IsDefaultPort) {
+        throw "RepoUrl '$Url' must be an HTTPS https://github.com/<owner>/<repo> URL with no credentials, query, or fragment."
+    }
+
+    $trimmedPath = $parsed.AbsolutePath.Trim('/')
+    if ($trimmedPath.EndsWith('.git', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $trimmedPath = $trimmedPath.Substring(0, $trimmedPath.Length - 4)
+    }
+    if ($trimmedPath -notmatch '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$') {
+        throw "RepoUrl '$Url' must point to a valid GitHub <owner>/<repo> path."
+    }
+
+    $segments = $trimmedPath -split '/'
+    if ($segments[0] -in @('.', '..') -or $segments[1] -in @('.', '..')) {
+        throw "RepoUrl '$Url' contains invalid path segments."
+    }
+
+    return "https://github.com/$trimmedPath"
+}
+
+function Assert-ValidGitRef {
+    param(
+        [Parameter(Mandatory = $true)][string]$Ref,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Ref)) {
+        throw "$Label cannot be empty."
+    }
+
+    $trimmed = $Ref.Trim()
+    if ($trimmed.StartsWith('/') -or $trimmed.EndsWith('/') -or
+        $trimmed.StartsWith('.') -or $trimmed.EndsWith('.') -or
+        $trimmed.Contains('..') -or $trimmed.Contains('//') -or
+        $trimmed.EndsWith('.lock', [System.StringComparison]::OrdinalIgnoreCase) -or
+        $trimmed -notmatch '^[A-Za-z0-9._/-]+$') {
+        throw "$Label '$Ref' is not a valid Git ref or release tag."
+    }
+
+    return $trimmed
+}
+
+function Assert-ValidSha256Hex {
+    param(
+        [Parameter(Mandatory = $true)][string]$Hash,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    $normalized = $Hash.Trim().ToLowerInvariant()
+    if ($normalized -notmatch '^[0-9a-f]{64}$') {
+        throw "$Label '$Hash' is not a valid 64-character SHA-256 hex digest."
+    }
+
+    return $normalized
+}
+
+function Assert-ContainedPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Candidate,
+        [Parameter(Mandatory = $true)][string]$Parent,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    $candidateFull = [System.IO.Path]::GetFullPath($Candidate).TrimEnd('\', '/')
+    $parentFull = [System.IO.Path]::GetFullPath($Parent).TrimEnd('\', '/')
+    $prefix = $parentFull + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $candidateFull.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label must remain below '$parentFull'; got '$candidateFull'."
+    }
+
+    return $candidateFull
+}
+
+function Assert-NoReparseTree {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    $rootItem = Get-Item -Force -LiteralPath $Path
+    if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing to mutate reparse point '$Path'."
+    }
+
+    if ($rootItem.PSIsContainer) {
+        $reparseChild = Get-ChildItem -Force -Recurse -LiteralPath $Path |
+            Where-Object { ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 } |
+            Select-Object -First 1
+        if ($null -ne $reparseChild) {
+            throw "Refusing to mutate a tree containing reparse point '$($reparseChild.FullName)'."
+        }
+    }
+}
+
+function Remove-ContainedDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Parent
+    )
+
+    $safePath = Assert-ContainedPath -Candidate $Path -Parent $Parent -Label 'Recursive delete target'
+    if (Test-Path -LiteralPath $safePath) {
+        Assert-NoReparseTree -Path $safePath
+        Remove-Item -Force -Recurse -LiteralPath $safePath
+    }
+}
+
+function Assert-X64Executable {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {
+        $reader = New-Object System.IO.BinaryReader($stream)
+        try {
+            if ($reader.ReadUInt16() -ne 0x5A4D) {
+                throw "'$Path' is not a PE executable."
+            }
+
+            [void]$stream.Seek(0x3C, [System.IO.SeekOrigin]::Begin)
+            $peOffset = $reader.ReadInt32()
+            if ($peOffset -lt 0x40 -or $peOffset -gt ($stream.Length - 6)) {
+                throw "'$Path' has an invalid PE header offset."
+            }
+
+            [void]$stream.Seek($peOffset, [System.IO.SeekOrigin]::Begin)
+            if ($reader.ReadUInt32() -ne 0x00004550) {
+                throw "'$Path' has an invalid PE signature."
+            }
+
+            if ($reader.ReadUInt16() -ne 0x8664) {
+                throw "'$Path' is not an x64 executable."
+            }
+        }
+        finally {
+            $reader.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Read-Sha256Manifest {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $entries = @{}
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+        if ($line -notmatch '^([0-9a-fA-F]{64}) \*(.+)$') {
+            throw "Invalid checksum line '$line' in '$Path'."
+        }
+        $name = $Matches[2]
+        if ($entries.ContainsKey($name)) {
+            throw "Duplicate checksum entry '$name' in '$Path'."
+        }
+        $entries[$name] = $Matches[1].ToLowerInvariant()
+    }
+
+    if ($entries.Count -eq 0) {
+        throw "Checksum manifest '$Path' is empty."
+    }
+
+    return $entries
+}
+
+function Assert-FileSha256 {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ExpectedHash,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    $expected = Assert-ValidSha256Hex -Hash $ExpectedHash -Label "$Label expected SHA-256"
+    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+    if (-not [string]::Equals($actual, $expected, [System.StringComparison]::Ordinal)) {
+        throw "SHA-256 verification failed for $Label ('$Path'). Expected '$expected', got '$actual'."
+    }
+}
+
+function Test-HttpNotFound {
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    $ex = $ErrorRecord.Exception
+    if ($ex -is [System.Net.WebException] -and $null -ne $ex.Response) {
+        $httpResp = $ex.Response -as [System.Net.HttpWebResponse]
+        if ($null -ne $httpResp -and $httpResp.StatusCode -eq [System.Net.HttpStatusCode]::NotFound) {
+            return $true
+        }
+    }
+    if ($null -ne $ex.PSObject.Properties['Response'] -and $null -ne $ex.Response) {
+        $statusCodeProp = $ex.Response.PSObject.Properties['StatusCode']
+        if ($null -ne $statusCodeProp -and ([int]$statusCodeProp.Value -eq 404)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Invoke-WebDownloadOptional {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][string]$OutFile
+    )
+
+    try {
+        Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
+        return $true
+    }
+    catch {
+        if (Test-HttpNotFound -ErrorRecord $_) {
+            if (Test-Path -LiteralPath $OutFile) {
+                Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+            }
+            return $false
+        }
+        throw
+    }
+}
+
+$normalizedRepoUrl = Assert-ValidGitHubRepoUrl -Url $RepoUrl
+$repoSlug = ([Uri]$normalizedRepoUrl).AbsolutePath.Trim('/')
+$validatedBranch = if (-not [string]::IsNullOrWhiteSpace($Branch)) {
+    Assert-ValidGitRef -Ref $Branch -Label 'Branch'
+} else {
+    ''
+}
+$validatedReleaseTag = Assert-ValidGitRef -Ref $ReleaseTag -Label 'ReleaseTag'
+$validatedExpectedSha256 = if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+    Assert-ValidSha256Hex -Hash $ExpectedSha256 -Label 'ExpectedSha256'
+} else {
+    ''
+}
+
 Write-Host "==================================================================" -ForegroundColor Cyan
 Write-Host "             MISHAWEB ALL-IN-ONE INSTALLER SETUP                 " -ForegroundColor Cyan
 Write-Host "==================================================================" -ForegroundColor Cyan
 Write-Host "Target Installation Directory: $InstallPath" -ForegroundColor Gray
 
-# 1. Determine Source (Local or GitHub Download)
+# 1. Determine Source (Local or GitHub Release / Tag)
 $scriptDir = $PSScriptRoot
 $repoRootCandidate = [System.IO.Path]::GetFullPath((Join-Path $scriptDir '..'))
-$isLocalRepo = (Test-Path (Join-Path $repoRootCandidate 'desktop\MishaWeb.csproj'))
+$isLocalRepo = (Test-Path -LiteralPath (Join-Path $repoRootCandidate 'desktop\MishaWeb.csproj') -PathType Leaf)
 
-$script:InstallDirPrefix = [System.IO.Path]::GetFullPath($InstallPath).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
 $installFullPath = [System.IO.Path]::GetFullPath($InstallPath).TrimEnd('\', '/')
+$script:InstallDirPrefix = $installFullPath + [System.IO.Path]::DirectorySeparatorChar
 
-$stagingDir = Join-Path $env:TEMP "MishaWeb_Install_$([Guid]::NewGuid().ToString('N'))"
+$tempRoot = [System.IO.Path]::GetFullPath($env:TEMP).TrimEnd('\', '/')
+$stagingDir = Join-Path $tempRoot "MishaWeb_Install_$([Guid]::NewGuid().ToString('N'))"
+[void](Assert-ContainedPath -Candidate $stagingDir -Parent $tempRoot -Label 'Staging directory')
 $backupDir = $null
 $wshShell = $null
 $desktopShortcut = $null
@@ -64,31 +321,110 @@ try {
         throw "MishaWeb is currently running from '$installFullPath' (PID: $pids). Close it before installing."
     }
 
+    $publishStagingDir = Join-Path $stagingDir 'publish'
+    New-Item -ItemType Directory -Path $publishStagingDir -Force | Out-Null
+    $stagedExe = Join-Path $publishStagingDir 'MishaWeb.exe'
+    $stagedNotice = Join-Path $publishStagingDir 'THIRD-PARTY-NOTICES.txt'
+    $sourceDir = $null
+    $usedVerifiedReleaseBinary = $false
+
     if ($isLocalRepo -and (-not $ForceDownload)) {
         Write-Host "`n[1/4] Detected local MishaWeb repository source at:" -ForegroundColor Green
         Write-Host "      $repoRootCandidate" -ForegroundColor Gray
         $sourceDir = $repoRootCandidate
     }
+    elseif ([string]::IsNullOrWhiteSpace($validatedBranch)) {
+        Write-Host "`n[1/4] Downloading verified MishaWeb release '$validatedReleaseTag' from GitHub..." -ForegroundColor Green
+        $releaseBaseUrl = "$normalizedRepoUrl/releases/download/$validatedReleaseTag"
+        $checksumPath = Join-Path $stagingDir 'MishaWeb.sha256'
+        $hasReleaseChecksum = Invoke-WebDownloadOptional -Uri "$releaseBaseUrl/MishaWeb.sha256" -OutFile $checksumPath
+        $hasReleaseExe = $false
+
+        if ($hasReleaseChecksum) {
+            $checksumEntries = Read-Sha256Manifest -Path $checksumPath
+            $hasReleaseExe = Invoke-WebDownloadOptional -Uri "$releaseBaseUrl/MishaWeb.exe" -OutFile $stagedExe
+            if ($hasReleaseExe) {
+                if (-not $checksumEntries.ContainsKey('MishaWeb.exe')) {
+                    throw "Release checksum manifest '$checksumPath' does not contain an entry for 'MishaWeb.exe'."
+                }
+                Assert-FileSha256 -Path $stagedExe -ExpectedHash $checksumEntries['MishaWeb.exe'] -Label 'MishaWeb.exe'
+                if (-not [string]::IsNullOrWhiteSpace($validatedExpectedSha256)) {
+                    Assert-FileSha256 -Path $stagedExe -ExpectedHash $validatedExpectedSha256 -Label 'MishaWeb.exe (ExpectedSha256)'
+                }
+
+                if (-not (Invoke-WebDownloadOptional -Uri "$releaseBaseUrl/THIRD-PARTY-NOTICES.txt" -OutFile $stagedNotice)) {
+                    $rawNoticeUrl = "https://raw.githubusercontent.com/$repoSlug/refs/tags/$validatedReleaseTag/licenses/THIRD-PARTY-NOTICES.txt"
+                    Invoke-WebRequest -Uri $rawNoticeUrl -OutFile $stagedNotice -UseBasicParsing
+                }
+                if (-not $checksumEntries.ContainsKey('THIRD-PARTY-NOTICES.txt')) {
+                    throw "Release checksum manifest '$checksumPath' does not contain an entry for 'THIRD-PARTY-NOTICES.txt'."
+                }
+                Assert-FileSha256 -Path $stagedNotice -ExpectedHash $checksumEntries['THIRD-PARTY-NOTICES.txt'] -Label 'THIRD-PARTY-NOTICES.txt'
+
+                $releaseManifestPath = Join-Path $stagingDir 'MishaWeb.release.json'
+                if (Invoke-WebDownloadOptional -Uri "$releaseBaseUrl/MishaWeb.release.json" -OutFile $releaseManifestPath) {
+                    if (-not $checksumEntries.ContainsKey('MishaWeb.release.json')) {
+                        throw "Release checksum manifest '$checksumPath' does not contain an entry for 'MishaWeb.release.json'."
+                    }
+                    Assert-FileSha256 -Path $releaseManifestPath -ExpectedHash $checksumEntries['MishaWeb.release.json'] -Label 'MishaWeb.release.json'
+                    $releaseManifest = Get-Content -Raw -LiteralPath $releaseManifestPath | ConvertFrom-Json
+                    if ($releaseManifest.product -ne 'MishaWeb' -or $releaseManifest.runtimeIdentifier -ne 'win-x64') {
+                        throw "Release manifest metadata is invalid for MishaWeb win-x64."
+                    }
+                }
+
+                if ((Get-Item -LiteralPath $stagedExe).Length -le 0) {
+                    throw "Downloaded MishaWeb.exe at '$stagedExe' is empty."
+                }
+                Assert-X64Executable -Path $stagedExe
+                $usedVerifiedReleaseBinary = $true
+                Write-Host "      Verified release artifact SHA-256 against MishaWeb.sha256." -ForegroundColor Gray
+            }
+        }
+
+        if (-not $usedVerifiedReleaseBinary) {
+            $tagZipUrl = "$normalizedRepoUrl/archive/refs/tags/$validatedReleaseTag.zip"
+            $zipFile = Join-Path $stagingDir 'mishaweb-source.zip'
+            Write-Host "      Release binary assets unavailable; fetching tagged source archive: $tagZipUrl" -ForegroundColor Gray
+            Invoke-WebRequest -Uri $tagZipUrl -OutFile $zipFile -UseBasicParsing
+
+            if (-not [string]::IsNullOrWhiteSpace($validatedExpectedSha256)) {
+                Assert-FileSha256 -Path $zipFile -ExpectedHash $validatedExpectedSha256 -Label 'Tagged source archive'
+            }
+            elseif ($hasReleaseChecksum -and $checksumEntries.ContainsKey('mishaweb-source.zip')) {
+                Assert-FileSha256 -Path $zipFile -ExpectedHash $checksumEntries['mishaweb-source.zip'] -Label 'Tagged source archive'
+            }
+
+            Write-Host "      Extracting repository contents..." -ForegroundColor Gray
+            $extractDir = Join-Path $stagingDir 'unpacked'
+            Expand-Archive -LiteralPath $zipFile -DestinationPath $extractDir -Force
+            Assert-NoReparseTree -Path $extractDir
+
+            $unpackedRoot = Get-ChildItem -Path $extractDir -Directory | Select-Object -First 1
+            if ($null -eq $unpackedRoot) {
+                throw "Failed to find unpacked repository root directory in '$extractDir'."
+            }
+            $sourceDir = $unpackedRoot.FullName
+            Write-Host "      Downloaded and unpacked release tag '$validatedReleaseTag'." -ForegroundColor Gray
+        }
+    }
     else {
-        Write-Host "`n[1/4] Downloading MishaWeb repository from GitHub..." -ForegroundColor Green
-        $zipUrl = "$RepoUrl/archive/refs/heads/$Branch.zip"
-        $fallbackZipUrl = "$RepoUrl/archive/refs/heads/master.zip"
+        Write-Host "`n[1/4] Downloading MishaWeb branch '$validatedBranch' from GitHub..." -ForegroundColor Green
+        $zipUrl = "$normalizedRepoUrl/archive/refs/heads/$validatedBranch.zip"
         $zipFile = Join-Path $stagingDir 'mishaweb-source.zip'
 
         Write-Host "      Fetching from: $zipUrl" -ForegroundColor Gray
-        try {
-            Invoke-WebRequest -Uri $zipUrl -OutFile $zipFile -UseBasicParsing
-        }
-        catch {
-            Write-Host "      Retrying with fallback master branch: $fallbackZipUrl" -ForegroundColor Yellow
-            Invoke-WebRequest -Uri $fallbackZipUrl -OutFile $zipFile -UseBasicParsing
+        Invoke-WebRequest -Uri $zipUrl -OutFile $zipFile -UseBasicParsing
+
+        if (-not [string]::IsNullOrWhiteSpace($validatedExpectedSha256)) {
+            Assert-FileSha256 -Path $zipFile -ExpectedHash $validatedExpectedSha256 -Label 'Branch source archive'
         }
 
         Write-Host "      Extracting repository contents..." -ForegroundColor Gray
         $extractDir = Join-Path $stagingDir 'unpacked'
         Expand-Archive -LiteralPath $zipFile -DestinationPath $extractDir -Force
+        Assert-NoReparseTree -Path $extractDir
 
-        # Find the unpacked directory (typically browser-engine-main or browser-engine-master)
         $unpackedRoot = Get-ChildItem -Path $extractDir -Directory | Select-Object -First 1
         if ($null -eq $unpackedRoot) {
             throw "Failed to find unpacked repository root directory in '$extractDir'."
@@ -97,46 +433,60 @@ try {
         Write-Host "      Downloaded and unpacked successfully." -ForegroundColor Gray
     }
 
-    # 2. Always build cleanly into an isolated staging directory (never copy repo sources into InstallPath)
-    Write-Host "`n[2/4] Publishing clean single-file MishaWeb.exe to staging..." -ForegroundColor Green
-    $projectFile = Join-Path $sourceDir 'desktop\MishaWeb.csproj'
-    if (-not (Test-Path -LiteralPath $projectFile -PathType Leaf)) {
-        throw "MishaWeb.csproj not found at '$projectFile'."
+    # 2. Build cleanly into isolated staging when installing from source, and stage THIRD-PARTY-NOTICES.txt
+    if (-not $usedVerifiedReleaseBinary) {
+        Write-Host "`n[2/4] Publishing clean single-file MishaWeb.exe to staging..." -ForegroundColor Green
+        $projectFile = Join-Path $sourceDir 'desktop\MishaWeb.csproj'
+        if (-not (Test-Path -LiteralPath $projectFile -PathType Leaf)) {
+            throw "MishaWeb.csproj not found at '$projectFile'."
+        }
+
+        $lockFile = Join-Path $sourceDir 'desktop\packages.lock.json'
+        if (-not (Test-Path -LiteralPath $lockFile -PathType Leaf)) {
+            throw "Locked NuGet restore is required, but '$lockFile' is missing."
+        }
+
+        $noticeSource = Join-Path $sourceDir 'licenses\THIRD-PARTY-NOTICES.txt'
+        if (-not (Test-Path -LiteralPath $noticeSource -PathType Leaf)) {
+            throw "Required license notice file not found at '$noticeSource'."
+        }
+
+        $dotnetCmd = Get-Command dotnet -ErrorAction SilentlyContinue
+        if ($null -eq $dotnetCmd) {
+            throw "Microsoft .NET 10 SDK was not found on your system. Please install .NET 10 from https://dotnet.microsoft.com/download/dotnet/10.0"
+        }
+
+        & dotnet publish $projectFile `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained false `
+            --output $publishStagingDir `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:PublishReadyToRun=false `
+            -p:TieredPGO=true `
+            -p:PublishTrimmed=false `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            -p:ContinuousIntegrationBuild=true `
+            -p:RestoreLockedMode=true `
+            -p:Deterministic=true
+
+        if ($LASTEXITCODE -ne 0 -or (-not (Test-Path -LiteralPath $stagedExe -PathType Leaf))) {
+            throw "Failed to compile MishaWeb.exe. dotnet publish exited with code $LASTEXITCODE."
+        }
+        if ((Get-Item -LiteralPath $stagedExe).Length -le 0) {
+            throw "Staged MishaWeb.exe at '$stagedExe' is empty."
+        }
+        Assert-X64Executable -Path $stagedExe
+
+        Copy-Item -LiteralPath $noticeSource -Destination $stagedNotice -Force
+        if (-not (Test-Path -LiteralPath $stagedNotice -PathType Leaf)) {
+            throw "Failed to stage THIRD-PARTY-NOTICES.txt at '$stagedNotice'."
+        }
     }
-
-    $dotnetCmd = Get-Command dotnet -ErrorAction SilentlyContinue
-    if ($null -eq $dotnetCmd) {
-        throw "Microsoft .NET 10 SDK was not found on your system. Please install .NET 10 from https://dotnet.microsoft.com/download/dotnet/10.0"
-    }
-
-    $publishStagingDir = Join-Path $stagingDir 'publish'
-    New-Item -ItemType Directory -Path $publishStagingDir -Force | Out-Null
-
-    $lockFile = Join-Path $sourceDir 'desktop\packages.lock.json'
-    $restoreLockedMode = if (Test-Path -LiteralPath $lockFile -PathType Leaf) { 'true' } else { 'false' }
-
-    & dotnet publish $projectFile `
-        --configuration Release `
-        --runtime win-x64 `
-        --self-contained false `
-        --output $publishStagingDir `
-        -p:PublishSingleFile=true `
-        -p:IncludeNativeLibrariesForSelfExtract=true `
-        -p:PublishReadyToRun=false `
-        -p:TieredPGO=true `
-        -p:PublishTrimmed=false `
-        -p:DebugType=None `
-        -p:DebugSymbols=false `
-        -p:ContinuousIntegrationBuild=true `
-        "-p:RestoreLockedMode=$restoreLockedMode" `
-        -p:Deterministic=true
-
-    $stagedExe = Join-Path $publishStagingDir 'MishaWeb.exe'
-    if ($LASTEXITCODE -ne 0 -or (-not (Test-Path -LiteralPath $stagedExe -PathType Leaf))) {
-        throw "Failed to compile MishaWeb.exe. dotnet publish exited with code $LASTEXITCODE."
-    }
-    if ((Get-Item -LiteralPath $stagedExe).Length -le 0) {
-        throw "Staged MishaWeb.exe at '$stagedExe' is empty."
+    else {
+        Write-Host "`n[2/4] Using SHA-256 verified release binary payload..." -ForegroundColor Green
     }
 
     # 3. Atomically swap staged build into InstallPath with backup rollback on failure
@@ -152,15 +502,28 @@ try {
     if (-not (Test-Path -LiteralPath $installParent)) {
         New-Item -ItemType Directory -Path $installParent -Force | Out-Null
     }
+    $installParentItem = Get-Item -Force -LiteralPath $installParent
+    if (($installParentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing to install under reparse-point parent directory '$installParent'."
+    }
 
+    [void](Assert-ContainedPath -Candidate $installFullPath -Parent $installParent -Label 'Install target')
     $targetExe = Join-Path $installFullPath 'MishaWeb.exe'
+    $targetNotice = Join-Path $installFullPath 'THIRD-PARTY-NOTICES.txt'
     $targetStageDir = Join-Path $installParent (".MishaWeb_Stage_$([Guid]::NewGuid().ToString('N'))")
     $backupDir = Join-Path $installParent (".MishaWeb_Backup_$([Guid]::NewGuid().ToString('N'))")
+    [void](Assert-ContainedPath -Candidate $targetStageDir -Parent $installParent -Label 'Install stage')
+    [void](Assert-ContainedPath -Candidate $backupDir -Parent $installParent -Label 'Install backup')
+
     $movedBackup = $false
     try {
+        Assert-NoReparseTree -Path $publishStagingDir
         # Materialize the verified staging tree on the target volume before swapping.
         Copy-Item -LiteralPath $publishStagingDir -Destination $targetStageDir -Recurse -Force
+        Assert-NoReparseTree -Path $targetStageDir
+
         if (Test-Path -LiteralPath $installFullPath) {
+            Assert-NoReparseTree -Path $installFullPath
             Move-Item -LiteralPath $installFullPath -Destination $backupDir
             $movedBackup = $true
         }
@@ -168,24 +531,28 @@ try {
         if (-not (Test-Path -LiteralPath $targetExe -PathType Leaf)) {
             throw "Installed executable missing at '$targetExe' after commit."
         }
+        if (-not (Test-Path -LiteralPath $targetNotice -PathType Leaf)) {
+            throw "Installed THIRD-PARTY-NOTICES.txt missing at '$targetNotice' after commit."
+        }
     }
     catch {
         if (Test-Path -LiteralPath $targetStageDir) {
-            Remove-Item -LiteralPath $targetStageDir -Recurse -Force -ErrorAction SilentlyContinue
+            try { Remove-ContainedDirectory -Path $targetStageDir -Parent $installParent } catch { }
         }
         if (Test-Path -LiteralPath $installFullPath) {
-            Remove-Item -LiteralPath $installFullPath -Recurse -Force -ErrorAction SilentlyContinue
+            try { Remove-ContainedDirectory -Path $installFullPath -Parent $installParent } catch { }
         }
         if ($movedBackup -and (Test-Path -LiteralPath $backupDir)) {
+            Assert-NoReparseTree -Path $backupDir
             Move-Item -LiteralPath $backupDir -Destination $installFullPath -ErrorAction SilentlyContinue
         }
         throw
     }
 
     if ($movedBackup -and (Test-Path -LiteralPath $backupDir)) {
-        Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+        try { Remove-ContainedDirectory -Path $backupDir -Parent $installParent } catch { }
     }
-    Write-Host "      MishaWeb.exe installed and verified cleanly." -ForegroundColor Green
+    Write-Host "      MishaWeb.exe and THIRD-PARTY-NOTICES.txt installed and verified cleanly." -ForegroundColor Green
 
     # 4. Create Shortcuts
     Write-Host "`n[4/4] Creating Desktop and Start Menu shortcuts..." -ForegroundColor Green
@@ -336,6 +703,6 @@ finally {
         }
     }
     if (Test-Path -LiteralPath $stagingDir) {
-        Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
+        try { Remove-ContainedDirectory -Path $stagingDir -Parent $tempRoot } catch { }
     }
 }

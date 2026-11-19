@@ -651,9 +651,10 @@ internal sealed class ExtensionsManagerForm : Form
             header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 46));
             header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
 
+            var iconTargetPixels = Math.Max(16, parentForm.LogicalToDeviceUnits(36));
             if (row.IconPath is not null && File.Exists(row.IconPath))
             {
-                iconImage = TryLoadUnlockedBitmap(row.IconPath);
+                iconImage = TryLoadUnlockedBitmap(row.IconPath, iconTargetPixels);
             }
 
             var iconBox = new ExtensionIconBox(iconImage, row.Name);
@@ -848,9 +849,22 @@ internal sealed class ExtensionsManagerForm : Form
             }
 
             var capList = row.Capabilities ?? [];
-            var capText = capList.Count == 0
-                ? "No special permissions or site access declared in manifest."
-                : "Declared permissions and site access:" + Environment.NewLine + string.Join(Environment.NewLine, capList.Select(c => "  \u00B7 " + c));
+            string capText;
+            if (capList.Count == 0)
+            {
+                capText = "No special permissions or site access declared in manifest.";
+            }
+            else
+            {
+                var visibleCapabilities = MainForm.SelectExtensionCapabilitiesForPrompt(
+                    capList,
+                    maximumOrdinaryCapabilities: 18);
+                capText = visibleCapabilities.Count == 0
+                    ? "No special permissions or site access declared in manifest."
+                    : "Declared permissions and site access:"
+                        + Environment.NewLine
+                        + string.Join(Environment.NewLine, visibleCapabilities.Select(c => "  \u00B7 " + c));
+            }
             var capLabel = new Label
             {
                 Dock = DockStyle.Top,
@@ -906,16 +920,51 @@ internal sealed class ExtensionsManagerForm : Form
             g.DrawPath(pen, path);
         }
 
-        private static Bitmap? TryLoadUnlockedBitmap(string filePath)
+        private const long MaximumIconFileBytes = 2 * 1024 * 1024;
+        private const int MaximumIconDimension = 4096;
+
+        private static Bitmap? TryLoadUnlockedBitmap(string filePath, int targetPixels)
         {
             try
             {
-                using var stream = File.OpenRead(filePath);
+                using var stream = new FileStream(
+                    filePath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.Read);
+                if (stream.Length <= 0 || stream.Length > MaximumIconFileBytes)
+                {
+                    return null;
+                }
                 using var decoded = Image.FromStream(
                     stream,
                     useEmbeddedColorManagement: false,
                     validateImageData: true);
-                return new Bitmap(decoded);
+                if (decoded.Width <= 0
+                    || decoded.Height <= 0
+                    || decoded.Width > MaximumIconDimension
+                    || decoded.Height > MaximumIconDimension)
+                {
+                    return null;
+                }
+
+                var side = Math.Clamp(targetPixels, 16, 256);
+                var scaled = new Bitmap(side, side, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+                try
+                {
+                    scaled.SetResolution(96f, 96f);
+                    using var graphics = Graphics.FromImage(scaled);
+                    graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    graphics.SmoothingMode = SmoothingMode.HighQuality;
+                    graphics.DrawImage(decoded, new Rectangle(0, 0, side, side));
+                    return scaled;
+                }
+                catch
+                {
+                    scaled.Dispose();
+                    throw;
+                }
             }
             catch
             {

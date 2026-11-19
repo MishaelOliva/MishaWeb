@@ -60,11 +60,19 @@ internal static class BrandArtwork
             if (cached is null)
             {
                 cached = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppPArgb);
-                cached.SetResolution(96f, 96f);
-                using (var renderGraphics = Graphics.FromImage(cached))
+                try
                 {
-                    renderGraphics.Clear(Color.Transparent);
-                    RenderLogo(renderGraphics, new Rectangle(0, 0, bounds.Width, bounds.Height), image);
+                    cached.SetResolution(96f, 96f);
+                    using (var renderGraphics = Graphics.FromImage(cached))
+                    {
+                        renderGraphics.Clear(Color.Transparent);
+                        RenderLogo(renderGraphics, new Rectangle(0, 0, bounds.Width, bounds.Height), image);
+                    }
+                }
+                catch
+                {
+                    cached.Dispose();
+                    throw;
                 }
 
                 if (RenderedLogoCache.Count >= MaximumCachedLogoEntries)
@@ -101,7 +109,7 @@ internal static class BrandArtwork
             bounds.Width,
             bounds.Height);
         var radius = Math.Min(clipBounds.Width, clipBounds.Height) * 0.25f;
-        using var squirclePath = CreateRoundedPath(clipBounds, radius);
+        using var squirclePath = NativeUiTheme.CreateRoundedPath(clipBounds, radius);
         var state = graphics.Save();
         try
         {
@@ -163,7 +171,7 @@ internal static class BrandArtwork
                 Math.Max(1f, bounds.Width - 1f),
                 Math.Max(1f, bounds.Height - 1f));
             var borderRadius = Math.Min(borderBounds.Width, borderBounds.Height) * 0.25f;
-            using var borderPath = CreateRoundedPath(borderBounds, borderRadius);
+            using var borderPath = NativeUiTheme.CreateRoundedPath(borderBounds, borderRadius);
             using var outerRimBrush = new LinearGradientBrush(
                 borderBounds,
                 Color.FromArgb(205, 255, 232, 246),
@@ -177,7 +185,7 @@ internal static class BrandArtwork
             if (innerBounds.Width > 4f && innerBounds.Height > 4f)
             {
                 var innerRadius = Math.Max(2f, borderRadius - 1.1f);
-                using var innerPath = CreateRoundedPath(innerBounds, innerRadius);
+                using var innerPath = NativeUiTheme.CreateRoundedPath(innerBounds, innerRadius);
                 using var innerRimBrush = new LinearGradientBrush(
                     innerBounds,
                     Color.FromArgb(115, 255, 255, 255),
@@ -194,25 +202,6 @@ internal static class BrandArtwork
             graphics.PixelOffsetMode = previousPixelOffset;
             graphics.CompositingQuality = previousCompositing;
         }
-    }
-
-    private static GraphicsPath CreateRoundedPath(RectangleF bounds, float radius)
-    {
-        var path = new GraphicsPath();
-        if (bounds.Width <= 1f || bounds.Height <= 1f)
-        {
-            path.AddRectangle(bounds);
-            return path;
-        }
-
-        var safeRadius = Math.Max(1f, Math.Min(radius, Math.Min(bounds.Width, bounds.Height) / 2f));
-        var diameter = safeRadius * 2f;
-        path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
-        path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
-        path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
-        path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
-        path.CloseFigure();
-        return path;
     }
 
     private static Bitmap? LoadLogoImage()
@@ -292,10 +281,12 @@ internal sealed class BrandLogoControl : Control
             1f);
         e.Graphics.FillEllipse(fill, badgeBounds);
         e.Graphics.DrawEllipse(border, badgeBounds);
+        var badgePointSize = Math.Clamp((badgeSize * 0.58f * 72f) / Math.Max(96f, e.Graphics.DpiY), 5.5f, 24f);
+        var badgeFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", badgePointSize, FontStyle.Bold);
         TextRenderer.DrawText(
             e.Graphics,
             "I",
-            Font,
+            badgeFont,
             badgeBounds,
             SystemInformation.HighContrast ? SystemColors.HighlightText : NativeUiTheme.AccentText,
             TextFormatFlags.HorizontalCenter
