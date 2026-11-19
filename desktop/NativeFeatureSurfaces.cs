@@ -10,9 +10,9 @@ internal static class NativeDialogLayout
 {
     internal const int ActionRowHeight = 44;
     internal const int WrappedActionRowHeight = 84;
-    internal static readonly Font QueryFont = new("Segoe UI", 11f);
-    internal static readonly Font ListFont = new("Segoe UI", 10f);
-    internal static readonly Font CompactListFont = new("Segoe UI", 9.5f);
+    internal static readonly Font QueryFont = NativeUiTheme.GetSharedFont("Segoe UI", 11f);
+    internal static readonly Font ListFont = NativeUiTheme.GetSharedFont("Segoe UI", 10f);
+    internal static readonly Font CompactListFont = NativeUiTheme.GetSharedFont("Segoe UI", 9.5f);
 
     internal static void EnableDpiScaling(Form form)
     {
@@ -117,8 +117,24 @@ internal sealed class CommandPaletteForm : Form
         queryBox.TextChanged += (_, _) => QueueRefresh();
         queryBox.KeyDown += OnKeyDown;
         resultList.KeyDown += OnKeyDown;
-        resultList.MouseClick += (_, _) => ActivateSelected();
-        resultList.DoubleClick += (_, _) => ActivateSelected();
+        resultList.MouseClick += (_, e) =>
+        {
+            var index = resultList.IndexFromPoint(e.Location);
+            if (index >= 0 && index < rows.Count)
+            {
+                resultList.SelectedIndex = index;
+                ActivateSelected();
+            }
+        };
+        resultList.MouseDoubleClick += (_, e) =>
+        {
+            var index = resultList.IndexFromPoint(e.Location);
+            if (index >= 0 && index < rows.Count)
+            {
+                resultList.SelectedIndex = index;
+                ActivateSelected();
+            }
+        };
         queryTimer.Tick += (_, _) =>
         {
             queryTimer.Stop();
@@ -338,9 +354,27 @@ internal sealed class MruSwitcherForm : Form
                     "T",
                     NativeUiTheme.Accent);
             });
+        itemList.MouseClick += (_, e) =>
+        {
+            var index = itemList.IndexFromPoint(e.Location);
+            if (index >= 0 && index < labels.Count)
+            {
+                itemList.SelectedIndex = index;
+                CommitSelection();
+            }
+        };
+        itemList.MouseDoubleClick += (_, e) =>
+        {
+            var index = itemList.IndexFromPoint(e.Location);
+            if (index >= 0 && index < labels.Count)
+            {
+                itemList.SelectedIndex = index;
+                CommitSelection();
+            }
+        };
         KeyUp += (_, e) =>
         {
-            if (e.KeyCode == Keys.Control && Visible) CommitSelection();
+            if (e.KeyCode == Keys.ControlKey && Visible) CommitSelection();
         };
         Deactivate += (_, _) =>
         {
@@ -425,6 +459,11 @@ internal sealed class MruSwitcherForm : Form
             MoveSelection(-1);
             return true;
         }
+        if (keyData == Keys.Enter)
+        {
+            CommitSelection();
+            return true;
+        }
         if (keyData == Keys.Escape)
         {
             CancelSelection();
@@ -498,6 +537,8 @@ internal sealed class SessionManagerForm : Form
         actions.Controls.AddRange([closeButton, deleteButton, renameButton, updateButton, replaceButton, openButton, newButton]);
         root.Controls.Add(actions, 0, 1);
         Controls.Add(root);
+        AcceptButton = openButton;
+        CancelButton = closeButton;
         NativeUiTheme.Apply(this, openButton);
         NativeUiTheme.ConfigureModernListBox(
             sessionList,
@@ -544,7 +585,6 @@ internal sealed class SessionManagerForm : Form
                 Hide();
             }
         };
-        FormClosed += (_, _) => Hide();
         UpdateButtons();
     }
 
@@ -779,6 +819,8 @@ internal sealed class PermissionManagerForm : Form
         actions.Controls.AddRange([closeButton, resetAllButton, resetButton]);
         root.Controls.Add(actions, 0, 1);
         Controls.Add(root);
+        AcceptButton = resetButton;
+        CancelButton = closeButton;
         NativeUiTheme.Apply(this);
         NativeUiTheme.ConfigureModernListBox(
             settingList,
@@ -1626,8 +1668,8 @@ internal sealed class DownloadNotificationForm : Form
 
 internal sealed class NativeAlertDialog : Form
 {
-    private static readonly Font MessageFont = new("Segoe UI", 9.5f);
-    private static readonly Font BadgeFont = new("Segoe UI Semibold", 11.5f);
+    private static readonly Font MessageFont = NativeUiTheme.GetSharedFont("Segoe UI", 9.5f);
+    private static readonly Font BadgeFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 11.5f);
 
     private NativeAlertDialog(
         string title,

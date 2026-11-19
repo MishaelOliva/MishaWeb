@@ -151,7 +151,7 @@ internal sealed class MultiViewToolbarButton : Button
 
         var pillRect = new RectangleF(1f, 2f, Math.Max(2f, ClientSize.Width - 2f), Math.Max(2f, ClientSize.Height - 4f));
         var radius = Math.Min(pillRect.Height / 2f, 9f * scale);
-        using var pillPath = CreateRoundedPath(pillRect, radius);
+        using var pillPath = NativeUiTheme.CreateRoundedPath(pillRect, radius);
         using (var bgBrush = new SolidBrush(fill))
         {
             graphics.FillPath(bgBrush, pillPath);
@@ -228,7 +228,7 @@ internal sealed class MultiViewToolbarButton : Button
     private static void DrawGridGlyph(Graphics graphics, RectangleF bounds, int viewCount, Color color, float scale)
     {
         using var pen = new Pen(color, Math.Max(1.1f, 1.25f * scale));
-        using var outer = CreateRoundedPath(bounds, 2.5f * scale);
+        using var outer = NativeUiTheme.CreateRoundedPath(bounds, 2.5f * scale);
         graphics.DrawPath(pen, outer);
 
         var midX = bounds.Left + (bounds.Width / 2f);
@@ -242,19 +242,6 @@ internal sealed class MultiViewToolbarButton : Button
         {
             graphics.DrawLine(pen, bounds.Left + 1f, midY, bounds.Right - 1f, midY);
         }
-    }
-
-    private static GraphicsPath CreateRoundedPath(RectangleF bounds, float radius)
-    {
-        var path = new GraphicsPath();
-        var safe = Math.Max(1f, Math.Min(radius, Math.Min(bounds.Width, bounds.Height) / 2f));
-        var d = safe * 2f;
-        path.AddArc(bounds.Left, bounds.Top, d, d, 180, 90);
-        path.AddArc(bounds.Right - d, bounds.Top, d, d, 270, 90);
-        path.AddArc(bounds.Right - d, bounds.Bottom - d, d, d, 0, 90);
-        path.AddArc(bounds.Left, bounds.Bottom - d, d, d, 90, 90);
-        path.CloseFigure();
-        return path;
     }
 }
 
@@ -283,13 +270,15 @@ internal sealed class PaneHeaderBar : Control
             ControlStyles.AllPaintingInWmPaint
             | ControlStyles.OptimizedDoubleBuffer
             | ControlStyles.ResizeRedraw
+            | ControlStyles.Selectable
             | ControlStyles.StandardClick
             | ControlStyles.StandardDoubleClick
             | ControlStyles.UserPaint,
             true);
-        TabStop = false;
+        TabStop = true;
         AccessibleRole = AccessibleRole.TitleBar;
         AccessibleName = $"View pane {paneIndex + 1}";
+        AccessibleDescription = "Activate pane, switch tab, toggle audio, or close pane";
     }
 
     public int PaneIndex { get; }
@@ -345,6 +334,65 @@ internal sealed class PaneHeaderBar : Control
     {
         base.OnResize(e);
         RecalculateButtonBounds();
+    }
+
+    protected override void OnDpiChangedAfterParent(EventArgs e)
+    {
+        base.OnDpiChangedAfterParent(e);
+        RecalculateButtonBounds();
+        Invalidate();
+    }
+
+    protected override void OnGotFocus(EventArgs e)
+    {
+        base.OnGotFocus(e);
+        Invalidate();
+    }
+
+    protected override void OnLostFocus(EventArgs e)
+    {
+        base.OnLostFocus(e);
+        Invalidate();
+    }
+
+    protected override bool IsInputKey(Keys keyData)
+    {
+        return keyData is Keys.Left or Keys.Right || base.IsInputKey(keyData);
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+        if (e.KeyCode is Keys.Enter or Keys.Space)
+        {
+            PaneActivated?.Invoke(this, EventArgs.Empty);
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+        }
+        else if (e.KeyCode == Keys.W && e.Control && !closeBounds.IsEmpty)
+        {
+            CloseRequested?.Invoke(this, EventArgs.Empty);
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+        }
+        else if (e.KeyCode == Keys.M && e.Control && !audioBounds.IsEmpty)
+        {
+            AudioToggleRequested?.Invoke(this, EventArgs.Empty);
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+        }
+        else if (e.KeyCode == Keys.Down && e.Alt && !switchBounds.IsEmpty)
+        {
+            TabSwitchRequested?.Invoke(this, PointToScreen(new Point(switchBounds.Left, Height)));
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+        }
+        else if (e.KeyCode == Keys.F10 && e.Shift && !switchBounds.IsEmpty)
+        {
+            TabSwitchRequested?.Invoke(this, PointToScreen(new Point(switchBounds.Left, Height)));
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+        }
     }
 
     protected override void OnMouseMove(MouseEventArgs e)
@@ -565,22 +613,178 @@ internal sealed class PaneHeaderBar : Control
             graphics.DrawLine(closePen, cx - half, cy - half, cx + half, cy + half);
             graphics.DrawLine(closePen, cx + half, cy - half, cx - half, cy + half);
         }
+
+        if (Focused && ShowFocusCues)
+        {
+            var focusRect = Rectangle.Inflate(ClientRectangle, -1, -1);
+            if (focusRect.Width > 2 && focusRect.Height > 2)
+            {
+                ControlPaint.DrawFocusRectangle(
+                    graphics,
+                    focusRect,
+                    highContrast ? textColor : NativeUiTheme.Focus,
+                    bgColor);
+            }
+        }
+    }
+
+    protected override AccessibleObject CreateAccessibilityInstance()
+    {
+        return new PaneHeaderAccessibleObject(this);
     }
 
     private void RecalculateButtonBounds()
     {
-        var buttonSize = Math.Max(18, Math.Min(Height - 2, (int)Math.Round(22 * Math.Max(1f, DeviceDpi / 96f))));
+        var scale = Math.Max(1f, DeviceDpi / 96f);
+        var buttonSize = Math.Max(18, Math.Min(Height - 2, (int)Math.Round(22 * scale)));
+        var gap = Math.Max(2, (int)Math.Round(2 * scale));
+        var rightMargin = Math.Max(3, (int)Math.Round(3 * scale));
         var y = Math.Max(1, (Height - buttonSize) / 2);
-        var closeRight = Math.Max(0, Width - 3);
-        closeBounds = Width >= buttonSize * 2 + 24
+        var closeRight = Math.Max(0, Width - rightMargin);
+        closeBounds = Width >= buttonSize * 2 + (int)Math.Round(24 * scale)
             ? new Rectangle(closeRight - buttonSize, y, buttonSize, buttonSize)
             : Rectangle.Empty;
-        switchBounds = Width >= buttonSize * 3 + 32
-            ? new Rectangle(closeBounds.Left - buttonSize - 2, y, buttonSize, buttonSize)
+        switchBounds = Width >= buttonSize * 3 + (int)Math.Round(32 * scale)
+            ? new Rectangle(closeBounds.Left - buttonSize - gap, y, buttonSize, buttonSize)
             : Rectangle.Empty;
-        audioBounds = (isAudible || isMuted) && Width >= buttonSize * 4 + 40 && !switchBounds.IsEmpty
-            ? new Rectangle(switchBounds.Left - buttonSize - 2, y, buttonSize, buttonSize)
+        audioBounds = (isAudible || isMuted) && Width >= buttonSize * 4 + (int)Math.Round(40 * scale) && !switchBounds.IsEmpty
+            ? new Rectangle(switchBounds.Left - buttonSize - gap, y, buttonSize, buttonSize)
             : Rectangle.Empty;
+    }
+
+    private enum HeaderActionKind
+    {
+        Audio,
+        SwitchTab,
+        Close
+    }
+
+    private List<HeaderActionKind> GetVisibleActions()
+    {
+        var actions = new List<HeaderActionKind>(3);
+        if (!audioBounds.IsEmpty) actions.Add(HeaderActionKind.Audio);
+        if (!switchBounds.IsEmpty) actions.Add(HeaderActionKind.SwitchTab);
+        if (!closeBounds.IsEmpty) actions.Add(HeaderActionKind.Close);
+        return actions;
+    }
+
+    private Rectangle GetActionBounds(HeaderActionKind kind) => kind switch
+    {
+        HeaderActionKind.Audio => audioBounds,
+        HeaderActionKind.SwitchTab => switchBounds,
+        HeaderActionKind.Close => closeBounds,
+        _ => Rectangle.Empty
+    };
+
+    private void InvokeAction(HeaderActionKind kind)
+    {
+        switch (kind)
+        {
+            case HeaderActionKind.Audio:
+                AudioToggleRequested?.Invoke(this, EventArgs.Empty);
+                break;
+            case HeaderActionKind.SwitchTab:
+                PaneActivated?.Invoke(this, EventArgs.Empty);
+                TabSwitchRequested?.Invoke(this, PointToScreen(new Point(switchBounds.Left, Height)));
+                break;
+            case HeaderActionKind.Close:
+                CloseRequested?.Invoke(this, EventArgs.Empty);
+                break;
+        }
+    }
+
+    private sealed class PaneHeaderAccessibleObject(PaneHeaderBar owner) : ControlAccessibleObject(owner)
+    {
+        public override AccessibleRole Role => AccessibleRole.TitleBar;
+
+        public override AccessibleStates State => base.State
+            | AccessibleStates.Selectable
+            | (owner.isFocusedPane ? AccessibleStates.Selected : AccessibleStates.None);
+
+        public override string DefaultAction => "Activate pane";
+
+        public override void DoDefaultAction()
+        {
+            if (!owner.IsDisposed) owner.PaneActivated?.Invoke(owner, EventArgs.Empty);
+        }
+
+        public override int GetChildCount() => owner.IsDisposed ? 0 : owner.GetVisibleActions().Count;
+
+        public override AccessibleObject? GetChild(int index)
+        {
+            if (owner.IsDisposed) return null;
+            var actions = owner.GetVisibleActions();
+            return index >= 0 && index < actions.Count
+                ? new PaneHeaderActionAccessibleObject(this, owner, actions[index])
+                : null;
+        }
+
+        public override AccessibleObject? HitTest(int x, int y)
+        {
+            if (owner.IsDisposed || !owner.IsHandleCreated) return null;
+            var client = owner.PointToClient(new Point(x, y));
+            foreach (var action in owner.GetVisibleActions())
+            {
+                if (owner.GetActionBounds(action).Contains(client))
+                {
+                    return new PaneHeaderActionAccessibleObject(this, owner, action);
+                }
+            }
+            return base.HitTest(x, y);
+        }
+    }
+
+    private sealed class PaneHeaderActionAccessibleObject(
+        PaneHeaderAccessibleObject parent,
+        PaneHeaderBar owner,
+        HeaderActionKind kind) : AccessibleObject
+    {
+        public override AccessibleObject Parent => parent;
+
+        public override AccessibleRole Role => AccessibleRole.PushButton;
+
+        public override string Name => kind switch
+        {
+            HeaderActionKind.Audio => owner.isMuted ? $"Unmute pane {owner.PaneIndex + 1}" : $"Mute pane {owner.PaneIndex + 1}",
+            HeaderActionKind.SwitchTab => $"Switch tab in pane {owner.PaneIndex + 1}",
+            HeaderActionKind.Close => $"Close pane {owner.PaneIndex + 1}",
+            _ => string.Empty
+        };
+
+        public override string DefaultAction => kind switch
+        {
+            HeaderActionKind.Audio => owner.isMuted ? "Unmute" : "Mute",
+            HeaderActionKind.SwitchTab => "Switch tab",
+            HeaderActionKind.Close => "Close",
+            _ => "Press"
+        };
+
+        public override AccessibleStates State
+        {
+            get
+            {
+                if (owner.IsDisposed || !owner.IsHandleCreated || owner.GetActionBounds(kind).IsEmpty)
+                {
+                    return AccessibleStates.Unavailable | AccessibleStates.Offscreen;
+                }
+                return AccessibleStates.Focusable;
+            }
+        }
+
+        public override Rectangle Bounds
+        {
+            get
+            {
+                if (owner.IsDisposed || !owner.IsHandleCreated) return Rectangle.Empty;
+                var local = owner.GetActionBounds(kind);
+                return local.IsEmpty ? Rectangle.Empty : owner.RectangleToScreen(local);
+            }
+        }
+
+        public override void DoDefaultAction()
+        {
+            if (!owner.IsDisposed) owner.InvokeAction(kind);
+        }
     }
 }
 

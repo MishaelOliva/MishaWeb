@@ -272,6 +272,7 @@ internal static class NativeUiTheme
 
         var highContrast = SystemInformation.HighContrast;
         var selected = (state & DrawItemState.Selected) != 0;
+        var focused = (state & DrawItemState.Focus) != 0 && (state & DrawItemState.NoFocusRect) == 0;
         var backdropColor = highContrast ? SystemColors.Window : Field;
         using (var backdrop = new SolidBrush(backdropColor))
         {
@@ -299,8 +300,16 @@ internal static class NativeUiTheme
                     graphics.DrawPath(hcPen, hcPath);
                 }
             }
+            if (focused)
+            {
+                ControlPaint.DrawFocusRectangle(
+                    graphics,
+                    Rectangle.Round(pillBounds),
+                    selected ? SystemColors.HighlightText : SystemColors.WindowText,
+                    selected ? SystemColors.Highlight : (isHovered ? SystemColors.Control : SystemColors.Window));
+            }
         }
-        else if (selected || isHovered)
+        else if (selected || isHovered || focused)
         {
             using var pillPath = CreateRoundedPath(pillBounds, radius);
             if (selected)
@@ -320,7 +329,7 @@ internal static class NativeUiTheme
                     LinearGradientMode.Vertical);
                 graphics.FillRectangle(sheen, sheenRect);
 
-                using var rim = new Pen(Color.FromArgb(190, Focus), 1f);
+                using var rim = new Pen(Color.FromArgb(focused ? 245 : 190, Focus), focused ? 1.5f : 1f);
                 graphics.DrawPath(rim, pillPath);
 
                 var cueWidth = Math.Max(2.5f, Scaled(3));
@@ -333,12 +342,19 @@ internal static class NativeUiTheme
                 using var cueBrush = new SolidBrush(Accent);
                 graphics.FillPath(cueBrush, cuePath);
             }
-            else
+            else if (isHovered)
             {
                 using var hoverFill = new SolidBrush(Color.FromArgb(155, Hover));
                 graphics.FillPath(hoverFill, pillPath);
-                using var hoverRim = new Pen(Color.FromArgb(95, Border), 1f);
+                using var hoverRim = new Pen(
+                    focused ? Color.FromArgb(200, Focus) : Color.FromArgb(95, Border),
+                    focused ? 1.35f : 1f);
                 graphics.DrawPath(hoverRim, pillPath);
+            }
+            else
+            {
+                using var focusRim = new Pen(Color.FromArgb(195, Focus), 1.35f);
+                graphics.DrawPath(focusRim, pillPath);
             }
         }
         else
@@ -505,6 +521,12 @@ internal static class NativeUiTheme
     internal static GraphicsPath CreateRoundedPath(RectangleF bounds, float radius)
     {
         var path = new GraphicsPath();
+        if (bounds.Width <= 1f || bounds.Height <= 1f)
+        {
+            path.AddRectangle(bounds);
+            return path;
+        }
+
         var maxRadius = Math.Min(bounds.Width, bounds.Height) / 2f;
         var effectiveRadius = Math.Clamp(radius, 0.5f, Math.Max(0.5f, maxRadius));
         var diameter = effectiveRadius * 2f;
@@ -618,6 +640,7 @@ internal static class NativeUiTheme
 
     private static void EnsureGlassButtonPaint(Button button, bool isAccent)
     {
+        EnableDoubleBuffering(button);
         var state = StyledButtons.GetOrCreateValue(button);
         state.IsAccent = isAccent;
         if (state.EventsWired)
@@ -647,6 +670,17 @@ internal static class NativeUiTheme
         button.MouseUp += (_, _) =>
         {
             if (!state.IsPressed) return;
+            state.IsPressed = false;
+            button.Invalidate();
+        };
+        button.GotFocus += (_, _) => button.Invalidate();
+        button.LostFocus += (_, _) =>
+        {
+            state.IsPressed = false;
+            button.Invalidate();
+        };
+        button.EnabledChanged += (_, _) =>
+        {
             state.IsPressed = false;
             button.Invalidate();
         };

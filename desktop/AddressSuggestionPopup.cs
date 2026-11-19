@@ -193,12 +193,6 @@ internal sealed class AddressSuggestionPopup : Control
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
-        if (Region is not null)
-        {
-            var previous = Region;
-            Region = null;
-            previous.Dispose();
-        }
     }
 
     protected override void OnSystemColorsChanged(EventArgs e)
@@ -353,9 +347,11 @@ internal sealed class AddressSuggestionPopup : Control
             }
 
             var rowHeight = ScaledRowHeight;
+            var clip = e.ClipRectangle;
             for (var index = 0; index < suggestions.Count; index++)
             {
                 var row = new Rectangle(1, 1 + (index * rowHeight), Math.Max(0, Width - 2), rowHeight);
+                if (!clip.IsEmpty && !row.IntersectsWith(clip)) continue;
                 var isSelected = index == selectedIndex;
                 var isHovered = index == hoverIndex;
                 var highlighted = isSelected || isHovered;
@@ -430,21 +426,43 @@ internal sealed class AddressSuggestionPopup : Control
     {
         public override AccessibleRole Role => AccessibleRole.List;
 
-        public override int GetChildCount() => owner.suggestions.Count;
+        public override int GetChildCount() => owner.IsDisposed ? 0 : owner.suggestions.Count;
 
         public override AccessibleObject? GetChild(int index)
         {
+            return !owner.IsDisposed && index >= 0 && index < owner.suggestions.Count
+                ? new SuggestionRowAccessibleObject(this, owner, owner.suggestions[index])
+                : null;
+        }
+
+        public override AccessibleObject? GetSelected()
+        {
+            if (owner.IsDisposed) return null;
+            var index = owner.selectedIndex;
             return index >= 0 && index < owner.suggestions.Count
-                ? new SuggestionRowAccessibleObject(owner, owner.suggestions[index])
+                ? new SuggestionRowAccessibleObject(this, owner, owner.suggestions[index])
+                : null;
+        }
+
+        public override AccessibleObject? HitTest(int x, int y)
+        {
+            if (owner.IsDisposed || !owner.IsHandleCreated) return null;
+            var clientPoint = owner.PointToClient(new Point(x, y));
+            var index = owner.HitTestRow(clientPoint);
+            return index >= 0 && index < owner.suggestions.Count
+                ? new SuggestionRowAccessibleObject(this, owner, owner.suggestions[index])
                 : null;
         }
     }
 
     private sealed class SuggestionRowAccessibleObject(
+        SuggestionPopupAccessibleObject parent,
         AddressSuggestionPopup owner,
         AddressSuggestion snapshot) : AccessibleObject
     {
-        private int CurrentIndex => owner.FindSuggestionIndex(snapshot);
+        private int CurrentIndex => owner.IsDisposed ? -1 : owner.FindSuggestionIndex(snapshot);
+
+        public override AccessibleObject Parent => parent;
 
         public override string Name
         {
@@ -482,6 +500,7 @@ internal sealed class AddressSuggestionPopup : Control
         {
             get
             {
+                if (owner.IsDisposed || !owner.IsHandleCreated) return Rectangle.Empty;
                 var index = CurrentIndex;
                 if (index < 0) return Rectangle.Empty;
                 var row = new Rectangle(0, 1 + (index * owner.ScaledRowHeight), owner.Width, owner.ScaledRowHeight);
@@ -491,7 +510,7 @@ internal sealed class AddressSuggestionPopup : Control
 
         public override void DoDefaultAction()
         {
-            owner.ActivateSuggestion(CurrentIndex);
+            if (!owner.IsDisposed) owner.ActivateSuggestion(CurrentIndex);
         }
     }
 

@@ -41,7 +41,7 @@ internal sealed class SavedItemsDialog : Form
     private const int MaximumDisplayDetailCharacters = 160;
     private const int MaximumDisplayUrlCharacters = 512;
     private const int MaximumDisplayRowCharacters = 960;
-    private static readonly Font ListFont = new("Segoe UI", 9.5f);
+    private static readonly Font ListFont = NativeUiTheme.GetSharedFont("Segoe UI", 9.5f);
 
     private readonly Func<SavedItemsView, IReadOnlyList<SavedItemRow>> itemProvider;
     private readonly ComboBox viewPicker = new();

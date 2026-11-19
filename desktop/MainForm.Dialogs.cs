@@ -11,6 +11,13 @@ namespace MishaWeb;
 
 public sealed partial class MainForm
 {
+    private static readonly HashSet<string> DangerousDownloadExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".exe", ".msi", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".hta", ".lnk", ".scr", ".reg", ".dll"
+    };
+    private readonly Dictionary<string, (int Size, Bitmap Icon)> extensionMenuIconCache = new(StringComparer.OrdinalIgnoreCase);
+    private bool extensionIconCacheCleanupWired;
+
     private void ToggleFavorite()
     {
         if (isPrivateMode)
@@ -1202,12 +1209,91 @@ public sealed partial class MainForm
         searchBox.Focus();
     }
 
+    private Image? GetCachedExtensionMenuIcon(string iconFullPath, int targetSize)
+    {
+        if (extensionMenuIconCache.TryGetValue(iconFullPath, out var cached))
+        {
+            if (cached.Size == targetSize) return cached.Icon;
+            cached.Icon.Dispose();
+            extensionMenuIconCache.Remove(iconFullPath);
+        }
+
+        if (!File.Exists(iconFullPath)) return null;
+        using var decoded = TryLoadUnlockedBitmap(iconFullPath);
+        if (decoded is null) return null;
+
+        var scaled = new Bitmap(targetSize, targetSize, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+        try
+        {
+            using var graphics = Graphics.FromImage(scaled);
+            graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            graphics.CompositingQuality = CompositingQuality.HighQuality;
+            graphics.Clear(Color.Transparent);
+            graphics.DrawImage(decoded, new Rectangle(0, 0, targetSize, targetSize));
+        }
+        catch
+        {
+            scaled.Dispose();
+            throw;
+        }
+
+        extensionMenuIconCache[iconFullPath] = (targetSize, scaled);
+        return scaled;
+    }
+
+    private void PruneExtensionMenuIconCache(HashSet<string> activePaths, int targetSize)
+    {
+        if (extensionMenuIconCache.Count == 0) return;
+        foreach (var key in extensionMenuIconCache.Keys.ToArray())
+        {
+            if (activePaths.Contains(key) && extensionMenuIconCache[key].Size == targetSize) continue;
+            extensionMenuIconCache[key].Icon.Dispose();
+            extensionMenuIconCache.Remove(key);
+        }
+    }
+
+    private void ClearExtensionMenuIconCache()
+    {
+        if (extensionMenuIconCache.Count == 0) return;
+        foreach (var entry in extensionMenuIconCache.Values)
+        {
+            entry.Icon.Dispose();
+        }
+        extensionMenuIconCache.Clear();
+    }
+
+    private static bool DoesDownloadFileExist(DownloadEntry download)
+    {
+        if (string.IsNullOrWhiteSpace(download.FilePath)) return false;
+        var nowTick = Environment.TickCount64;
+        if (download.IsTerminal
+            && download.LastKnownFileExists is { } cached
+            && nowTick - download.LastFileExistsCheckedAtTick < 2_000)
+        {
+            return cached;
+        }
+        var exists = File.Exists(download.FilePath);
+        download.LastKnownFileExists = exists;
+        download.LastFileExistsCheckedAtTick = nowTick;
+        return exists;
+    }
+
     private void PopulateAppMenu()
     {
+        if (!extensionIconCacheCleanupWired)
+        {
+            extensionIconCacheCleanupWired = true;
+            appMenu.Disposed += (_, _) => ClearExtensionMenuIconCache();
+        }
         extensionsMenuItem.Enabled = !isPrivateMode;
         extensionsMenuItem.ToolTipText = isPrivateMode
             ? "Extensions are unavailable in private windows"
             : "Install and manage browser extensions";
+        foreach (ToolStripItem existingItem in extensionsMenuItem.DropDownItems)
+        {
+            existingItem.Image = null;
+        }
         ClearAndDisposeMenuItems(extensionsMenuItem.DropDownItems);
         var manageItem = new ToolStripMenuItem("Manage extensions\u2026")
         {
@@ -1221,6 +1307,8 @@ public sealed partial class MainForm
         if (!isPrivateMode)
         {
             var managed = browserExtensions.GetManagedExtensions();
+            var iconTargetSize = ScaleChromeLogical(16);
+            var activeIconPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (managed.Count > 0)
             {
                 extensionsMenuItem.DropDownItems.Add(new ToolStripSeparator());
@@ -1230,10 +1318,8 @@ public sealed partial class MainForm
                     if (ext.IconPath is not null)
                     {
                         var iconFullPath = Path.Combine(ext.FolderPath, ext.IconPath.Replace('/', Path.DirectorySeparatorChar));
-                        if (File.Exists(iconFullPath))
-                        {
-                            icon = TryLoadUnlockedBitmap(iconFullPath);
-                        }
+                        activeIconPaths.Add(iconFullPath);
+                        icon = GetCachedExtensionMenuIcon(iconFullPath, iconTargetSize);
                     }
                     var extItem = new ToolStripMenuItem(TrimMenuText(ext.Name, 42), icon);
                     extItem.DropDown.Renderer = menuRenderer;
@@ -1277,6 +1363,7 @@ public sealed partial class MainForm
                     extensionsMenuItem.DropDownItems.Add(extItem);
                 }
             }
+            PruneExtensionMenuIconCache(activeIconPaths, iconTargetSize);
         }
         PopulateSearchProviderMenu();
         ClearAndDisposeMenuItems(favoritesMenu.DropDownItems);
@@ -1345,7 +1432,7 @@ public sealed partial class MainForm
                 item.DropDown.Renderer = menuRenderer;
                 NativeUiTheme.ApplyMenuWindowFrame(item.DropDown);
                 if (download.State.Equals("Complete", StringComparison.OrdinalIgnoreCase)
-                    && File.Exists(download.FilePath))
+                    && DoesDownloadFileExist(download))
                 {
                     item.DropDownItems.Add("Open file", null, (_, _) => OpenDownloadedFile(download));
                 }
@@ -1553,6 +1640,10 @@ public sealed partial class MainForm
             48,
             (index, _) =>
             {
+                if (index < 0 || index >= state.PinnedStartPageLinks.Count)
+                {
+                    return new ModernListRowVisual(string.Empty, string.Empty, string.Empty);
+                }
                 var item = state.PinnedStartPageLinks[index];
                 var title = string.IsNullOrWhiteSpace(item.Title) ? HostFromUrl(item.Url) : item.Title;
                 return new ModernListRowVisual(
@@ -1914,8 +2005,11 @@ public sealed partial class MainForm
                 "Could not open that history page");
             menu.Items.Add(item);
         }
-        menu.Closed += (_, _) => menu.Dispose();
-        NativeUiTheme.ApplyMenuWindowFrame(menu);
+        ApplyMenuPalette(menu, ResolveChromeColorPolicy(IsHighContrastActive, isPrivateMode));
+        menu.Closed += (_, _) =>
+        {
+            if (!PostUi(() => menu.Dispose())) menu.Dispose();
+        };
         menu.Show(anchor, new Point(0, anchor.Height), ToolStripDropDownDirection.BelowRight);
     }
 
@@ -2269,7 +2363,7 @@ public sealed partial class MainForm
             detail,
             percent,
             activeCount,
-            download.IsTerminal && download.State.Equals("Complete", StringComparison.OrdinalIgnoreCase) && File.Exists(download.FilePath),
+            download.IsTerminal && download.State.Equals("Complete", StringComparison.OrdinalIgnoreCase) && DoesDownloadFileExist(download),
             !string.IsNullOrWhiteSpace(download.FilePath),
             !download.IsTerminal && download.CancelAction is not null,
             download);
@@ -2289,7 +2383,7 @@ public sealed partial class MainForm
                 CanPauseDownload(download),
                 CanResumeDownload(download),
                 !download.IsTerminal && download.CancelAction is not null,
-                download.IsTerminal && File.Exists(download.FilePath),
+                download.IsTerminal && DoesDownloadFileExist(download),
                 !string.IsNullOrWhiteSpace(download.FilePath),
                 download))
             .ToArray();
@@ -2507,7 +2601,20 @@ public sealed partial class MainForm
         {
             if (!File.Exists(download.FilePath))
             {
+                download.LastKnownFileExists = false;
+                download.LastFileExistsCheckedAtTick = Environment.TickCount64;
                 ShowTransientStatus("The downloaded file is no longer at its saved location");
+                return;
+            }
+            var extension = Path.GetExtension(download.FilePath);
+            if (DangerousDownloadExtensions.Contains(extension)
+                && !NativeAlertDialog.Confirm(
+                    this,
+                    "Open executable or script file?",
+                    $"\"{download.FileName}\" is an executable or script file ({extension}) that may run code on your device.\n\nOnly open files from sources you trust.",
+                    confirmText: "Open anyway",
+                    cancelText: "Cancel"))
+            {
                 return;
             }
             Process.Start(new ProcessStartInfo(download.FilePath) { UseShellExecute = true });

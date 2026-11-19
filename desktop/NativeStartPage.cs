@@ -46,18 +46,17 @@ internal sealed class NativeStartPage : UserControl
     private static readonly Color ChipHoverColor = Color.FromArgb(255, 70, 30, 62);
     private static readonly Color ChipPressedColor = Color.FromArgb(255, 84, 36, 74);
 
-    private static readonly Font BrandFont = new("Segoe UI Semibold", 27f, FontStyle.Regular);
-    private static readonly Font TaglineFont = new("Segoe UI", 11f, FontStyle.Regular);
-    private static readonly Font IncognitoTaglineFont = new("Segoe UI Semibold", 10f, FontStyle.Regular);
-    private static readonly Font SearchFont = new("Segoe UI", 11f, FontStyle.Regular);
-    private static readonly Font ActionFont = new("Segoe UI Semibold", 9.5f, FontStyle.Regular);
-    private static readonly Font FeatureHeadingFont = new("Segoe UI Semibold", 9.2f, FontStyle.Regular);
-    private static readonly Font FeatureDetailFont = new("Segoe UI", 8.2f, FontStyle.Regular);
-    private static readonly Font LinkTitleFont = new("Segoe UI Semibold", 9.1f, FontStyle.Regular);
-    private static readonly Font LinkDetailFont = new("Segoe UI", 8f, FontStyle.Regular);
-    private static readonly Font ManageButtonFont = new("Segoe UI Semibold", 8.2f, FontStyle.Regular);
-    private static readonly Font LinkMonogramFont = new("Segoe UI Semibold", 10.5f, FontStyle.Regular);
-    private static readonly Font LinkSiteLetterFont = new("Segoe UI", 22f, FontStyle.Bold);
+    private static readonly Font BrandFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 27f);
+    private static readonly Font TaglineFont = NativeUiTheme.GetSharedFont("Segoe UI", 11f);
+    private static readonly Font IncognitoTaglineFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 10f);
+    private static readonly Font ActionFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 9.5f);
+    private static readonly Font FeatureHeadingFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 9.2f);
+    private static readonly Font FeatureDetailFont = NativeUiTheme.GetSharedFont("Segoe UI", 8.2f);
+    private static readonly Font LinkTitleFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 9.1f);
+    private static readonly Font LinkDetailFont = NativeUiTheme.GetSharedFont("Segoe UI", 8f);
+    private static readonly Font ManageButtonFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 8.2f);
+    private static readonly Font LinkMonogramFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 10.5f);
+    private static readonly Font LinkSiteLetterFont = NativeUiTheme.GetSharedFont("Segoe UI", 22f, FontStyle.Bold);
 
     private readonly RoundedSurfacePanel card = new();
     private readonly TransparentTableLayoutPanel contentLayout = new();
@@ -79,6 +78,8 @@ internal sealed class NativeStartPage : UserControl
     private StartPageStatus currentStatus = StartPageStatus.Default;
     private StartPageLink[] currentQuickLinks = [];
     private bool isPrivateModeActive;
+    private int measuredManageWidthDpi;
+    private int measuredManageTextWidth;
 
     public NativeStartPage()
     {
@@ -775,30 +776,36 @@ internal sealed class NativeStartPage : UserControl
         var headerWidth = quickLinksHeader.ClientSize.Width;
         var headerHeight = quickLinksHeader.ClientSize.Height;
         var gap = ScaleLogical(8);
-        var scale = Math.Max(1f, DeviceDpi / 96f);
-        Size measuredText;
-        if (quickLinksHeader.IsHandleCreated)
+        var dpi = Math.Max(96, DeviceDpi);
+        var scale = dpi / 96f;
+        if (measuredManageWidthDpi != dpi)
         {
-            using var measureGraphics = quickLinksHeader.CreateGraphics();
-            measuredText = TextRenderer.MeasureText(
-                measureGraphics,
-                "Manage",
-                ManageButtonFont,
-                Size.Empty,
-                TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
-        }
-        else
-        {
-            measuredText = TextRenderer.MeasureText(
-                "Manage",
-                ManageButtonFont,
-                Size.Empty,
-                TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+            Size measuredText;
+            if (quickLinksHeader.IsHandleCreated)
+            {
+                using var measureGraphics = quickLinksHeader.CreateGraphics();
+                measuredText = TextRenderer.MeasureText(
+                    measureGraphics,
+                    "Manage",
+                    ManageButtonFont,
+                    Size.Empty,
+                    TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                measuredManageWidthDpi = dpi;
+            }
+            else
+            {
+                measuredText = TextRenderer.MeasureText(
+                    "Manage",
+                    ManageButtonFont,
+                    Size.Empty,
+                    TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+            }
+            measuredManageTextWidth = measuredText.Width;
         }
         var chromePadding = (int)Math.Ceiling((9f + 8.5f + 5f + 9f) * scale);
         var pillWidth = Math.Min(
             Math.Max(1, headerWidth / 2),
-            Math.Max(ScaleLogical(74), measuredText.Width + chromePadding));
+            Math.Max(ScaleLogical(74), measuredManageTextWidth + chromePadding));
         var pillHeight = Math.Max(
             Math.Min(headerHeight, ScaleLogical(20)),
             Math.Min(headerHeight - Math.Max(2, ScaleLogical(4)), ScaleLogical(compactLayout ? 22 : 25)));
@@ -886,25 +893,6 @@ internal sealed class NativeStartPage : UserControl
             ((foreground.B * alpha) + (background.B * inverse) + 127) / 255);
     }
 
-    private static GraphicsPath CreateRoundedPath(RectangleF bounds, float radius)
-    {
-        var path = new GraphicsPath();
-        if (bounds.Width <= 1 || bounds.Height <= 1)
-        {
-            path.AddRectangle(bounds);
-            return path;
-        }
-
-        var safeRadius = Math.Max(1f, Math.Min(radius, Math.Min(bounds.Width, bounds.Height) / 2f));
-        var diameter = safeRadius * 2f;
-        path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
-        path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
-        path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
-        path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
-        path.CloseFigure();
-        return path;
-    }
-
     private static void PaintLiquidGlassCard(
         Graphics graphics,
         RectangleF bounds,
@@ -915,7 +903,7 @@ internal sealed class NativeStartPage : UserControl
     {
         graphics.SmoothingMode = SmoothingMode.AntiAlias;
         graphics.CompositingQuality = CompositingQuality.HighSpeed;
-        using var path = CreateRoundedPath(bounds, cornerRadius);
+        using var path = NativeUiTheme.CreateRoundedPath(bounds, cornerRadius);
 
         if (SystemInformation.HighContrast)
         {
@@ -980,7 +968,7 @@ internal sealed class NativeStartPage : UserControl
         innerBounds.Inflate(-1.1f, -1.1f);
         if (innerBounds.Width > 6f && innerBounds.Height > 6f)
         {
-            using var innerPath = CreateRoundedPath(innerBounds, Math.Max(2f, cornerRadius - 1.1f));
+            using var innerPath = NativeUiTheme.CreateRoundedPath(innerBounds, Math.Max(2f, cornerRadius - 1.1f));
             using var innerRimBrush = new LinearGradientBrush(
                 innerBounds,
                 Color.FromArgb(hovered ? 105 : 76, 255, 255, 255),
@@ -1059,7 +1047,7 @@ internal sealed class NativeStartPage : UserControl
             base.OnPaintBackground(e);
 
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            using var path = CreateRoundedPath(
+            using var path = NativeUiTheme.CreateRoundedPath(
                 new RectangleF(0.5f, 0.5f, Math.Max(1, Width - 1f), Math.Max(1, Height - 1f)),
                 CornerRadius);
             if (SystemInformation.HighContrast)
@@ -1126,7 +1114,7 @@ internal sealed class NativeStartPage : UserControl
 
             lastRegionSize = currentSize;
             lastRegionRadius = CornerRadius;
-            using var path = CreateRoundedPath(new RectangleF(0, 0, Width, Height), CornerRadius);
+            using var path = NativeUiTheme.CreateRoundedPath(new RectangleF(0, 0, Width, Height), CornerRadius);
             var previousRegion = Region;
             Region = new Region(path);
             previousRegion?.Dispose();
@@ -1168,118 +1156,6 @@ internal sealed class NativeStartPage : UserControl
         protected override void OnPaintBackground(PaintEventArgs e)
         {
             if (!PaintBackdropSlice(this, e)) base.OnPaintBackground(e);
-        }
-    }
-
-    private sealed class RoundedButton : Button
-    {
-        private bool hovered;
-        private bool pressed;
-
-        public RoundedButton()
-        {
-            SetStyle(
-                ControlStyles.AllPaintingInWmPaint
-                | ControlStyles.OptimizedDoubleBuffer
-                | ControlStyles.ResizeRedraw
-                | ControlStyles.UserPaint,
-                true);
-            FlatStyle = FlatStyle.Flat;
-            FlatAppearance.BorderSize = 0;
-            UseVisualStyleBackColor = false;
-            UseMnemonic = false;
-            Cursor = Cursors.Hand;
-            AccessibleRole = AccessibleRole.PushButton;
-        }
-
-        public Color FillColor { get; set; } = AccentColor;
-        public Color FillColorSecondary { get; set; } = AccentColorSecondary;
-        public Color HoverColor { get; set; } = AccentHoverColor;
-        public Color PressedColor { get; set; } = AccentPressedColor;
-        public Color BorderColor { get; set; } = AccentColor;
-        public Color FocusColor { get; set; } = NativeStartPage.FocusColor;
-        public int CornerRadius { get; set; } = 10;
-
-        protected override void OnMouseEnter(EventArgs e)
-        {
-            hovered = true;
-            Invalidate();
-            base.OnMouseEnter(e);
-        }
-
-        protected override void OnMouseLeave(EventArgs e)
-        {
-            hovered = false;
-            pressed = false;
-            Invalidate();
-            base.OnMouseLeave(e);
-        }
-
-        protected override void OnMouseDown(MouseEventArgs mevent)
-        {
-            if (mevent.Button == MouseButtons.Left) pressed = true;
-            Invalidate();
-            base.OnMouseDown(mevent);
-        }
-
-        protected override void OnMouseUp(MouseEventArgs mevent)
-        {
-            pressed = false;
-            Invalidate();
-            base.OnMouseUp(mevent);
-        }
-
-        protected override void OnGotFocus(EventArgs e)
-        {
-            base.OnGotFocus(e);
-            Invalidate();
-        }
-
-        protected override void OnLostFocus(EventArgs e)
-        {
-            base.OnLostFocus(e);
-            pressed = false;
-            Invalidate();
-        }
-
-        protected override void OnPaint(PaintEventArgs pevent)
-        {
-            pevent.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            var background = !Enabled
-                ? ControlPaint.Dark(FillColor, 0.15f)
-                : pressed ? PressedColor : hovered ? HoverColor : FillColor;
-            using var path = CreateRoundedPath(
-                new RectangleF(0.5f, 0.5f, Math.Max(1, Width - 1f), Math.Max(1, Height - 1f)),
-                CornerRadius);
-            var secondary = !Enabled || pressed || hovered ? background : FillColorSecondary;
-            using var fill = new LinearGradientBrush(
-                ClientRectangle,
-                background,
-                secondary,
-                LinearGradientMode.Horizontal);
-            using var border = new Pen(BorderColor);
-            pevent.Graphics.FillPath(fill, path);
-            pevent.Graphics.DrawPath(border, path);
-
-            var textColor = Enabled ? ForeColor : ControlPaint.Dark(ForeColor);
-            TextRenderer.DrawText(
-                pevent.Graphics,
-                Text,
-                Font,
-                Rectangle.Inflate(ClientRectangle, -8, -2),
-                textColor,
-                TextFormatFlags.HorizontalCenter
-                | TextFormatFlags.VerticalCenter
-                | TextFormatFlags.EndEllipsis
-                | TextFormatFlags.NoPadding
-                | TextFormatFlags.NoPrefix
-                | TextFormatFlags.SingleLine);
-
-            if (Focused && ShowFocusCues)
-            {
-                var focusBounds = Rectangle.Inflate(ClientRectangle, -5, -5);
-                ControlPaint.DrawFocusRectangle(pevent.Graphics, focusBounds, FocusColor, background);
-            }
         }
     }
 
@@ -1511,7 +1387,7 @@ internal sealed class NativeStartPage : UserControl
         {
             if (SystemInformation.HighContrast)
             {
-                using var highContrastPath = CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
+                using var highContrastPath = NativeUiTheme.CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
                 using var highContrastFill = new SolidBrush(SystemColors.Highlight);
                 using var highContrastBorder = new Pen(SystemColors.WindowText, Math.Max(1f, scale));
                 graphics.FillPath(highContrastFill, highContrastPath);
@@ -1560,7 +1436,7 @@ internal sealed class NativeStartPage : UserControl
                     return;
             }
 
-            using var path = CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
+            using var path = NativeUiTheme.CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
             using var fill = new LinearGradientBrush(
                 bounds,
                 SystemInformation.HighContrast ? SystemColors.Highlight : Color.FromArgb(235, NativeUiTheme.Accent),
@@ -1582,7 +1458,7 @@ internal sealed class NativeStartPage : UserControl
 
         private static void DrawYouTubeIcon(Graphics graphics, Rectangle bounds, float scale)
         {
-            using var path = CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
+            using var path = NativeUiTheme.CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
             using var fill = new LinearGradientBrush(
                 bounds,
                 Color.FromArgb(249, 78, 97),
@@ -1670,7 +1546,7 @@ internal sealed class NativeStartPage : UserControl
 
         private static void DrawInstagramIcon(Graphics graphics, Rectangle bounds, float scale)
         {
-            using var path = CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
+            using var path = NativeUiTheme.CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
             using var fill = new LinearGradientBrush(
                 bounds,
                 Color.FromArgb(249, 196, 74),
@@ -1682,7 +1558,7 @@ internal sealed class NativeStartPage : UserControl
 
             var cameraBounds = RectangleF.Inflate(bounds, -bounds.Width * 0.24f, -bounds.Height * 0.24f);
             using var camera = new Pen(Color.White, Math.Max(1.7f, 2.3f * scale));
-            using var cameraPath = CreateRoundedPath(cameraBounds, 5f * scale);
+            using var cameraPath = NativeUiTheme.CreateRoundedPath(cameraBounds, 5f * scale);
             graphics.DrawPath(camera, cameraPath);
             var lens = new RectangleF(
                 bounds.Left + (bounds.Width * 0.39f),
@@ -1696,7 +1572,7 @@ internal sealed class NativeStartPage : UserControl
 
         private static void DrawDiscordIcon(Graphics graphics, Rectangle bounds, float scale)
         {
-            using var path = CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
+            using var path = NativeUiTheme.CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
             using var fill = new SolidBrush(Color.FromArgb(88, 101, 242));
             using var border = new Pen(Color.FromArgb(160, 185, 193, 255), Math.Max(1f, scale));
             graphics.FillPath(fill, path);
@@ -1730,7 +1606,7 @@ internal sealed class NativeStartPage : UserControl
 
         private static void DrawTwitchIcon(Graphics graphics, Rectangle bounds, float scale)
         {
-            using var path = CreateRoundedPath(bounds, Math.Max(8f, 10f * scale));
+            using var path = NativeUiTheme.CreateRoundedPath(bounds, Math.Max(8f, 10f * scale));
             using var fill = new SolidBrush(Color.FromArgb(145, 70, 218));
             using var border = new Pen(Color.FromArgb(165, 224, 195, 255), Math.Max(1f, scale));
             graphics.FillPath(fill, path);
@@ -1764,7 +1640,7 @@ internal sealed class NativeStartPage : UserControl
 
         private static void DrawAnthropicIcon(Graphics graphics, Rectangle bounds, float scale)
         {
-            using var path = CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
+            using var path = NativeUiTheme.CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
             using var fill = new LinearGradientBrush(
                 bounds,
                 Color.FromArgb(241, 174, 95),
@@ -1995,45 +1871,6 @@ internal sealed class NativeStartPage : UserControl
         }
     }
 
-    private sealed class SearchGlyph : Control
-    {
-        public SearchGlyph()
-        {
-            SetStyle(
-                ControlStyles.AllPaintingInWmPaint
-                | ControlStyles.OptimizedDoubleBuffer
-                | ControlStyles.ResizeRedraw
-                | ControlStyles.SupportsTransparentBackColor
-                | ControlStyles.UserPaint,
-                true);
-            NativeStartPage.TrySetTransparentBackColor(this);
-            TabStop = false;
-            AccessibleName = "Search";
-            AccessibleRole = AccessibleRole.Graphic;
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            var scale = Math.Max(1f, DeviceDpi / 96f);
-            var diameter = 12f * scale;
-            var left = (Width - diameter - (4f * scale)) / 2f;
-            var top = (Height - diameter - (2f * scale)) / 2f;
-            using var pen = new Pen(MutedTextColor, Math.Max(1.4f, 1.6f * scale))
-            {
-                StartCap = LineCap.Round,
-                EndCap = LineCap.Round
-            };
-            e.Graphics.DrawEllipse(pen, left, top, diameter, diameter);
-            e.Graphics.DrawLine(
-                pen,
-                left + diameter - (1f * scale),
-                top + diameter - (1f * scale),
-                left + diameter + (4f * scale),
-                top + diameter + (4f * scale));
-        }
-    }
-
     private sealed class BrandTitleLabel : Label
     {
         public bool IsPrivateMode { get; set; }
@@ -2240,7 +2077,7 @@ internal sealed class NativeStartPage : UserControl
                 for (var col = 0; col < 2; col++)
                 {
                     var rect = new RectangleF(iconLeft + (col * step), iconTop + (row * step), tile, tile);
-                    using var tilePath = CreateRoundedPath(rect, Math.Max(0.8f, 1.1f * scale));
+                    using var tilePath = NativeUiTheme.CreateRoundedPath(rect, Math.Max(0.8f, 1.1f * scale));
                     e.Graphics.FillPath(iconBrush, tilePath);
                 }
             }
