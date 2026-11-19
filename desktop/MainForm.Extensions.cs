@@ -244,7 +244,7 @@ public sealed partial class MainForm
             {
                 managedExtensions.TryGetValue(extension.Id, out var managed);
                 var fullIconPath = managed?.FolderPath is not null && managed.IconPath is not null
-                    ? Path.Combine(managed.FolderPath, managed.IconPath.Replace('/', Path.DirectorySeparatorChar))
+                    ? BrowserExtensions.ResolveSafeExtensionFilePath(managed.FolderPath, managed.IconPath)
                     : null;
                 return new ExtensionManagerRow(
                     extension.Id,
@@ -591,6 +591,8 @@ public sealed partial class MainForm
         var permission = GetDeclaredExtensionPermission(value);
         if (value.Contains("<all_urls>", StringComparison.Ordinal)
             || value.Contains("*://*/*", StringComparison.Ordinal)
+            || value.Contains("https://*/*", StringComparison.Ordinal)
+            || value.Contains("http://*/*", StringComparison.Ordinal)
             || permission is "debugger"
                 or "desktopcapture"
                 or "nativemessaging"
@@ -620,6 +622,7 @@ public sealed partial class MainForm
                 or "notifications"
                 or "privacy"
                 or "readinglist"
+                or "scripting"
                 or "system.storage"
                 or "tabs"
                 or "tabgroups"
@@ -629,6 +632,7 @@ public sealed partial class MainForm
             || permission?.StartsWith("downloads", StringComparison.Ordinal) == true
             || permission?.StartsWith("webrequest", StringComparison.Ordinal) == true
             || value.StartsWith("site access:", StringComparison.Ordinal)
+            || value.StartsWith("optional site access:", StringComparison.Ordinal)
             || value.StartsWith("runs on:", StringComparison.Ordinal)
             || value.StartsWith("accepts connections from:", StringComparison.Ordinal))
         {
@@ -644,6 +648,8 @@ public sealed partial class MainForm
         var permission = GetDeclaredExtensionPermission(lower);
         var consequence = lower.Contains("<all_urls>", StringComparison.Ordinal)
             || lower.Contains("*://*/*", StringComparison.Ordinal)
+            || lower.Contains("https://*/*", StringComparison.Ordinal)
+            || lower.Contains("http://*/*", StringComparison.Ordinal)
                 ? "can read and change data on all websites"
             : permission == "nativemessaging"
                 ? "can communicate with applications on this computer"
@@ -679,6 +685,8 @@ public sealed partial class MainForm
                 ? "can view and manage tab groups"
             : permission == "ttsengine"
                 ? "can read text spoken by synthesized speech"
+            : permission == "scripting"
+                ? "can run scripts on websites it can access"
             : permission == "system.storage"
                 ? "can identify and eject storage devices"
             : permission?.StartsWith("downloads", StringComparison.Ordinal) == true
@@ -687,6 +695,7 @@ public sealed partial class MainForm
                 || permission?.StartsWith("declarativenetrequest", StringComparison.Ordinal) == true
                 ? "can observe, block, or change network requests"
             : lower.StartsWith("site access:", StringComparison.Ordinal)
+                || lower.StartsWith("optional site access:", StringComparison.Ordinal)
                 || lower.StartsWith("runs on:", StringComparison.Ordinal)
                 ? "can read and change data on the named website"
             : lower.StartsWith("accepts connections from:", StringComparison.Ordinal)

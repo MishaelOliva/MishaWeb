@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Collections.ObjectModel;
 using System.IO.Compression;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -106,7 +107,11 @@ internal sealed class BrowserExtensions
     private long cachedRegistryLastWriteTicks = -1;
     private ReadOnlyDictionary<string, ManagedBrowserExtension>? cachedRegistryRecords;
     private readonly SemaphoreSlim updateCheckGate = new(1, 1);
+    private readonly SemaphoreSlim scriptRefreshGate = new(1, 1);
     private readonly Dictionary<string, CachedScript> scriptCache = new(StringComparer.OrdinalIgnoreCase);
+    private FileSystemWatcher? scriptWatcher;
+    private volatile bool scriptsDirty = true;
+    private Task? backgroundScriptRefreshTask;
     private CachedScript[] cachedLoadedScripts = Array.Empty<CachedScript>();
     private string[] cachedScriptContents = Array.Empty<string>();
     private DateTime lastScriptDirectoryWriteUtc = DateTime.MinValue;
@@ -131,6 +136,21 @@ internal sealed class BrowserExtensions
         lock (scriptCacheSync) return cachedScriptContents;
     }
 
+    internal async Task EnsureScriptsLoadedAsync()
+    {
+        if (!NeedsScriptRescan()) return;
+        await scriptRefreshGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (!NeedsScriptRescan()) return;
+            await Task.Run(() => EnsureScriptsLoaded()).ConfigureAwait(false);
+        }
+        finally
+        {
+            scriptRefreshGate.Release();
+        }
+    }
+
     internal IReadOnlyList<(string Key, string Script)> GetScriptsForUrl(string? url)
     {
         if (string.IsNullOrWhiteSpace(url)
@@ -141,6 +161,32 @@ internal sealed class BrowserExtensions
         }
 
         var entries = EnsureScriptsLoaded();
+        return MatchScriptsForUri(entries, uri);
+    }
+
+    internal IReadOnlyList<(string Key, string Script)> GetCachedScriptsForUrl(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url)
+            || !Uri.TryCreate(url, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            return Array.Empty<(string, string)>();
+        }
+
+        if (NeedsScriptRescan())
+        {
+            TriggerBackgroundScriptRefresh();
+        }
+
+        CachedScript[] entries;
+        lock (scriptCacheSync) entries = cachedLoadedScripts;
+        return MatchScriptsForUri(entries, uri);
+    }
+
+    private static IReadOnlyList<(string Key, string Script)> MatchScriptsForUri(
+        CachedScript[] entries,
+        Uri uri)
+    {
         if (entries.Length == 0) return Array.Empty<(string, string)>();
 
         List<(string Key, string Script)>? matched = null;
@@ -162,7 +208,13 @@ internal sealed class BrowserExtensions
             return false;
         }
 
-        var entries = EnsureScriptsLoaded();
+        if (NeedsScriptRescan())
+        {
+            TriggerBackgroundScriptRefresh();
+        }
+
+        CachedScript[] entries;
+        lock (scriptCacheSync) entries = cachedLoadedScripts;
         if (entries.Length == 0) return false;
         foreach (var entry in entries)
         {
@@ -174,29 +226,83 @@ internal sealed class BrowserExtensions
         return false;
     }
 
+    private bool NeedsScriptRescan()
+    {
+        var lastTick = Volatile.Read(ref lastScriptScanTick);
+        if (lastTick == long.MinValue || scriptsDirty) return true;
+        if (scriptWatcher is not null) return false;
+        return (Environment.TickCount64 - lastTick) >= 10_000;
+    }
+
+    private void TriggerBackgroundScriptRefresh()
+    {
+        lock (scriptCacheSync)
+        {
+            if (backgroundScriptRefreshTask is { IsCompleted: false }) return;
+            backgroundScriptRefreshTask = EnsureScriptsLoadedAsync();
+        }
+    }
+
+    private void EnsureScriptWatcherLocked()
+    {
+        if (scriptWatcher is not null) return;
+        try
+        {
+            var watcher = new FileSystemWatcher(folderPath, "*.js")
+            {
+                IncludeSubdirectories = false,
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size
+            };
+            FileSystemEventHandler onChanged = (_, _) => scriptsDirty = true;
+            RenamedEventHandler onRenamed = (_, _) => scriptsDirty = true;
+            ErrorEventHandler onError = (_, _) =>
+            {
+                scriptsDirty = true;
+                lock (scriptCacheSync)
+                {
+                    if (ReferenceEquals(scriptWatcher, watcher))
+                    {
+                        scriptWatcher = null;
+                    }
+                }
+                watcher.Dispose();
+            };
+            watcher.Created += onChanged;
+            watcher.Changed += onChanged;
+            watcher.Deleted += onChanged;
+            watcher.Renamed += onRenamed;
+            watcher.Error += onError;
+            watcher.EnableRaisingEvents = true;
+            scriptWatcher = watcher;
+        }
+        catch (Exception error) when (error is IOException
+            or UnauthorizedAccessException
+            or PlatformNotSupportedException)
+        {
+        }
+    }
+
     private CachedScript[] EnsureScriptsLoaded()
     {
         lock (scriptCacheSync)
         {
+            if (!NeedsScriptRescan())
+            {
+                return cachedLoadedScripts;
+            }
+
+            scriptsDirty = false;
             if (!Directory.Exists(folderPath))
             {
-                Directory.CreateDirectory(folderPath);
                 cachedLoadedScripts = Array.Empty<CachedScript>();
                 cachedScriptContents = Array.Empty<string>();
-                lastScriptDirectoryWriteUtc = Directory.GetLastWriteTimeUtc(folderPath);
-                lastScriptScanTick = Environment.TickCount64;
+                lastScriptDirectoryWriteUtc = DateTime.MinValue;
+                Volatile.Write(ref lastScriptScanTick, Environment.TickCount64);
                 return cachedLoadedScripts;
             }
 
+            EnsureScriptWatcherLocked();
             var dirWriteUtc = Directory.GetLastWriteTimeUtc(folderPath);
-            var nowTick = Environment.TickCount64;
-            if (lastScriptScanTick != long.MinValue
-                && dirWriteUtc == lastScriptDirectoryWriteUtc
-                && (nowTick - lastScriptScanTick) < 10_000)
-            {
-                return cachedLoadedScripts;
-            }
-
             var paths = Directory.EnumerateFiles(folderPath, "*.js")
                 .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
@@ -246,7 +352,7 @@ internal sealed class BrowserExtensions
             cachedLoadedScripts = entries.ToArray();
             cachedScriptContents = contents.ToArray();
             lastScriptDirectoryWriteUtc = dirWriteUtc;
-            lastScriptScanTick = Environment.TickCount64;
+            Volatile.Write(ref lastScriptScanTick, Environment.TickCount64);
             return cachedLoadedScripts;
         }
     }
@@ -265,18 +371,24 @@ internal sealed class BrowserExtensions
         }
         var matchJson = JsonSerializer.Serialize(matches, BrowserStateJsonContext.Default.IReadOnlyListString);
         var excludeJson = JsonSerializer.Serialize(excludes, BrowserStateJsonContext.Default.IReadOnlyListString);
+        var bodyJson = JsonSerializer.Serialize(content, BrowserStateJsonContext.Default.String);
 
         // Legacy scripts are local code, but they must still declare where they
         // run. The wrapper default-denies file/extension pages and the Web Store,
-        // then evaluates familiar userscript match patterns before executing.
+        // then evaluates familiar userscript match patterns before executing the
+        // JSON-escaped body inside an isolated Function call so syntax in the
+        // script cannot break out of the wrapper IIFE.
         var wrapped = "(() => { 'use strict';"
             + "const u=new URL(location.href);"
             + "if(u.protocol!=='http:'&&u.protocol!=='https:')return;"
             + "const h=u.hostname.toLowerCase();"
             + "if(h==='chromewebstore.google.com'||h==='chrome.google.com'||h.endsWith('.chrome.google.com'))return;"
-            + "const wild=(p,v)=>{const a=p.split('*');let n=0;for(let k=0;k<a.length;k++){const z=a[k];if(!z)continue;"
-            + "const f=v.indexOf(z,n);if(f<0||(k===0&&!p.startsWith('*')&&f!==0))return false;n=f+z.length;}"
-            + "return p.endsWith('*')||n===v.length;};"
+            + "const wild=(p,v)=>{let pi=0,vi=0,sp=-1,sv=0;while(vi<v.length){"
+            + "if(pi<p.length&&p[pi]==='*'){sp=pi++;sv=vi;}"
+            + "else if(pi<p.length&&p[pi]===v[vi]){pi++;vi++;}"
+            + "else if(sp>=0){pi=sp+1;vi=++sv;}"
+            + "else{return false;}}"
+            + "while(pi<p.length&&p[pi]==='*')pi++;return pi===p.length;};"
             + "const test=(p)=>{if(p==='<all_urls>')return true;"
             + "const i=p.indexOf('://');if(i<1)return false;const s=p.slice(0,i),r=p.slice(i+3),j=r.indexOf('/');"
             + "if(j<0)return false;const ph=r.slice(0,j).toLowerCase(),pp=r.slice(j);"
@@ -284,9 +396,9 @@ internal sealed class BrowserExtensions
             + "if(ph!=='*'){if(ph.startsWith('*.')){const b=ph.slice(2);if(h!==b&&!h.endsWith('.'+b))return false;}else if(h!==ph)return false;}"
             + "return wild(pp,u.pathname+u.search+u.hash);};"
             + "const m=" + matchJson + ",x=" + excludeJson + ";"
-            + "if(!m.some(test)||x.some(test))return;(function(){\n"
-            + content
-            + "\n}).call(globalThis);})();";
+            + "if(!m.some(test)||x.some(test))return;"
+            + "new Function(\"'use strict';\\n\"+" + bodyJson + ").call(globalThis);"
+            + "})();";
 
         return new CachedScript(
             length,
@@ -378,29 +490,40 @@ internal sealed class BrowserExtensions
 
     private static bool WildcardPathMatches(ReadOnlySpan<char> pattern, ReadOnlySpan<char> value)
     {
-        var searchStart = 0;
-        var segmentStart = 0;
-        var firstSegment = true;
-        while (segmentStart <= pattern.Length)
+        var pi = 0;
+        var vi = 0;
+        var starPi = -1;
+        var starVi = 0;
+
+        while (vi < value.Length)
         {
-            var starOffset = pattern[segmentStart..].IndexOf('*');
-            var segment = starOffset < 0
-                ? pattern[segmentStart..]
-                : pattern.Slice(segmentStart, starOffset);
-            if (!segment.IsEmpty)
+            if (pi < pattern.Length && pattern[pi] == '*')
             {
-                var matchIndex = value[searchStart..].IndexOf(segment, StringComparison.Ordinal);
-                if (matchIndex < 0 || (firstSegment && !pattern.StartsWith('*') && matchIndex != 0))
-                {
-                    return false;
-                }
-                searchStart += matchIndex + segment.Length;
+                starPi = pi++;
+                starVi = vi;
             }
-            firstSegment = false;
-            if (starOffset < 0) break;
-            segmentStart += starOffset + 1;
+            else if (pi < pattern.Length && pattern[pi] == value[vi])
+            {
+                pi++;
+                vi++;
+            }
+            else if (starPi >= 0)
+            {
+                pi = starPi + 1;
+                vi = ++starVi;
+            }
+            else
+            {
+                return false;
+            }
         }
-        return pattern.EndsWith('*') || searchStart == value.Length;
+
+        while (pi < pattern.Length && pattern[pi] == '*')
+        {
+            pi++;
+        }
+
+        return pi == pattern.Length;
     }
 
     private static bool TryReadUserScriptPatterns(
@@ -411,6 +534,7 @@ internal sealed class BrowserExtensions
         var patterns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var span = content.AsSpan();
         var lineCount = 0;
+        var inMetadataBlock = false;
         while (!span.IsEmpty && lineCount < 256)
         {
             var newlineIndex = span.IndexOf('\n');
@@ -419,10 +543,23 @@ internal sealed class BrowserExtensions
             lineCount++;
 
             var line = rawLine.Trim().TrimEnd('\r');
-            if (!line.StartsWith("//", StringComparison.Ordinal)) continue;
+            if (line.IsEmpty) continue;
+            if (!line.StartsWith("//", StringComparison.Ordinal)) break;
             line = line[2..].TrimStart();
+            if (line.Equals("==UserScript==".AsSpan(), StringComparison.Ordinal))
+            {
+                inMetadataBlock = true;
+                patterns.Clear();
+                continue;
+            }
+            if (inMetadataBlock && line.Equals("==/UserScript==".AsSpan(), StringComparison.Ordinal))
+            {
+                break;
+            }
             if (!line.StartsWith(directive.AsSpan(), StringComparison.OrdinalIgnoreCase)) continue;
-            var pattern = line[directive.Length..].Trim().ToString();
+            var remainder = line[directive.Length..];
+            if (remainder.IsEmpty || !char.IsWhiteSpace(remainder[0])) continue;
+            var pattern = remainder.Trim().ToString();
             if (!IsSafeUserScriptPattern(pattern))
             {
                 result = Array.Empty<string>();
@@ -471,10 +608,8 @@ internal sealed class BrowserExtensions
             using var transferTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             transferTimeout.CancelAfter(StoreDownloadTimeout);
             var transferToken = transferTimeout.Token;
-            using var response = await ChromeStoreClient.GetAsync(
-                downloadUri,
-                HttpCompletionOption.ResponseHeadersRead,
-                transferToken).ConfigureAwait(false);
+            using var response = await GetChromeStoreResponseAsync(downloadUri, transferToken)
+                .ConfigureAwait(false);
             if (response.StatusCode is HttpStatusCode.NoContent or HttpStatusCode.NotFound)
             {
                 throw new InvalidDataException(
@@ -1561,9 +1696,9 @@ internal sealed class BrowserExtensions
             {
                 throw new InvalidDataException("The extension archive contains duplicate file paths.");
             }
-            if (entry.Length > MaximumSingleFileBytes)
+            if (entry.Length < 0 || entry.Length > MaximumSingleFileBytes)
             {
-                throw new InvalidDataException("The extension archive contains a file that is too large.");
+                throw new InvalidDataException("The extension archive contains an invalid or oversized file.");
             }
             totalBytes = checked(totalBytes + entry.Length);
             if (totalBytes > MaximumExtractedBytes)
@@ -1677,8 +1812,9 @@ internal sealed class BrowserExtensions
 
         var name = ReadRequiredManifestString(manifest, "name");
         var version = ReadRequiredManifestString(manifest, "version");
-        var manifestVersion = manifest["manifest_version"]?.GetValue<int>() ?? 0;
-        if (manifestVersion is not 2 and not 3)
+        if (manifest["manifest_version"] is not JsonValue manifestVersionNode
+            || !manifestVersionNode.TryGetValue<int>(out var manifestVersion)
+            || manifestVersion is not 2 and not 3)
         {
             throw new InvalidDataException("Only Manifest V2 and Manifest V3 extensions are supported.");
         }
@@ -1896,16 +2032,57 @@ internal sealed class BrowserExtensions
         foreach (var candidate in candidates)
         {
             if (string.IsNullOrWhiteSpace(candidate)) continue;
-            var normalized = NormalizeExtensionRelativePath(candidate);
+            var normalized = NormalizeExtensionRelativeFilePath(candidate);
             if (normalized is null) continue;
             try
             {
-                var full = Path.Combine(extensionRoot, normalized.Replace('/', Path.DirectorySeparatorChar));
-                if (File.Exists(full)) return normalized;
+                var full = ResolveSafeExtensionFilePath(extensionRoot, normalized);
+                if (full is not null && File.Exists(full)) return normalized;
             }
             catch { }
         }
         return null;
+    }
+
+    private static readonly char[] InvalidExtensionFileNameChars = Path.GetInvalidFileNameChars();
+
+    internal static string? ResolveSafeExtensionFilePath(string extensionRoot, string? relativePath)
+    {
+        var normalized = NormalizeExtensionRelativeFilePath(relativePath);
+        if (normalized is null || string.IsNullOrWhiteSpace(extensionRoot)) return null;
+        try
+        {
+            var rootFull = Path.GetFullPath(extensionRoot);
+            var candidateFull = Path.GetFullPath(
+                Path.Combine(rootFull, normalized.Replace('/', Path.DirectorySeparatorChar)));
+            return IsDescendantPath(rootFull, candidateFull) ? candidateFull : null;
+        }
+        catch (Exception error) when (error is ArgumentException
+            or NotSupportedException
+            or PathTooLongException)
+        {
+            return null;
+        }
+    }
+
+    private static string? NormalizeExtensionRelativeFilePath(string? path)
+    {
+        var trimmed = path?.Trim().TrimStart('/', '\\');
+        if (string.IsNullOrEmpty(trimmed)
+            || trimmed.Length > 1_024
+            || trimmed.Contains(':')
+            || trimmed.Contains('\0'))
+        {
+            return null;
+        }
+        var segments = trimmed.Replace('\\', '/').Split('/');
+        if (segments.Any(segment =>
+            segment is "" or "." or ".."
+            || segment.IndexOfAny(InvalidExtensionFileNameChars) >= 0))
+        {
+            return null;
+        }
+        return string.Join('/', segments);
     }
 
     private static string? NormalizeExtensionRelativePath(string? path)
@@ -2691,17 +2868,58 @@ internal sealed class BrowserExtensions
     private static bool PathsEqual(string left, string right) =>
         Path.GetFullPath(left).Equals(Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
 
+    private static async Task<HttpResponseMessage> GetChromeStoreResponseAsync(
+        Uri initialUri,
+        CancellationToken cancellationToken)
+    {
+        const int maxRedirects = 8;
+        var currentUri = initialUri;
+        for (var redirectCount = 0; redirectCount <= maxRedirects; redirectCount++)
+        {
+            var response = await ChromeStoreClient.GetAsync(
+                currentUri,
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken).ConfigureAwait(false);
+            var statusCode = (int)response.StatusCode;
+            if (statusCode is >= 300 and <= 399 && response.Headers.Location is { } location)
+            {
+                var nextUri = location.IsAbsoluteUri ? location : new Uri(currentUri, location);
+                response.Dispose();
+                if (redirectCount >= maxRedirects)
+                {
+                    throw new InvalidDataException("The Chrome Web Store returned too many redirects.");
+                }
+                if (!nextUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+                    || !string.IsNullOrEmpty(nextUri.UserInfo))
+                {
+                    throw new InvalidDataException("The Chrome Web Store redirect used an unsafe protocol.");
+                }
+                currentUri = nextUri;
+                continue;
+            }
+            return response;
+        }
+
+        throw new InvalidDataException("The Chrome Web Store returned too many redirects.");
+    }
+
     private static HttpClient CreateChromeStoreClient()
     {
         var handler = new SocketsHttpHandler
         {
-            AllowAutoRedirect = true,
+            AllowAutoRedirect = false,
+            UseCookies = false,
             AutomaticDecompression = DecompressionMethods.All,
-            MaxAutomaticRedirections = 8,
+            ConnectTimeout = TimeSpan.FromSeconds(10),
             PooledConnectionLifetime = TimeSpan.FromMinutes(10)
         };
-        var client = new HttpClient(handler, disposeHandler: true) { Timeout = TimeSpan.FromMinutes(3) };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("MishaWeb/2.2");
+        var client = new HttpClient(handler, disposeHandler: true) { Timeout = StoreDownloadTimeout };
+        var version = typeof(BrowserExtensions).Assembly.GetName().Version;
+        var productVersion = version is null
+            ? "1.0.0"
+            : $"{version.Major}.{version.Minor}.{Math.Max(0, version.Build)}";
+        client.DefaultRequestHeaders.UserAgent.Add(
+            new ProductInfoHeaderValue("MishaWeb", productVersion));
         return client;
     }
 
