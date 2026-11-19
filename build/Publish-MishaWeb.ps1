@@ -742,8 +742,7 @@ try {
         '--runtime', 'win-x64',
         '--locked-mode',
         "-p:SelfContained=$selfContainedText",
-        "-p:PublishSelfContained=$selfContainedText",
-        '-p:PublishReadyToRun=true'
+        "-p:PublishSelfContained=$selfContainedText"
     )
 
     Invoke-DotNet -Arguments @(
@@ -757,7 +756,7 @@ try {
         '-p:PublishSingleFile=true',
         "-p:PublishSelfContained=$selfContainedText",
         '-p:IncludeNativeLibrariesForSelfExtract=true',
-        '-p:PublishReadyToRun=true',
+        '-p:PublishReadyToRun=false',
         '-p:TieredPGO=true',
         '-p:PublishTrimmed=false',
         '-p:DebugType=None',

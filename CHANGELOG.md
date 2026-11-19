@@ -9,7 +9,7 @@
 
 ### Lifecycle, performance, and ad blocking
 
-- Enabled `TieredPGO` in `desktop/MishaWeb.csproj` and `PublishReadyToRun` + `TieredPGO` in `build/Publish-MishaWeb.ps1`, alongside startup, loader bootstrap (`WebView2LoaderBootstrap.cs`), system resource detection (`SystemResourceInfo.cs`), and tab lifecycle refinements (`TabLifecyclePolicy.cs`, `BrowserPerformance.cs`).
+- Enabled `TieredPGO` in `desktop/MishaWeb.csproj` and `build/Publish-MishaWeb.ps1` (while keeping `PublishReadyToRun=false` so framework-dependent single-file executables do not fail-fast across .NET 10 servicing runtimes), alongside startup, loader bootstrap (`WebView2LoaderBootstrap.cs`), system resource detection (`SystemResourceInfo.cs`), and tab lifecycle refinements (`TabLifecyclePolicy.cs`, `BrowserPerformance.cs`).
 - Updated `AdBlockEngine.cs`, `AdBlockDocumentScript.cs`, `BrowserExtensions.cs`, `SearchSuggestionService.cs`, and `AddressSuggestionEngine.cs`, and added `desktop.tests/AdBlockDocumentScript.test.mjs` while removing temporary scratch `.mjs` probes from `desktop.tests/`.
 - Expanded `.github/workflows/windows.yml` to run all five Node contract/script tests plus `PublishTransactionSmoke.ps1` and `Install-MishaWeb.ps1` AST syntax validation in CI.
 

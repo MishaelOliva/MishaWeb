@@ -122,7 +122,7 @@ try {
         --output $publishStagingDir `
         -p:PublishSingleFile=true `
         -p:IncludeNativeLibrariesForSelfExtract=true `
-        -p:PublishReadyToRun=true `
+        -p:PublishReadyToRun=false `
         -p:TieredPGO=true `
         -p:PublishTrimmed=false `
         -p:DebugType=None `
