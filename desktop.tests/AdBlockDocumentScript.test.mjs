@@ -250,4 +250,53 @@ function runYouTubeSandbox({ pathname = '/watch', hidden = false } = {}) {
   assert.strictEqual(firstDesc.get, secondDesc.get, 'Repeated ytcfg data object must not be re-wrapped');
 }
 
+// 5. YouTube runtime must not expose window.__mishaStopYouTubeRuntime and honors controlChannel teardown
+{
+  const substituted = youTubeRuntime.replace('__MISHA_ADBLOCK_CONTROL_CHANNEL__', 'misha_test_channel');
+  const listeners = new Map();
+  const timers = new Map();
+  let nextTimer = 0;
+  const sandbox = {
+    URL,
+    URLSearchParams,
+    queueMicrotask,
+    Request: class { constructor(url) { this.url = url; this.method = 'GET'; this.headers = new Map(); } clone() { return { text: async () => '' }; } },
+    Headers: Map,
+    performance: { now: () => 0 },
+    location: { hostname: 'www.youtube.com', pathname: '/watch', search: '?v=abc123def45', href: 'https://www.youtube.com/watch?v=abc123def45' },
+    HTMLElement: class {},
+    HTMLVideoElement: class {},
+    Node: class {},
+    HTMLIFrameElement: class {},
+    XMLHttpRequest: function MockXhr() {},
+    MutationObserver: class { observe() {} disconnect() {} },
+    console,
+    fetch: () => Promise.resolve({ ok: true, status: 200 }),
+    __mishaAdBlockEnabled: true,
+    setTimeout: (cb, delay = 0) => { const id = ++nextTimer; timers.set(id, { cb, delay }); return id; },
+    clearTimeout: (id) => timers.delete(id),
+    addEventListener: (name, cb) => { const list = listeners.get(name) ?? []; list.push(cb); listeners.set(name, list); },
+    removeEventListener: (name, cb) => { const list = listeners.get(name); if (list) listeners.set(name, list.filter((x) => x !== cb)); },
+    document: {
+      hidden: false,
+      readyState: 'complete',
+      documentElement: { appendChild: () => {}, setAttribute: () => {}, removeAttribute: () => {} },
+      createElement: () => ({ id: '', textContent: '', remove: () => {} }),
+      getElementById: () => null,
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      addEventListener: () => {},
+      removeEventListener: () => {}
+    }
+  };
+  sandbox.XMLHttpRequest.prototype = { open() {}, send() {}, addEventListener() {} };
+  sandbox.window = sandbox;
+  sandbox.globalThis = sandbox;
+  sandbox.Object = Object;
+  vm.runInNewContext(substituted, sandbox, { timeout: 2000 });
+  assert.equal('__mishaStopYouTubeRuntime' in sandbox, false, 'window.__mishaStopYouTubeRuntime must not be exposed');
+  assert.ok(listeners.has('misha_test_channel'), 'Substituted controlChannel listener must be registered');
+  for (const cb of listeners.get('misha_test_channel')) cb();
+}
+
 console.log(JSON.stringify({ status: 'PASS', contract: 'AdBlockDocumentScript universal/youtube split, timer gating, WeakSet dedupe, and XHR global hygiene verified' }));

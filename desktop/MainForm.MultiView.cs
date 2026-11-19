@@ -201,6 +201,7 @@ public sealed partial class MainForm
             if (!multiViewState.IsMultiViewActive)
             {
                 ActivateTab(nextActive, focusPage: true);
+                ApplyMultiViewLayout();
             }
             else
             {

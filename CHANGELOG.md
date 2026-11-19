@@ -9,8 +9,9 @@
 
 ### Lifecycle, performance, and ad blocking
 
-- Enabled `TieredPGO` in `desktop/MishaWeb.csproj` and `build/Publish-MishaWeb.ps1` (while keeping `PublishReadyToRun=false` so framework-dependent single-file executables do not fail-fast across .NET 10 servicing runtimes), alongside startup, loader bootstrap (`WebView2LoaderBootstrap.cs`), system resource detection (`SystemResourceInfo.cs`), and tab lifecycle refinements (`TabLifecyclePolicy.cs`, `BrowserPerformance.cs`).
-- Updated `AdBlockEngine.cs`, `AdBlockDocumentScript.cs`, `BrowserExtensions.cs`, `SearchSuggestionService.cs`, and `AddressSuggestionEngine.cs`, and added `desktop.tests/AdBlockDocumentScript.test.mjs` while removing temporary scratch `.mjs` probes from `desktop.tests/`.
+- Enabled `TieredPGO` in `desktop/MishaWeb.csproj` and `build/Publish-MishaWeb.ps1` (with `EnableCompressionInSingleFile=true` for self-contained Portable builds and `PublishReadyToRun=false` for framework-dependent runtime compatibility), hardened `build/Install-MishaWeb.ps1` and `Install-MishaWeb.bat` release-tag validation, and optimized `mishaweb-bunny-logo-v2.ico`.
+- Hardened lifecycle, Multi-View layout transitions, private-profile cleanup, high-risk download extension checks (`BrowserPolicy.IsHighRiskDownloadExtension`), DPI scaling, High Contrast rendering, GDI+ handle disposal, and accessibility across `MainForm.*.cs`, `MultiViewControls.cs`, `SmartSearchBar.cs`, and `NativeFeatureSurfaces.cs`.
+- Updated `AdBlockEngine.cs`, `AdBlockDocumentScript.cs` (including shared control-channel passing to YouTube document scripts), `BrowserExtensions.cs`, `SearchSuggestionService.cs`, `AddressSuggestionEngine.cs`, `PublicSuffixRules.cs`, and `ReaderModeScript.cs`, and added `desktop.tests/AdBlockDocumentScript.test.mjs` (`661` smoke checks + `5` Node contract tests).
 - Expanded `.github/workflows/windows.yml` to run all five Node contract/script tests plus `PublishTransactionSmoke.ps1` and `Install-MishaWeb.ps1` AST syntax validation in CI.
 
 ## 2.4.1 - 2026-11-14

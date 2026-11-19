@@ -1261,14 +1261,14 @@ public sealed partial class MainForm
             {
                 ActivateTab(tabs[Math.Min(index, tabs.Count - 1)]);
             }
-            else
+            if (wasMultiView)
             {
-                if (wasMultiView)
-                {
-                    ApplyMultiViewLayout();
-                    RefreshLiveTabMemoryTargets();
-                    ScheduleStateSave();
-                }
+                ApplyMultiViewLayout();
+                RefreshLiveTabMemoryTargets();
+                ScheduleStateSave();
+            }
+            if (!wasActive)
+            {
                 UpdateStatus();
             }
         }

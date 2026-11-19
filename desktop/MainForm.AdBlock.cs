@@ -132,8 +132,7 @@ public sealed partial class MainForm
         }
         tab.AdBlockPolicyScriptId = policyId;
 
-        var controlChannel = tab.AdBlockControlChannel ??=
-            "__misha_adblock_control_" + Guid.NewGuid().ToString("N");
+        var controlChannel = EnsureAdBlockControlChannel(tab);
         var scriptId = await core.AddScriptToExecuteOnDocumentCreatedAsync(
             AdBlockEngine.CreateUniversalBootstrapScript(controlChannel));
         if (!adBlockEnabled
@@ -157,6 +156,9 @@ public sealed partial class MainForm
         }
     }
 
+    private static string EnsureAdBlockControlChannel(BrowserTab tab) =>
+        tab.AdBlockControlChannel ??= "__misha_adblock_control_" + Guid.NewGuid().ToString("N");
+
     private async Task EnsureYouTubeDocumentScriptAsync(
         BrowserTab tab,
         CoreWebView2 core,
@@ -171,8 +173,9 @@ public sealed partial class MainForm
             return;
         }
 
+        var controlChannel = EnsureAdBlockControlChannel(tab);
         var ytScriptId = await core.AddScriptToExecuteOnDocumentCreatedAsync(
-            AdBlockEngine.CreateYouTubeDocumentScript());
+            AdBlockEngine.CreateYouTubeDocumentScript(controlChannel));
         if (!adBlockEnabled
             || tab.IsClosed
             || tab.Core != core

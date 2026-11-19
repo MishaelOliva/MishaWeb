@@ -11,10 +11,6 @@ namespace MishaWeb;
 
 public sealed partial class MainForm
 {
-    private static readonly HashSet<string> DangerousDownloadExtensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".exe", ".msi", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".hta", ".lnk", ".scr", ".reg", ".dll"
-    };
     private readonly Dictionary<string, (int Size, Bitmap Icon)> extensionMenuIconCache = new(StringComparer.OrdinalIgnoreCase);
     private bool extensionIconCacheCleanupWired;
 
@@ -2607,7 +2603,7 @@ public sealed partial class MainForm
                 return;
             }
             var extension = Path.GetExtension(download.FilePath);
-            if (DangerousDownloadExtensions.Contains(extension)
+            if (BrowserPolicy.IsHighRiskDownloadExtension(download.FilePath)
                 && !NativeAlertDialog.Confirm(
                     this,
                     "Open executable or script file?",

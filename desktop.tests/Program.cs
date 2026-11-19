@@ -2781,26 +2781,29 @@ Check(
         "https://publisher.invalid/page",
         AdBlockResourceType.Script));
 
-// uBO accepts both "|" and "," inside $denyallow. The comma form used to be
-// truncated by the enclosing option split, leaving an orphan option that failed
-// option mapping and deleted the whole rule.
+// uBO accepts both "|" and "," inside $denyallow, and excludes matching request
+// target hosts (requestUri.Host) rather than source page hosts.
 var denyAllowCommaEngine = new AdBlockEngine(initialRules:
 [
-    "||denyallow-comma.invalid^$denyallow=skipped.invalid,alsoskipped.invalid"
+    "/denyallow-comma.js$script,denyallow=skipped.invalid,alsoskipped.invalid"
 ]);
 Check(
-    "denyallow accepts a comma-separated list",
+    "denyallow accepts a comma-separated list of target host exceptions",
     !denyAllowCommaEngine.ShouldBlock(
-        "https://denyallow-comma.invalid/ad.js",
-        "https://skipped.invalid/page",
+        "https://skipped.invalid/denyallow-comma.js",
+        "https://publisher.invalid/page",
         AdBlockResourceType.Script)
     && !denyAllowCommaEngine.ShouldBlock(
-        "https://denyallow-comma.invalid/ad.js",
-        "https://alsoskipped.invalid/page",
+        "https://alsoskipped.invalid/denyallow-comma.js",
+        "https://publisher.invalid/page",
         AdBlockResourceType.Script)
     && denyAllowCommaEngine.ShouldBlock(
-        "https://denyallow-comma.invalid/ad.js",
-        "https://allowed.invalid/page",
+        "https://blocked.invalid/denyallow-comma.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script)
+    && denyAllowCommaEngine.ShouldBlock(
+        "https://blocked.invalid/denyallow-comma.js",
+        "https://skipped.invalid/page",
         AdBlockResourceType.Script));
 
 // The live WebView2 path resolves subframes from URLs recorded by each frame's
@@ -2898,21 +2901,21 @@ Check(
 // rule's third-party scoping, so it started firing on first-party requests.
 var denyAllowTrailingOptionEngine = new AdBlockEngine(initialRules:
 [
-    "||denyallow-trailing.invalid^$script,denyallow=skip.example.com,third-party"
+    "/denyallow-trailing.js$script,denyallow=skip.example.com,third-party"
 ]);
 Check(
     "denyallow stops at the next named option",
     !denyAllowTrailingOptionEngine.ShouldBlock(
-        "https://denyallow-trailing.invalid/ad.js",
-        "https://skip.example.com/page",
+        "https://skip.example.com/denyallow-trailing.js",
+        "https://publisher.invalid/page",
         AdBlockResourceType.Script)
     && !denyAllowTrailingOptionEngine.ShouldBlock(
-        "https://denyallow-trailing.invalid/ad.js",
-        "https://denyallow-trailing.invalid/page",
+        "https://other.invalid/denyallow-trailing.js",
+        "https://other.invalid/page",
         AdBlockResourceType.Script)
     && denyAllowTrailingOptionEngine.ShouldBlock(
-        "https://denyallow-trailing.invalid/ad.js",
-        "https://other.invalid/page",
+        "https://other.invalid/denyallow-trailing.js",
+        "https://publisher.invalid/page",
         AdBlockResourceType.Script));
 var splitDenyAllow = AdBlockEngine.SplitFilterOptionsForTesting("script,denyallow=a.com,b.com,third-party");
 Check(
@@ -3013,7 +3016,7 @@ Check(
         is ["script", "denyallow=a.com|localhost|10.0.0.0/8", "third-party"]);
 var denyAllowHostFormsEngine = new AdBlockEngine(initialRules:
 [
-    "||denyallow-forms.invalid^$script,denyallow=a.com,localhost,10.0.0.0/8"
+    "/denyallow-forms.js$script,denyallow=a.com,localhost,10.0.0.0/8"
 ]);
 Check(
     "a denyallow list of host forms does not delete its rule",
@@ -3022,16 +3025,16 @@ Check(
     // matched; this engine has no CIDR matching, so the range entry is dropped
     // rather than allowed to delete the rule.
     !denyAllowHostFormsEngine.ShouldBlock(
-        "https://denyallow-forms.invalid/ad.js",
-        "https://localhost/page",
+        "https://localhost/denyallow-forms.js",
+        "https://publisher.invalid/page",
         AdBlockResourceType.Script)
     && !denyAllowHostFormsEngine.ShouldBlock(
-        "https://denyallow-forms.invalid/ad.js",
-        "https://a.com/page",
+        "https://a.com/denyallow-forms.js",
+        "https://publisher.invalid/page",
         AdBlockResourceType.Script)
     && denyAllowHostFormsEngine.ShouldBlock(
-        "https://denyallow-forms.invalid/ad.js",
-        "https://allowed.invalid/page",
+        "https://blocked.invalid/denyallow-forms.js",
+        "https://publisher.invalid/page",
         AdBlockResourceType.Script));
 
 // The subframe URL set is per-tab session state. It has to be bounded, and it has
@@ -3129,25 +3132,29 @@ Check(
         requestUrlIsKnownSubframe: boundedSeam.Contains("https://preloaded0.invalid/page", 0))
         == AdBlockResourceType.SubDocument);
 
-// $denyallow=a.com means "do not apply on a.com"; the ~ form negates that, so
-// the rule must apply on b.com.
+// $denyallow=a.com means "do not apply when request target is a.com"; the ~ form
+// keeps ~b.com out of the target exclusion set, so requests to b.com are blocked.
 var denyAllowEngine = new AdBlockEngine(initialRules:
 [
-    "||denyallow.invalid^$denyallow=skipped.invalid|~kept.invalid"
+    "/denyallow-mix.js$script,denyallow=skipped.invalid|~kept.invalid"
 ]);
 Check(
-    "denyallow excludes listed hosts and keeps tilde-negated hosts",
+    "denyallow excludes listed target hosts and keeps tilde-negated targets blocked",
     !denyAllowEngine.ShouldBlock(
-        "https://denyallow.invalid/ad.js",
-        new Uri("https://skipped.invalid/page").AbsoluteUri,
-        AdBlockResourceType.Script)
-    && denyAllowEngine.ShouldBlock(
-        "https://denyallow.invalid/ad.js",
-        new Uri("https://kept.invalid/page").AbsoluteUri,
-        AdBlockResourceType.Script)
-    && denyAllowEngine.ShouldBlock(
-        "https://denyallow.invalid/ad.js",
+        "https://skipped.invalid/denyallow-mix.js",
         youtubeWatchUrl,
+        AdBlockResourceType.Script)
+    && denyAllowEngine.ShouldBlock(
+        "https://kept.invalid/denyallow-mix.js",
+        youtubeWatchUrl,
+        AdBlockResourceType.Script)
+    && denyAllowEngine.ShouldBlock(
+        "https://other.invalid/denyallow-mix.js",
+        youtubeWatchUrl,
+        AdBlockResourceType.Script)
+    && denyAllowEngine.ShouldBlock(
+        "https://other.invalid/denyallow-mix.js",
+        new Uri("https://skipped.invalid/page").AbsoluteUri,
         AdBlockResourceType.Script));
 
 // The host text is trimmed of dot padding but the path remainder is sliced from
@@ -6654,6 +6661,201 @@ Check(
 Check(
     "TabHeader renders favicons, swaps owned bitmaps cleanly, and disposes replaced icons",
     tabFaviconAndAudioToggle.FaviconHandled);
+
+// Cross-branch regression suite: AdBlockEngine path rules with options, prefix/glob
+// boundary matching, boolean !#if preprocessing, and selector delimiter safety.
+var pathRuleOptionsEngine = new AdBlockEngine(initialRules:
+[
+    "/ads.js$script,third-party",
+    "/tracker.js$script",
+    "@@/tracker.js$domain=foo.com"
+]);
+Check(
+    "AdBlockEngine parses options on leading-slash path and exception rules",
+    pathRuleOptionsEngine.ShouldBlock(
+        "https://cdn.invalid/ads.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script)
+    && !pathRuleOptionsEngine.ShouldBlock(
+        "https://publisher.invalid/ads.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script)
+    && !pathRuleOptionsEngine.ShouldBlock(
+        "https://cdn.invalid/ads.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Image)
+    && !pathRuleOptionsEngine.ShouldBlock(
+        "https://cdn.invalid/tracker.js",
+        "https://foo.com/page",
+        AdBlockResourceType.Script)
+    && pathRuleOptionsEngine.ShouldBlock(
+        "https://cdn.invalid/tracker.js",
+        "https://bar.com/page",
+        AdBlockResourceType.Script));
+
+var prefixAndSubdomainEngine = new AdBlockEngine(initialRules:
+[
+    "||ads.$script",
+    "||cacheserve.*/promodisplay/$script"
+]);
+Check(
+    "AdBlockEngine ||ads. excludes .ads TLD and ||glob matches subdomains",
+    !prefixAndSubdomainEngine.ShouldBlock(
+        "https://example.ads/app.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script)
+    && prefixAndSubdomainEngine.ShouldBlock(
+        "https://ads.example.com/app.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script)
+    && prefixAndSubdomainEngine.ShouldBlock(
+        "https://sub.ads.example.com/app.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script)
+    && prefixAndSubdomainEngine.ShouldBlock(
+        "https://cacheserve.example/promodisplay/x.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script)
+    && prefixAndSubdomainEngine.ShouldBlock(
+        "https://sub.cacheserve.example/promodisplay/x.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script)
+    && !prefixAndSubdomainEngine.ShouldBlock(
+        "https://sub.cacheserve.example/other/x.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script));
+
+var conditionalEngine = new AdBlockEngine(initialRules:
+[
+    "!#if !(env_chromium)",
+    "||non-chromium.invalid^$script",
+    "!#else",
+    "||chromium-branch.invalid^$script",
+    "!#endif",
+    "!#if (env_chromium && !env_firefox)",
+    "||chromium-expr.invalid^$script",
+    "!#endif"
+]);
+Check(
+    "AdBlockEngine evaluates negated and parenthesized !#if conditions",
+    !conditionalEngine.ShouldBlock(
+        "https://non-chromium.invalid/a.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script)
+    && conditionalEngine.ShouldBlock(
+        "https://chromium-branch.invalid/a.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script)
+    && conditionalEngine.ShouldBlock(
+        "https://chromium-expr.invalid/a.js",
+        "https://publisher.invalid/page",
+        AdBlockResourceType.Script));
+
+var cosmeticSafetyEngine = new AdBlockEngine(initialRules:
+[
+    "css-safety.invalid##.safe-ad",
+    "css-safety.invalid##div:matches-path(/feed)",
+    "css-safety.invalid##.unbalanced([attr"
+]);
+var cosmeticSafetyCss = cosmeticSafetyEngine.GetCosmeticCss(
+    "https://css-safety.invalid/feed",
+    cacheEvaluation: false);
+Check(
+    "AdBlockEngine IsSafeCssSelector drops procedural and unbalanced selectors without discarding valid rules",
+    cosmeticSafetyCss.Contains(".safe-ad", StringComparison.Ordinal)
+    && !cosmeticSafetyCss.Contains("matches-path", StringComparison.Ordinal)
+    && !cosmeticSafetyCss.Contains("unbalanced", StringComparison.Ordinal));
+
+var ytControlChannel = "__misha_test_channel_9f2a";
+var ytDocumentScript = AdBlockEngine.CreateYouTubeDocumentScript(ytControlChannel);
+Check(
+    "AdBlockDocumentScript substitutes controlChannel and does not expose window.__mishaStopYouTubeRuntime",
+    ytDocumentScript.Contains(ytControlChannel, StringComparison.Ordinal)
+    && !ytDocumentScript.Contains("__MISHA_ADBLOCK_CONTROL_CHANNEL__", StringComparison.Ordinal)
+    && !ytDocumentScript.Contains("__mishaStopYouTubeRuntime", StringComparison.Ordinal)
+    && !AdBlockDocumentScript.YouTubeRuntimeSource.Contains("__mishaStopYouTubeRuntime", StringComparison.Ordinal));
+
+Check(
+    "BrowserExtensions handles repeated-literal @exclude, @exclude-match isolation, invalid manifest_version, and unescaped icon paths",
+    VerifyBrowserExtensionsRegressions());
+
+Check(
+    "BrowserPolicy enforces high-risk download extensions and rejects control chars or empty hosts in URLs",
+    BrowserPolicy.IsHighRiskDownloadExtension("installer.exe")
+    && BrowserPolicy.IsHighRiskDownloadExtension("  SCRIPT.PS1  ")
+    && BrowserPolicy.IsHighRiskDownloadExtension("archive.vhdx")
+    && !BrowserPolicy.IsHighRiskDownloadExtension("report.pdf")
+    && !BrowserPolicy.IsHighRiskDownloadExtension("noext")
+    && !BrowserPolicy.IsHighRiskDownloadExtension("   ")
+    && !BrowserPolicy.IsHighRiskDownloadExtension(null)
+    && BrowserPolicy.IsSafeTopLevelUrl("https://example.com/ok")
+    && !BrowserPolicy.IsSafeTopLevelUrl("https://example.com/\n")
+    && !BrowserPolicy.IsSafeTopLevelUrl("https:///path")
+    && BrowserPolicy.IsHttpUrl("https://example.com/ok")
+    && !BrowserPolicy.IsHttpUrl("https://example.com/\r")
+    && !BrowserPolicy.IsHttpUrl("http:///path"));
+
+var subframeIsolation = MainForm.CreateAdBlockSubframeStateForTesting(documentGeneration: 10, seedCount: 3);
+var gen10Remaining = subframeIsolation.GetRemaining(10);
+var gen11BeforeRecord = subframeIsolation.GetRemaining(11);
+subframeIsolation.Record("https://new-gen.invalid/frame", 11);
+Check(
+    "AdBlockSubframeState.GetRemaining isolates subframe counts by document generation",
+    gen10Remaining == 3
+    && gen11BeforeRecord == 0
+    && subframeIsolation.GetRemaining(11) == 1
+    && subframeIsolation.GetRemaining(10) == 0);
+
+Check(
+    "MainForm worker communication bypass requires https/wss transport and provider origin",
+    MainForm.ShouldBypassCommunicationRequest(
+        topLevelUrl: "https://unrelated.invalid/",
+        sourceUrl: "https://discord.com/channels/@me",
+        requestUrl: "wss://gateway.discord.gg/",
+        AdBlockResourceType.WebSocket,
+        workerSource: true)
+    && !MainForm.ShouldBypassCommunicationRequest(
+        topLevelUrl: "https://discord.com/channels/@me",
+        sourceUrl: "https://discord.com/channels/@me",
+        requestUrl: "ws://gateway.discord.gg/",
+        AdBlockResourceType.WebSocket,
+        workerSource: true)
+    && !MainForm.ShouldBypassCommunicationRequest(
+        topLevelUrl: "https://discord.com/channels/@me",
+        sourceUrl: "http://discord.com/channels/@me",
+        requestUrl: "wss://gateway.discord.gg/",
+        AdBlockResourceType.WebSocket,
+        workerSource: true)
+    && !MainForm.ShouldBypassCommunicationRequest(
+        topLevelUrl: "https://discord.com/channels/@me",
+        sourceUrl: "https://evil.invalid/",
+        requestUrl: "wss://gateway.discord.gg/",
+        AdBlockResourceType.WebSocket,
+        workerSource: true)
+    && !MainForm.ShouldBypassCommunicationRequest(
+        topLevelUrl: "https://discord.com/channels/@me",
+        sourceUrl: "https://zoom.us/wc",
+        requestUrl: "wss://gateway.discord.gg/",
+        AdBlockResourceType.WebSocket,
+        workerSource: true)
+    && MainForm.ShouldBypassCommunicationRequest(
+        topLevelUrl: "https://discord.com/channels/@me",
+        sourceUrl: string.Empty,
+        requestUrl: "https://cdn.discordapp.com/app.js",
+        AdBlockResourceType.Script,
+        workerSource: true));
+
+Check(
+    "MultiViewLayoutEngine returns PaneBounds matching PaneCount when host bounds are empty",
+    VerifyEmptyMultiViewLayoutBounds());
+
+Check(
+    "MruSwitcherForm commits selection on Keys.ControlKey release",
+    VerifyMruSwitcherControlKeyCommit());
+
+Check(
+    "Split view closing a non-active pane resets remaining pane to full-width Single layout",
+    VerifySplitViewCloseNonActivePaneReset());
 
 if (failures.Count > 0)
 {
@@ -12577,6 +12779,217 @@ bool VerifyMultiViewLayoutGeometryAndState()
         }
         return area == (long)bounds.Width * bounds.Height;
     }
+}
+
+bool VerifyBrowserExtensionsRegressions()
+{
+    var tempRoot = Path.Combine(
+        Path.GetTempPath(),
+        "MishaWeb-ExtRegression-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(tempRoot);
+    try
+    {
+        var scriptsRoot = Path.Combine(tempRoot, "scripts");
+        Directory.CreateDirectory(scriptsRoot);
+        File.WriteAllText(
+            Path.Combine(scriptsRoot, "exclude-backtrack.user.js"),
+            """
+            // ==UserScript==
+            // @match https://auth.invalid/*
+            // @exclude https://auth.invalid/*login
+            // ==/UserScript==
+            console.log('ok');
+            """,
+            Encoding.UTF8);
+        File.WriteAllText(
+            Path.Combine(scriptsRoot, "exclude-match-isolation.user.js"),
+            """
+            // ==UserScript==
+            // @match https://news.invalid/*
+            // @exclude-match https://news.invalid/article
+            // ==/UserScript==
+            console.log('news');
+            """,
+            Encoding.UTF8);
+
+        var extensions = new BrowserExtensions(scriptsRoot);
+        var excludedRepeatedLiteral = extensions.GetScriptsForUrl("https://auth.invalid/login/relogin").Count == 0;
+        var allowedOtherAuthPath = extensions.GetScriptsForUrl("https://auth.invalid/login/dashboard").Count == 1;
+        var excludeMatchDidNotCollide = extensions.GetScriptsForUrl("https://news.invalid/article").Count == 1;
+
+        var runtimeId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        var pkgFolder = Path.Combine(extensions.ManagedFolderPath, runtimeId, "v1");
+        Directory.CreateDirectory(pkgFolder);
+        File.WriteAllText(
+            Path.Combine(pkgFolder, "manifest.json"),
+            """{"name":"Invalid MV","version":"1.0","manifest_version":3.5}""",
+            Encoding.UTF8);
+        File.WriteAllText(
+            pkgFolder + ".misha-managed",
+            "MishaWeb managed extension package",
+            Encoding.UTF8);
+        extensions.ReconcileManagedExtensions([runtimeId]);
+        var reconciliationCaughtInvalidManifest = extensions.GetManagedExtensions().Count == 0;
+
+        var iconExtRoot = Path.Combine(tempRoot, "icon-ext");
+        var iconsDir = Path.Combine(iconExtRoot, "icons");
+        Directory.CreateDirectory(iconsDir);
+        var unescapedIconFile = Path.Combine(iconsDir, "my icon #1.png");
+        File.WriteAllBytes(unescapedIconFile, [137, 80, 78, 71]);
+        var iconManifest = JsonNode.Parse("""{"icons":{"48":"icons/my icon #1.png"}}""")!.AsObject();
+        var iconRelative = BrowserExtensions.ReadBestIconPath(iconExtRoot, iconManifest);
+        var iconResolved = BrowserExtensions.ResolveSafeExtensionFilePath(iconExtRoot, iconRelative);
+        var iconOk = iconRelative == "icons/my icon #1.png"
+            && iconResolved is not null
+            && string.Equals(Path.GetFullPath(iconResolved), Path.GetFullPath(unescapedIconFile), StringComparison.OrdinalIgnoreCase)
+            && File.Exists(iconResolved);
+
+        return excludedRepeatedLiteral
+            && allowedOtherAuthPath
+            && excludeMatchDidNotCollide
+            && reconciliationCaughtInvalidManifest
+            && iconOk;
+    }
+    finally
+    {
+        try { Directory.Delete(tempRoot, recursive: true); } catch { }
+    }
+}
+
+bool VerifyEmptyMultiViewLayoutBounds()
+{
+    var state = new MultiViewState();
+    state.SetSingle(1);
+    for (var expectedCount = 1; expectedCount <= 4; expectedCount++)
+    {
+        if (expectedCount > 1 && !state.AddPane(expectedCount)) return false;
+        foreach (var emptyRect in new[] { Rectangle.Empty, new Rectangle(0, 0, 0, 200), new Rectangle(0, 0, 200, 0) })
+        {
+            var layout = MultiViewLayoutEngine.ComputeLayout(emptyRect, state, 4, 26);
+            if (layout.PaneCount != expectedCount
+                || layout.PaneBounds.Length != expectedCount
+                || layout.HeaderBounds.Length != expectedCount
+                || layout.ContentBounds.Length != expectedCount
+                || layout.Splitters.Length != 0)
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool VerifyMruSwitcherControlKeyCommit()
+{
+    var ok = false;
+    Exception? error = null;
+    var thread = new Thread(() =>
+    {
+        var previousSyncContext = SynchronizationContext.Current;
+        using var syncContext = new WindowsFormsSynchronizationContext();
+        SynchronizationContext.SetSynchronizationContext(syncContext);
+        try
+        {
+            using var owner = new Form
+            {
+                StartPosition = FormStartPosition.Manual,
+                Location = new Point(-20_000, -20_000),
+                Size = new Size(120, 120),
+                ShowInTaskbar = false
+            };
+            owner.Show();
+            using var mru = new MruSwitcherForm();
+            var committed = 0;
+            mru.Committed += (_, _) => committed++;
+            mru.Open(owner, ["First \u2014 https://first.invalid/", "Second \u2014 https://second.invalid/"], selectedIndex: 1);
+            Application.DoEvents();
+
+            var onKeyUp = typeof(Form).GetMethod(
+                "OnKeyUp",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (onKeyUp is null) return;
+
+            onKeyUp.Invoke(mru, [new KeyEventArgs(Keys.Control)]);
+            var ignoredNonKey = committed == 0 && mru.Visible;
+
+            onKeyUp.Invoke(mru, [new KeyEventArgs(Keys.ControlKey)]);
+            Application.DoEvents();
+            ok = ignoredNonKey && committed == 1 && !mru.Visible && mru.SelectedIndex == 1;
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previousSyncContext);
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+    return error is null && ok;
+}
+
+bool VerifySplitViewCloseNonActivePaneReset()
+{
+    var ok = false;
+    Exception? error = null;
+    var thread = new Thread(() =>
+    {
+        var previousSyncContext = SynchronizationContext.Current;
+        using var syncContext = new WindowsFormsSynchronizationContext();
+        SynchronizationContext.SetSynchronizationContext(syncContext);
+        try
+        {
+            using var form = new MainForm(startBrowserOnShown: false, mode: BrowserMode.Private)
+            {
+                StartPosition = FormStartPosition.Manual,
+                Location = new Point(-20_000, -20_000),
+                ShowInTaskbar = false,
+                ClientSize = new Size(1280, 800)
+            };
+            form.Show();
+            form.PrepareChromePreviewForTesting();
+            Application.DoEvents();
+
+            var addTask = form.AddMultiViewPaneForTestingAsync();
+            while (!addTask.IsCompleted)
+            {
+                Application.DoEvents();
+                Thread.Sleep(5);
+            }
+            if (!addTask.GetAwaiter().GetResult()) return;
+
+            form.FocusMultiViewPaneForTesting(0);
+            Application.DoEvents();
+            var pageHostSize = form.GetPageHostScreenRectangleForTesting().Size;
+
+            form.CloseMultiViewPaneForTesting(1);
+            form.PerformLayout();
+            Application.DoEvents();
+
+            var after = form.GetMultiViewSnapshotForTesting();
+            var actual = form.GetActualMultiViewGeometryForTesting();
+            ok = after.Preset == MultiViewPreset.Single
+                && after.PaneCount == 1
+                && after.PaneBounds.Length == 1
+                && actual.HostBounds.Length == 1
+                && actual.HostBounds[0] == new Rectangle(Point.Empty, pageHostSize);
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previousSyncContext);
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+    return error is null && ok;
 }
 
 bool VerifyTabLifecycleProtectsMultiViewPanes()
