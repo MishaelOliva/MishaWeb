@@ -21,7 +21,7 @@
     <Description>A resource-light native Windows browser powered by WebView2.</Description>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\Brand\mishaweb-bunny-logo-v2.ico</ApplicationIcon>
-    <DebugType>embedded</DebugType>
+    <DebugType Condition="'$(Configuration)' != 'Release'">embedded</DebugType>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <RestoreLockedMode Condition="'$(ContinuousIntegrationBuild)' == 'true'">true</RestoreLockedMode>
     <Deterministic>true</Deterministic>

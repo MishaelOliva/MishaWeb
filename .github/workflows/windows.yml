@@ -20,7 +20,6 @@ jobs:
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
       DOTNET_NOLOGO: '1'
       NUGET_XMLDOC_MODE: skip
-      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true'
 
     steps:
       - name: Check out source
@@ -39,6 +38,16 @@ jobs:
         shell: pwsh
         run: dotnet restore desktop.tests/MishaWeb.SmokeTests.csproj --locked-mode
 
+      - name: Check vulnerable NuGet packages
+        shell: pwsh
+        run: |
+          $vulnOutput = dotnet list desktop/MishaWeb.csproj package --vulnerable --include-transitive 2>&1 | Out-String
+          Write-Host $vulnOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($vulnOutput -match 'has the following vulnerable packages') {
+            throw 'Vulnerable NuGet packages detected.'
+          }
+
       - name: Strict build
         shell: pwsh
         run: dotnet build desktop.tests/MishaWeb.SmokeTests.csproj --configuration Release --no-restore --warnaserror -p:ContinuousIntegrationBuild=true
@@ -46,6 +55,11 @@ jobs:
       - name: Smoke and policy tests
         shell: pwsh
         run: dotnet run --project desktop.tests/MishaWeb.SmokeTests.csproj --configuration Release --no-build --no-restore
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
 
       - name: Node contract and script tests
         shell: pwsh

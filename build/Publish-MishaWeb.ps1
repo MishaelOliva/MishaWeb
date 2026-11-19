@@ -119,6 +119,28 @@ function Remove-CommittedBackupBestEffort {
     }
 }
 
+function Clear-StaleBackupDirectories {
+    $targets = @(
+        [pscustomobject]@{ Parent = $buildRoot; Filter = '.one-click-backup-*' },
+        [pscustomobject]@{ Parent = $desktopRoot; Filter = '.publish-backup-*' },
+        [pscustomobject]@{ Parent = $desktopRoot; Filter = '.portable-backup-*' }
+    )
+    foreach ($target in $targets) {
+        if (-not (Test-Path -LiteralPath $target.Parent -PathType Container)) {
+            continue
+        }
+        $staleDirs = @(Get-ChildItem -Force -Directory -LiteralPath $target.Parent -Filter $target.Filter)
+        foreach ($staleDir in $staleDirs) {
+            try {
+                Remove-ContainedDirectory -Path $staleDir.FullName -Parent $target.Parent
+            }
+            catch {
+                Write-Warning "Could not remove stale backup directory '$($staleDir.FullName)': $($_.Exception.Message)"
+            }
+        }
+    }
+}
+
 function Invoke-DotNet {
     param([Parameter(Mandatory = $true)][string[]] $Arguments)
 
@@ -267,10 +289,14 @@ function Test-ReleaseOutput {
         }
     }
 
-    $releaseNoticePath = Join-Path $OutputPath 'THIRD-PARTY-NOTICES.txt'
-    $sourceNoticeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $noticeSourcePath).Hash
-    $releaseNoticeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $releaseNoticePath).Hash
-    if ($releaseNoticeHash -ne $sourceNoticeHash) {
+    $hashedNames = @($payloadNames + $manifestName)
+    $actualRecords = @{}
+    foreach ($name in $hashedNames) {
+        $actualRecords[$name] = Get-FileRecord -Directory $OutputPath -Name $name
+    }
+
+    $sourceNoticeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $noticeSourcePath).Hash.ToLowerInvariant()
+    if ($actualRecords['THIRD-PARTY-NOTICES.txt'].sha256 -ne $sourceNoticeHash) {
         throw 'Release THIRD-PARTY-NOTICES.txt does not match the current dependency notice source.'
     }
 
@@ -318,7 +344,7 @@ function Test-ReleaseOutput {
             throw "Release manifest must contain exactly one record for '$name'."
         }
 
-        $actual = Get-FileRecord -Directory $OutputPath -Name $name
+        $actual = $actualRecords[$name]
         if ([long] $record[0].bytes -ne $actual.bytes -or $record[0].sha256 -ne $actual.sha256) {
             throw "Release manifest hash or size is invalid for '$name'."
         }
@@ -339,7 +365,6 @@ function Test-ReleaseOutput {
         $checksumEntries[$name] = $Matches[1].ToLowerInvariant()
     }
 
-    $hashedNames = @($payloadNames + $manifestName)
     if ($checksumEntries.Count -ne $hashedNames.Count) {
         throw 'Checksum file entry count is invalid.'
     }
@@ -347,16 +372,15 @@ function Test-ReleaseOutput {
         if (-not $checksumEntries.ContainsKey($name)) {
             throw "Checksum file is missing '$name'."
         }
-        $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $OutputPath $name)).Hash.ToLowerInvariant()
-        if ($checksumEntries[$name] -ne $actualHash) {
+        if ($checksumEntries[$name] -ne $actualRecords[$name].sha256) {
             throw "Checksum mismatch for '$name'."
         }
     }
 
     $exePath = Join-Path $OutputPath 'MishaWeb.exe'
-    $exeLength = (Get-Item -LiteralPath $exePath).Length
-    if ($exeLength -gt $Definition.MaximumExecutableBytes) {
-        throw "Executable size $exeLength exceeds the $($Definition.MaximumExecutableBytes)-byte budget for $($Definition.DeploymentMode)."
+    $exeRecord = $actualRecords['MishaWeb.exe']
+    if ($exeRecord.bytes -gt $Definition.MaximumExecutableBytes) {
+        throw "Executable size $($exeRecord.bytes) exceeds the $($Definition.MaximumExecutableBytes)-byte budget for $($Definition.DeploymentMode)."
     }
     Assert-X64Executable -Path $exePath
     $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exePath)
@@ -374,8 +398,8 @@ function Test-ReleaseOutput {
 
     return [pscustomobject]@{
         Executable = $exePath
-        Bytes = (Get-Item -LiteralPath $exePath).Length
-        Sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $exePath).Hash.ToLowerInvariant()
+        Bytes = $exeRecord.bytes
+        Sha256 = $exeRecord.sha256
         AuthenticodeStatus = $signatureStatus
     }
 }
@@ -431,10 +455,15 @@ function Add-ReleaseMetadata {
     $manifestJson = $manifest | ConvertTo-Json -Depth 6
     [System.IO.File]::WriteAllText((Join-Path $StagingPath $manifestName), $manifestJson + "`n", $utf8NoBom)
 
+    $recordsByName = @{}
+    foreach ($record in $artifactRecords) {
+        $recordsByName[$record.file] = $record
+    }
+    $recordsByName[$manifestName] = Get-FileRecord -Directory $StagingPath -Name $manifestName
+
     $checksumNames = @($payloadNames + $manifestName)
     $checksumLines = @($checksumNames | ForEach-Object {
-        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $StagingPath $_)).Hash.ToLowerInvariant()
-        "$hash *$_"
+        "$($recordsByName[$_].sha256) *$_"
     })
     [System.IO.File]::WriteAllText((Join-Path $StagingPath $checksumName), ($checksumLines -join "`n") + "`n", $utf8NoBom)
 }
@@ -489,6 +518,7 @@ function Move-FolderRelease {
 
     $oldMoved = $false
     $newMoved = $false
+    $validation = $null
     try {
         if (Test-Path -LiteralPath $DestinationPath) {
             Assert-NoReparseTree -Path $DestinationPath
@@ -498,7 +528,7 @@ function Move-FolderRelease {
 
         Move-Item -LiteralPath $StagingPath -Destination $DestinationPath
         $newMoved = $true
-        [void] (Test-ReleaseOutput -OutputPath $DestinationPath -Definition $Definition)
+        $validation = Test-ReleaseOutput -OutputPath $DestinationPath -Definition $Definition
     }
     catch {
         if ($newMoved -and (Test-Path -LiteralPath $DestinationPath)) {
@@ -519,6 +549,8 @@ function Move-FolderRelease {
             -Parent $desktopRoot `
             -ReleaseLabel 'Folder'
     }
+
+    return $validation
 }
 
 function Move-OneClickRelease {
@@ -536,6 +568,7 @@ function Move-OneClickRelease {
     $incomingPaths = @{}
     $installedNames = @()
     $movedOldNames = @()
+    $validation = $null
     try {
         foreach ($name in $releaseNames) {
             $incomingPath = Join-Path $repositoryRoot ".$name.incoming-$([Guid]::NewGuid().ToString('N'))"
@@ -559,7 +592,7 @@ function Move-OneClickRelease {
             $installedNames += $name
         }
 
-        [void] (Test-ReleaseOutput -OutputPath $repositoryRoot -Definition $Definition)
+        $validation = Test-ReleaseOutput -OutputPath $repositoryRoot -Definition $Definition
     }
     catch {
         foreach ($name in $installedNames) {
@@ -591,6 +624,8 @@ function Move-OneClickRelease {
         -Path $backupPath `
         -Parent $buildRoot `
         -ReleaseLabel 'One-click'
+
+    return $validation
 }
 
 [void] (Assert-ExactPath -Candidate $scriptPath -Expected (Join-Path $buildRoot 'Publish-MishaWeb.ps1') -Label 'Release script')
@@ -701,6 +736,8 @@ try {
         throw 'Another release operation is already running for this workspace.'
     }
 
+    Clear-StaleBackupDirectories
+
     if (Test-Path -LiteralPath $stagingRoot) {
         $stagingRootItem = Get-Item -Force -LiteralPath $stagingRoot
         if (($stagingRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
@@ -745,7 +782,7 @@ try {
         "-p:PublishSelfContained=$selfContainedText"
     )
 
-    Invoke-DotNet -Arguments @(
+    $publishArguments = @(
         'publish', $projectPath,
         '--configuration', 'Release',
         '--runtime', 'win-x64',
@@ -764,6 +801,10 @@ try {
         '-p:ContinuousIntegrationBuild=true',
         '-p:Deterministic=true'
     )
+    if ($definition.SelfContained) {
+        $publishArguments += '-p:EnableCompressionInSingleFile=true'
+    }
+    Invoke-DotNet -Arguments $publishArguments
 
     $rawPublishItems = @(Get-ChildItem -Force -LiteralPath $stagingPath)
     if ($rawPublishItems.Count -ne 1 -or $rawPublishItems[0].PSIsContainer -or $rawPublishItems[0].Name -ne 'MishaWeb.exe') {
@@ -791,16 +832,15 @@ try {
     }
 
     Add-ReleaseMetadata -StagingPath $stagingPath -Definition $definition -SdkVersion $dotnetSdkVersion
-    $stagedValidation = Test-ReleaseOutput -OutputPath $stagingPath -Definition $definition
+    [void] (Test-ReleaseOutput -OutputPath $stagingPath -Definition $definition)
 
     if ($Mode -eq 'OneClick') {
-        Move-OneClickRelease -StagingPath $stagingPath -Definition $definition
+        $finalValidation = Move-OneClickRelease -StagingPath $stagingPath -Definition $definition
     }
     else {
-        Move-FolderRelease -StagingPath $stagingPath -DestinationPath $definition.OutputPath -Definition $definition
+        $finalValidation = Move-FolderRelease -StagingPath $stagingPath -DestinationPath $definition.OutputPath -Definition $definition
     }
 
-    $finalValidation = Test-ReleaseOutput -OutputPath $definition.OutputPath -Definition $definition
     Write-Host "Published $Mode release: $($finalValidation.Executable)"
     Write-Host "Bytes: $($finalValidation.Bytes)"
     Write-Host "SHA-256: $($finalValidation.Sha256)"
