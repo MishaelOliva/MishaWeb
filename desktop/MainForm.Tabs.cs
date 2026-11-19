@@ -17,7 +17,8 @@ public sealed partial class MainForm
         bool waitForPopupNavigation = false,
         bool canScriptClose = false,
         bool isPinned = false,
-        string? trustedExtensionId = null)
+        string? trustedExtensionId = null,
+        bool trimWhenDiscarded = true)
     {
         if (isClosing) return null;
         if (tabs.Count >= MaximumTabs)
@@ -78,7 +79,7 @@ public sealed partial class MainForm
 
         if (!activate && !waitForPopupNavigation)
         {
-            MarkTabDiscarded(tab, "Waiting in the background");
+            MarkTabDiscarded(tab, "Waiting in the background", trimProcessMemory: trimWhenDiscarded);
             return tab;
         }
 
@@ -660,8 +661,8 @@ public sealed partial class MainForm
         }
         tab.ZoomFactor = 1.0;
         tab.IsMuted = false;
-        ShowNativeStartPage(tab);
         tab.IsStartPage = true;
+        ShowNativeStartPage(tab);
         tab.IsDiscarded = false;
         tab.Url = StartPage.Url;
         tab.Title = isPrivateMode ? "Incognito" : "New tab";
@@ -940,7 +941,6 @@ public sealed partial class MainForm
                 {
                     tabStrip.ScrollControlIntoView(tab.Header);
                 }
-                ApplyMultiViewLayout();
             }
             else
             {
@@ -1035,7 +1035,7 @@ public sealed partial class MainForm
 
     private async Task RestoreDiscardedTabAsync(BrowserTab tab, bool focusPage)
     {
-        if (isClosing || tab.IsClosed || !tab.IsDiscarded) return;
+        if (isClosing || tab.IsClosed || !tab.IsDiscarded || tab.IsInitializing) return;
         if (!CanContinueRequiredTabInitialization(tab)) return;
         if (tab.IsStartPage)
         {
@@ -1088,7 +1088,7 @@ public sealed partial class MainForm
         }
     }
 
-    private void MarkTabDiscarded(BrowserTab tab, string detail)
+    private void MarkTabDiscarded(BrowserTab tab, string detail, bool trimProcessMemory = true)
     {
         tab.NavigationRequestId++;
         tab.IsDiscarded = true;
@@ -1106,7 +1106,7 @@ public sealed partial class MainForm
         if (!restoringSession)
         {
             RefreshNativeStartPages();
-            TrimAllProcessMemory(allowManagedGc: true);
+            if (trimProcessMemory) TrimAllProcessMemory(allowManagedGc: true);
             RefreshMemorySweepTimer();
         }
     }
@@ -1193,6 +1193,7 @@ public sealed partial class MainForm
             if (!isPrivateMode) ScheduleStateSave();
         }
 
+        if (activeTabBeforeDrag == tab) activeTabBeforeDrag = null;
         if (wasActive)
         {
             activeTab = null;
@@ -1203,6 +1204,7 @@ public sealed partial class MainForm
         tab.IsClosed = true;
         tabs.RemoveAt(index);
         mruTabs.Remove(tab);
+        var wasMultiView = multiViewState.IsMultiViewActive;
         if (multiViewState.ContainsTab(tab.Id))
         {
             var replacement = tabs.FirstOrDefault(candidate =>
@@ -1248,13 +1250,27 @@ public sealed partial class MainForm
             else
             {
                 ApplyMultiViewLayout();
+                RefreshLiveTabMemoryTargets();
+                ScheduleStateSave();
                 UpdateStatus();
             }
         }
         else
         {
-            if (wasActive) ActivateTab(tabs[Math.Min(index, tabs.Count - 1)]);
-            else UpdateStatus();
+            if (wasActive)
+            {
+                ActivateTab(tabs[Math.Min(index, tabs.Count - 1)]);
+            }
+            else
+            {
+                if (wasMultiView)
+                {
+                    ApplyMultiViewLayout();
+                    RefreshLiveTabMemoryTargets();
+                    ScheduleStateSave();
+                }
+                UpdateStatus();
+            }
         }
     }
 
@@ -1362,11 +1378,11 @@ public sealed partial class MainForm
         unloadItem.Enabled = CanUnloadTab(tab);
         AddMenuItem(tabMenu, "Close other tabs", string.Empty, () =>
         {
+            ActivateTab(tab);
             foreach (var other in tabs.Where(item => item != tab && !item.IsPinned).ToArray())
             {
                 CloseTab(other, ensureReplacement: false);
             }
-            ActivateTab(tab);
         });
         AddMenuItem(tabMenu, "Close tab", "Ctrl+W", () => CloseTab(tab));
         tabMenu.Show(screenLocation);
@@ -1493,18 +1509,21 @@ public sealed partial class MainForm
         return "W";
     }
 
-    private Bitmap? GetCachedFaviconCopy(string? hostKey)
+    private Bitmap? GetCachedFaviconCopy(string? hostKey, out int version)
     {
+        version = 0;
         if (isClosing || IsDisposed || hostKey is null) return null;
         if (!faviconCacheMap.TryGetValue(hostKey, out var node)) return null;
         faviconCacheOrder.Remove(node);
         faviconCacheOrder.AddLast(node);
         try
         {
+            version = node.Value.Version;
             return new Bitmap(node.Value.Icon);
         }
         catch
         {
+            version = 0;
             faviconCacheOrder.Remove(node);
             faviconCacheMap.Remove(hostKey);
             return null;
@@ -1544,9 +1563,10 @@ public sealed partial class MainForm
             catch { }
         }
 
-        var node = faviconCacheOrder.AddLast((hostKey, favicon16));
+        if (faviconVersionSequence == int.MaxValue) faviconVersionSequence = 0;
+        var version = ++faviconVersionSequence;
+        var node = faviconCacheOrder.AddLast((hostKey, favicon16, version));
         faviconCacheMap[hostKey] = node;
-        faviconCacheVersion++;
     }
 
     private void ClearFaviconCache()
@@ -1558,7 +1578,28 @@ public sealed partial class MainForm
         }
         faviconCacheOrder.Clear();
         faviconCacheMap.Clear();
-        faviconCacheVersion++;
+    }
+
+    private static Bitmap DecodeFavicon16(byte[] imageBytes)
+    {
+        using var rawStream = new MemoryStream(imageBytes, writable: false);
+        using var decoded = Image.FromStream(rawStream, useEmbeddedColorManagement: false, validateImageData: false);
+        var cachedIcon = new Bitmap(16, 16, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        try
+        {
+            using var graphics = Graphics.FromImage(cachedIcon);
+            graphics.Clear(Color.Transparent);
+            graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            graphics.DrawImage(decoded, new Rectangle(0, 0, 16, 16));
+            return cachedIcon;
+        }
+        catch
+        {
+            cachedIcon.Dispose();
+            throw;
+        }
     }
 
     private async Task RefreshTabFaviconAsync(
@@ -1596,34 +1637,51 @@ public sealed partial class MainForm
                 return;
             }
 
-            using var buffer = new MemoryStream();
-            await stream.CopyToAsync(buffer);
-            if (buffer.Length == 0 || buffer.Length > 512 * 1024) return;
+            const int maximumFaviconBytes = 512 * 1024;
+            var initialCapacity = stream.CanSeek && stream.Length > 0 && stream.Length <= maximumFaviconBytes
+                ? (int)stream.Length
+                : 4096;
+            using var buffer = new MemoryStream(initialCapacity);
+            var chunk = System.Buffers.ArrayPool<byte>.Shared.Rent(8192);
+            try
+            {
+                var totalRead = 0;
+                while (true)
+                {
+                    var read = await stream.ReadAsync(chunk.AsMemory(0, chunk.Length));
+                    if (read == 0) break;
+                    totalRead += read;
+                    if (totalRead > maximumFaviconBytes) return;
+                    buffer.Write(chunk, 0, read);
+                }
+                if (totalRead == 0) return;
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(chunk);
+            }
+
             if (isClosing
                 || IsDisposed
                 || tab.IsClosed
+                || tab.IsStartPage
                 || !ReferenceEquals(tab.Core, core)
                 || tab.DocumentNavigationGeneration != documentGeneration)
             {
                 return;
             }
 
-            buffer.Position = 0;
-            using var decoded = Image.FromStream(buffer, useEmbeddedColorManagement: false, validateImageData: false);
-            var cachedIcon = new Bitmap(16, 16, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-            try
-            {
-                using var graphics = Graphics.FromImage(cachedIcon);
-                graphics.Clear(Color.Transparent);
-                graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                graphics.DrawImage(decoded, new Rectangle(0, 0, 16, 16));
-            }
-            catch
+            var imageBytes = buffer.ToArray();
+            var cachedIcon = await Task.Run(() => DecodeFavicon16(imageBytes));
+            if (isClosing
+                || IsDisposed
+                || tab.IsClosed
+                || tab.IsStartPage
+                || !ReferenceEquals(tab.Core, core)
+                || tab.DocumentNavigationGeneration != documentGeneration)
             {
                 cachedIcon.Dispose();
-                throw;
+                return;
             }
             StoreFaviconInCache(hostKey, cachedIcon);
 
@@ -1654,7 +1712,10 @@ public sealed partial class MainForm
         tabDragScreenLocation = screenLocation;
         tab.Header.SetDragging(true);
         tabDragGhost.SetState(tab.Title, IsHighContrastActive);
-        ActivateTab(tab, focusPage: false, restoreDiscarded: false);
+        if (!multiViewState.IsMultiViewActive || multiViewState.ContainsTab(tab.Id))
+        {
+            ActivateTab(tab, focusPage: false, restoreDiscarded: false);
+        }
         UpdateTabDrag(screenLocation);
     }
 
@@ -1689,6 +1750,7 @@ public sealed partial class MainForm
 
         UpdateTabDrag(screenLocation);
         var targetIndex = tabDragDropIndex;
+        var previousActive = activeTabBeforeDrag;
         CancelTabDrag();
         if (targetIndex >= 0)
         {
@@ -1696,7 +1758,15 @@ public sealed partial class MainForm
         }
         else
         {
-            TryDropTabOntoMultiViewPane(tab, screenLocation);
+            activeTabBeforeDrag = previousActive;
+            try
+            {
+                TryDropTabOntoMultiViewPane(tab, screenLocation);
+            }
+            finally
+            {
+                activeTabBeforeDrag = null;
+            }
         }
     }
 
@@ -1704,6 +1774,7 @@ public sealed partial class MainForm
     {
         draggedTab?.Header.SetDragging(false);
         draggedTab = null;
+        activeTabBeforeDrag = null;
         tabDragDropIndex = -1;
         tabDragIndicatorIndex = -1;
         tabDropIndicator.Visible = false;
@@ -1840,15 +1911,14 @@ public sealed partial class MainForm
             tab.LoadedFaviconVersion = 0;
             tab.Header.SetFavicon(null, null, webTab: false);
         }
-        else if (hostKey is not null && faviconCacheMap.ContainsKey(hostKey))
+        else if (hostKey is not null && faviconCacheMap.TryGetValue(hostKey, out var cachedNode))
         {
             if (!string.Equals(tab.LoadedFaviconHostKey, hostKey, StringComparison.OrdinalIgnoreCase)
-                || tab.LoadedFaviconVersion != faviconCacheVersion)
+                || tab.LoadedFaviconVersion != cachedNode.Value.Version)
             {
-                var copy = GetCachedFaviconCopy(hostKey);
+                var copy = GetCachedFaviconCopy(hostKey, out var cacheVersion);
                 if (copy is not null)
                 {
-                    var cacheVersion = faviconCacheVersion;
                     try
                     {
                         tab.Header.SetFavicon(copy, monogram, webTab: true);

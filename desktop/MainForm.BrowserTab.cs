@@ -106,7 +106,7 @@ public sealed partial class MainForm
         public int SavedScrollY { get; set; }
         public int PendingRestoreScrollY { get; set; }
         public string? LoadedFaviconHostKey { get; set; }
-        public long LoadedFaviconVersion { get; set; }
+        public int LoadedFaviconVersion { get; set; }
         public bool SupportsMemoryUsageTarget { get; set; } = true;
         public CoreWebView2MemoryUsageTargetLevel? MemoryUsageTargetLevel { get; set; }
         public bool CanScriptClose { get; set; }

@@ -141,9 +141,24 @@ internal static class BrowserPolicy
 
     public static bool UrlEquals(string left, string right) => UrlComparer.Equals(left, right);
 
+    private static readonly HashSet<string> HighRiskDownloadExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".exe", ".msi", ".msp", ".msix", ".appx",
+        ".bat", ".cmd", ".ps1", ".psm1", ".psd1",
+        ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh",
+        ".hta", ".lnk", ".url", ".scf", ".scr",
+        ".pif", ".com", ".cpl", ".reg", ".dll",
+        ".sys", ".drv", ".ocx", ".jar", ".iso", ".img", ".vhd", ".vhdx"
+    };
+
     public static bool IsSafeTopLevelUrl(string url, bool allowFileScheme = false)
     {
-        if (url.Length > MaximumUrlLength) return false;
+        if (string.IsNullOrWhiteSpace(url)
+            || url.Length > MaximumUrlLength
+            || ContainsControlChars(url))
+        {
+            return false;
+        }
 
         if (allowFileScheme && TryNormalizeLocalFileUrl(url, out _))
         {
@@ -151,7 +166,8 @@ internal static class BrowserPolicy
         }
 
         return Uri.TryCreate(url, UriKind.Absolute, out var absoluteUri)
-            && (absoluteUri.Scheme == Uri.UriSchemeHttp || absoluteUri.Scheme == Uri.UriSchemeHttps);
+            && (absoluteUri.Scheme == Uri.UriSchemeHttp || absoluteUri.Scheme == Uri.UriSchemeHttps)
+            && !string.IsNullOrWhiteSpace(absoluteUri.IdnHost);
     }
 
     public static bool IsPopupBootstrapUrl(string? url)
@@ -174,9 +190,47 @@ internal static class BrowserPolicy
 
     public static bool IsHttpUrl(string url)
     {
-        return url.Length <= MaximumUrlLength
+        return !string.IsNullOrWhiteSpace(url)
+            && url.Length <= MaximumUrlLength
+            && !ContainsControlChars(url)
             && Uri.TryCreate(url, UriKind.Absolute, out var uri)
-            && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
+            && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+            && !string.IsNullOrWhiteSpace(uri.IdnHost);
+    }
+
+    public static bool IsSafeDownloadUri(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url)
+            || url.Length > MaximumUrlLength
+            || ContainsControlChars(url)
+            || !Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            return false;
+        }
+
+        if (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+        {
+            return !string.IsNullOrWhiteSpace(uri.IdnHost);
+        }
+
+        if (uri.Scheme.Equals("blob", StringComparison.OrdinalIgnoreCase))
+        {
+            var innerUrl = url[5..];
+            return Uri.TryCreate(innerUrl, UriKind.Absolute, out var inner)
+                && (inner.Scheme == Uri.UriSchemeHttp || inner.Scheme == Uri.UriSchemeHttps)
+                && !string.IsNullOrWhiteSpace(inner.IdnHost)
+                && inner.AbsolutePath.Length > 1;
+        }
+
+        return uri.Scheme.Equals("data", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool IsHighRiskDownloadExtension(string? filePathOrName)
+    {
+        if (string.IsNullOrWhiteSpace(filePathOrName)) return false;
+        var trimmed = filePathOrName.Trim();
+        var extension = Path.GetExtension(trimmed);
+        return !string.IsNullOrEmpty(extension) && HighRiskDownloadExtensions.Contains(extension);
     }
 
     public static bool IsLocalFileUrl(string? url) =>

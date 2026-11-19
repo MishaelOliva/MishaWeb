@@ -69,9 +69,7 @@ public sealed partial class MainForm
         {
             "BackForwardCache",
             "SpareRendererForSitePerProcess",
-            "PeriodicBackgroundSync",
-            "AudioServiceOutOfProcess",
-            "AudioServiceSandbox"
+            "PeriodicBackgroundSync"
         })
         {
             if (disableFeatureSet.Add(feature)) disableFeatures.Add(feature);
@@ -367,7 +365,7 @@ public sealed partial class MainForm
 
     private void SyncDomFullScreenFromActiveTab()
     {
-        if (isClosing || activeTab?.Core is null)
+        if (isClosing || IsDisposed || activeTab?.Core is null)
         {
             if (isDomFullScreen)
             {
@@ -378,7 +376,18 @@ public sealed partial class MainForm
             return;
         }
 
-        SetDomFullScreen(activeTab.Core.ContainsFullScreenElement);
+        try
+        {
+            SetDomFullScreen(activeTab.Core.ContainsFullScreenElement);
+        }
+        catch (Exception error) when (
+            error is InvalidOperationException
+                or COMException
+                or ObjectDisposedException)
+        {
+            if (isDomFullScreen) SetDomFullScreen(false);
+            stateStore.Log("Could not inspect fullscreen state", error);
+        }
     }
 
     private void SetDomFullScreen(bool value)
@@ -755,6 +764,17 @@ public sealed partial class MainForm
                 // WebView2 requires resource filters for popup contents to be
                 // added only after the CoreWebView2 has been assigned here.
                 await InstallAdBlockFilteringAsync(popup);
+                if (isClosing || IsDisposed || popup.IsClosed || popup.Core is null)
+                {
+                    e.NewWindow = null;
+                    popupAttached = false;
+                    if (!popup.IsClosed)
+                    {
+                        CloseTab(popup, remember: false, ensureReplacement: false);
+                    }
+                    popup = null;
+                    return;
+                }
             }
             popup.Url = e.Uri;
             popup.IsStartPage = false;
@@ -807,6 +827,10 @@ public sealed partial class MainForm
                 InvalidateBrowserEnvironment();
                 foreach (var item in tabs.ToArray())
                 {
+                    if (item.IsStartPage && item.View is null)
+                    {
+                        continue;
+                    }
                     ReplaceTabView(item);
                     item.StatusText = "Browser process stopped";
                     item.ConnectionState = ConnectionState.Failed;
@@ -936,6 +960,21 @@ public sealed partial class MainForm
     private void OnDownloadStarting(BrowserTab tab, CoreWebView2DownloadStartingEventArgs e)
     {
         if (TryHandleChromeStoreExtensionDownload(tab, e)) return;
+        if (isClosing || IsDisposed || tab.IsClosed)
+        {
+            try
+            {
+                e.Cancel = true;
+                e.Handled = true;
+            }
+            catch (Exception error) when (
+                error is InvalidOperationException
+                    or COMException
+                    or ObjectDisposedException)
+            {
+            }
+            return;
+        }
         if (downloads.Count(item => !item.IsTerminal) >= MaximumActiveDownloads)
         {
             e.Cancel = true;
@@ -944,26 +983,151 @@ public sealed partial class MainForm
             return;
         }
 
+        string resultFilePath;
+        CoreWebView2DownloadOperation candidateOperation;
+        string? downloadUri;
+        try
+        {
+            resultFilePath = e.ResultFilePath;
+            candidateOperation = e.DownloadOperation;
+            downloadUri = candidateOperation.Uri;
+        }
+        catch (Exception error) when (
+            error is InvalidOperationException
+                or COMException
+                or ObjectDisposedException)
+        {
+            stateStore.Log("Could not inspect a download request", error);
+            return;
+        }
+
+        if (!BrowserPolicy.IsSafeDownloadUri(downloadUri))
+        {
+            try
+            {
+                e.Cancel = true;
+                e.Handled = true;
+            }
+            catch (Exception error) when (
+                error is InvalidOperationException
+                    or COMException
+                    or ObjectDisposedException)
+            {
+            }
+            ShowTransientStatus("Blocked an unsafe download address");
+            return;
+        }
+
+        if (BrowserPolicy.IsHighRiskDownloadExtension(resultFilePath))
+        {
+            CoreWebView2Deferral? deferral;
+            try
+            {
+                e.Cancel = true;
+                e.Handled = true;
+                deferral = e.GetDeferral();
+            }
+            catch (Exception error) when (
+                error is InvalidOperationException
+                    or COMException
+                    or ObjectDisposedException)
+            {
+                stateStore.Log("Could not defer a high-risk download prompt", error);
+                return;
+            }
+
+            var displayName = SanitizeDownloadDisplayName(Path.GetFileName(resultFilePath));
+            var sourceLabel = SanitizeExtensionPromptText(
+                TextSafety.FormatUrlForDisplay(downloadUri, 180),
+                180);
+            if (!PostUi(() =>
+            {
+                try
+                {
+                    if (isClosing || IsDisposed || tab.IsClosed) return;
+
+                    var promptText = string.IsNullOrWhiteSpace(sourceLabel)
+                        ? $"\"{displayName}\" is an executable or script file that could harm your computer. Download it anyway?"
+                        : $"\"{displayName}\" is an executable or script file that could harm your computer.{Environment.NewLine}{Environment.NewLine}Source: {sourceLabel}{Environment.NewLine}{Environment.NewLine}Download it anyway?";
+                    var allowed = NativeAlertDialog.Confirm(
+                        this,
+                        "Keep potentially harmful file?",
+                        promptText,
+                        confirmText: "Keep file",
+                        cancelText: "Discard");
+                    if (isClosing || IsDisposed || tab.IsClosed) return;
+                    if (!allowed)
+                    {
+                        ShowTransientStatus($"Discarded {displayName}");
+                        return;
+                    }
+
+                    e.Cancel = false;
+                    BeginTrackedDownload(tab, candidateOperation, resultFilePath);
+                }
+                catch (Exception error) when (
+                    error is InvalidOperationException
+                        or COMException
+                        or ObjectDisposedException)
+                {
+                    stateStore.Log("Could not complete a high-risk download prompt", error);
+                }
+                finally
+                {
+                    try { deferral.Complete(); }
+                    catch { }
+                }
+            }))
+            {
+                try { deferral.Complete(); }
+                catch { }
+            }
+            return;
+        }
+
         // MishaWeb owns the download surface and lifecycle from this point.
         // Suppress WebView2's separate default dialog so each download appears
         // exactly once and remains governed by the browser's close safeguards.
         e.Handled = true;
         var operation = e.DownloadOperation;
-        var entry = new DownloadEntry(
-            SanitizeDownloadDisplayName(Path.GetFileName(e.ResultFilePath)),
-            e.ResultFilePath,
-            operation.Uri,
-            DateTime.Now,
-            "Downloading");
-        entry.Operation = operation;
-        entry.BytesReceived = SafeDownloadBytes(operation.BytesReceived);
-        entry.TotalBytesToReceive = SafeDownloadBytes(operation.TotalBytesToReceive);
-        entry.CancelAction = operation.Cancel;
-        entry.PauseAction = operation.Pause;
-        entry.ResumeAction = operation.Resume;
-        entry.CanResume = operation.CanResume;
-        entry.EstimatedEndTimeText = FormatEstimatedEndTime(operation.EstimatedEndTime);
-        entry.InterruptReason = MapDownloadInterruptReason(operation.InterruptReason);
+        BeginTrackedDownload(tab, operation, resultFilePath);
+    }
+
+    private void BeginTrackedDownload(
+        BrowserTab tab,
+        CoreWebView2DownloadOperation operation,
+        string resultFilePath)
+    {
+        if (isClosing || IsDisposed || tab.IsClosed) return;
+
+        DownloadEntry entry;
+        try
+        {
+            entry = new DownloadEntry(
+                SanitizeDownloadDisplayName(Path.GetFileName(resultFilePath)),
+                resultFilePath,
+                operation.Uri,
+                DateTime.Now,
+                "Downloading");
+            entry.Operation = operation;
+            entry.BytesReceived = SafeDownloadBytes(operation.BytesReceived);
+            entry.TotalBytesToReceive = SafeDownloadBytes(operation.TotalBytesToReceive);
+            entry.CancelAction = operation.Cancel;
+            entry.PauseAction = operation.Pause;
+            entry.ResumeAction = operation.Resume;
+            entry.CanResume = operation.CanResume;
+            entry.EstimatedEndTimeText = FormatEstimatedEndTime(operation.EstimatedEndTime);
+            entry.InterruptReason = MapDownloadInterruptReason(operation.InterruptReason);
+        }
+        catch (Exception error) when (
+            error is InvalidOperationException
+                or COMException
+                or ObjectDisposedException)
+        {
+            stateStore.Log("Could not start tracking a download", error);
+            return;
+        }
+
         downloads.Insert(0, entry);
         TrimDownloadRecords();
         downloadsButtonAutoVisible = true;
@@ -980,27 +1144,46 @@ public sealed partial class MainForm
         EventHandler<object>? stateChanged = null;
         stateChanged = (_, _) =>
         {
-            entry.BytesReceived = SafeDownloadBytes(operation.BytesReceived);
-            entry.TotalBytesToReceive = SafeDownloadBytes(operation.TotalBytesToReceive);
-            entry.FilePath = operation.ResultFilePath;
-            entry.FileName = SanitizeDownloadDisplayName(
-                Path.GetFileName(operation.ResultFilePath));
-            var isUserPaused = operation.State == CoreWebView2DownloadState.Interrupted
-                && operation.InterruptReason.ToString() is "UserCanceled" or "UserPaused"
-                && operation.CanResume;
-            entry.State = operation.State switch
+            if (isClosing || IsDisposed) return;
+            CoreWebView2DownloadState currentState;
+            CoreWebView2DownloadInterruptReason currentInterruptReason;
+            bool canResume;
+            bool isUserPaused;
+            try
             {
-                CoreWebView2DownloadState.Completed => "Complete",
-                CoreWebView2DownloadState.Interrupted when isUserPaused => "Paused",
-                CoreWebView2DownloadState.Interrupted => "Interrupted",
-                _ => "Downloading"
-            };
-            entry.CanResume = operation.CanResume;
-            entry.EstimatedEndTimeText = FormatEstimatedEndTime(operation.EstimatedEndTime);
-            entry.InterruptReason = isUserPaused ? "Paused by user" : MapDownloadInterruptReason(operation.InterruptReason);
+                entry.BytesReceived = SafeDownloadBytes(operation.BytesReceived);
+                entry.TotalBytesToReceive = SafeDownloadBytes(operation.TotalBytesToReceive);
+                entry.FilePath = operation.ResultFilePath;
+                entry.FileName = SanitizeDownloadDisplayName(
+                    Path.GetFileName(operation.ResultFilePath));
+                currentState = operation.State;
+                currentInterruptReason = operation.InterruptReason;
+                canResume = operation.CanResume;
+                isUserPaused = currentState == CoreWebView2DownloadState.Interrupted
+                    && currentInterruptReason.ToString() is "UserCanceled" or "UserPaused"
+                    && canResume;
+                entry.State = currentState switch
+                {
+                    CoreWebView2DownloadState.Completed => "Complete",
+                    CoreWebView2DownloadState.Interrupted when isUserPaused => "Paused",
+                    CoreWebView2DownloadState.Interrupted => "Interrupted",
+                    _ => "Downloading"
+                };
+                entry.CanResume = canResume;
+                entry.EstimatedEndTimeText = FormatEstimatedEndTime(operation.EstimatedEndTime);
+                entry.InterruptReason = isUserPaused ? "Paused by user" : MapDownloadInterruptReason(currentInterruptReason);
+            }
+            catch (Exception error) when (
+                error is InvalidOperationException
+                    or COMException
+                    or ObjectDisposedException)
+            {
+                stateStore.Log("Could not read download state update", error);
+                return;
+            }
 
-            var isTerminal = operation.State == CoreWebView2DownloadState.Completed
-                || (operation.State == CoreWebView2DownloadState.Interrupted && !isUserPaused);
+            var isTerminal = currentState == CoreWebView2DownloadState.Completed
+                || (currentState == CoreWebView2DownloadState.Interrupted && !isUserPaused);
             if (!entry.IsTerminal && isTerminal)
             {
                 entry.IsTerminal = true;
@@ -1019,7 +1202,7 @@ public sealed partial class MainForm
                         QueueBackgroundTabReduction(downloadTab);
                     }
                 }
-                if (operation.State == CoreWebView2DownloadState.Completed)
+                if (currentState == CoreWebView2DownloadState.Completed)
                 {
                     ShowTransientStatus($"Downloaded {entry.FileName}");
                 }
@@ -1039,15 +1222,37 @@ public sealed partial class MainForm
         operation.StateChanged += stateChanged;
         EventHandler<object> bytesChanged = (_, _) =>
         {
-            entry.BytesReceived = SafeDownloadBytes(operation.BytesReceived);
-            entry.TotalBytesToReceive = SafeDownloadBytes(operation.TotalBytesToReceive);
+            if (isClosing || IsDisposed) return;
+            try
+            {
+                entry.BytesReceived = SafeDownloadBytes(operation.BytesReceived);
+                entry.TotalBytesToReceive = SafeDownloadBytes(operation.TotalBytesToReceive);
+            }
+            catch (Exception error) when (
+                error is InvalidOperationException
+                    or COMException
+                    or ObjectDisposedException)
+            {
+                return;
+            }
             RefreshDownloadsUi();
         };
         entry.BytesReceivedChangedHandler = bytesChanged;
         operation.BytesReceivedChanged += bytesChanged;
         EventHandler<object> estimatedEndTimeChanged = (_, _) =>
         {
-            entry.EstimatedEndTimeText = FormatEstimatedEndTime(operation.EstimatedEndTime);
+            if (isClosing || IsDisposed) return;
+            try
+            {
+                entry.EstimatedEndTimeText = FormatEstimatedEndTime(operation.EstimatedEndTime);
+            }
+            catch (Exception error) when (
+                error is InvalidOperationException
+                    or COMException
+                    or ObjectDisposedException)
+            {
+                return;
+            }
             RefreshDownloadsUi();
         };
         entry.EstimatedEndTimeChangedHandler = estimatedEndTimeChanged;
@@ -1084,6 +1289,12 @@ public sealed partial class MainForm
             return;
         }
 
+        if (!IsAllowedExternalNavigation(requestedUri, isUserInitiated))
+        {
+            ShowTransientStatus("Blocked a restricted external protocol request");
+            return;
+        }
+
         CoreWebView2Deferral? deferral;
         try
         {
@@ -1096,6 +1307,8 @@ public sealed partial class MainForm
         }
 
         var scheme = Uri.TryCreate(requestedUri, UriKind.Absolute, out var uri) ? uri.Scheme : "external";
+        var safeScheme = SanitizeExtensionPromptText(scheme, 40);
+        var uriPreview = SanitizeExtensionPromptText(TextSafety.FormatUrlForDisplay(requestedUri, 180), 180);
         var originValue = NormalizePermissionOrigin(initiatingOrigin)
             ?? NormalizePermissionOrigin(tab.Url)
             ?? HostFromUrl(tab.Url);
@@ -1112,10 +1325,13 @@ public sealed partial class MainForm
                     return;
                 }
 
+                var promptDetail = string.IsNullOrWhiteSpace(uriPreview)
+                    ? $"Allow {origin} to open the '{safeScheme}' app?"
+                    : $"Allow {origin} to open the '{safeScheme}' app?{Environment.NewLine}{Environment.NewLine}{uriPreview}";
                 var allowed = NativeAlertDialog.Confirm(
                     this,
                     "Open an external app?",
-                    $"Allow {origin} to open the '{scheme}' app?",
+                    promptDetail,
                     confirmText: "Open app",
                     cancelText: "Cancel");
                 if (isClosing
@@ -2021,6 +2237,7 @@ public sealed partial class MainForm
             Title = "Capture page as PNG"
         };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        if (isClosing || IsDisposed || tab.IsClosed) return;
 
         try
         {
@@ -2045,6 +2262,7 @@ public sealed partial class MainForm
                 await tab.Core.CapturePreviewAsync(
                     CoreWebView2CapturePreviewImageFormat.Png,
                     stream);
+                if (isClosing || IsDisposed || tab.IsClosed) return;
             }
             else
             {
@@ -2052,7 +2270,7 @@ public sealed partial class MainForm
                 return;
             }
 
-            ShowTransientStatus($"Saved {Path.GetFileName(dialog.FileName)}");
+            if (!isClosing && !IsDisposed) ShowTransientStatus($"Saved {Path.GetFileName(dialog.FileName)}");
         }
         catch (Exception error)
         {
@@ -2407,7 +2625,7 @@ public sealed partial class MainForm
             if (args.PermissionKind == CoreWebView2PermissionKind.Autoplay)
             {
                 args.State = CoreWebView2PermissionState.Allow;
-                args.SavesInProfile = true;
+                args.SavesInProfile = !isPrivateMode;
                 deferral.Complete();
                 return;
             }
@@ -2893,7 +3111,31 @@ public sealed partial class MainForm
         bool requireActive,
         long initializationGeneration)
     {
-        var initializingEnvironment = await GetOrCreateEnvironmentAsync();
+        CoreWebView2Environment initializingEnvironment;
+        try
+        {
+            initializingEnvironment = await GetOrCreateEnvironmentAsync();
+        }
+        catch (Exception error)
+        {
+            if (isClosing || tab.IsClosed || tab.InitializationGeneration != initializationGeneration)
+            {
+                return false;
+            }
+            tab.IsInitializing = false;
+            tab.StatusText = "Tab failed";
+            stateStore.Log("Browser engine initialization failed", error);
+            ReplaceTabView(tab);
+            ShowTabOverlay(
+                tab,
+                "This tab could not start",
+                error.Message,
+                "Try again",
+                () => RecreateTabAsync(tab));
+            UpdateTabHeader(tab);
+            UpdateNavigationChrome();
+            return false;
+        }
         if (!IsTabInitializationCurrent(tab, initializationGeneration, requireActive)
             || environment != initializingEnvironment)
         {
@@ -2957,7 +3199,12 @@ public sealed partial class MainForm
                 if (tab.Core is null) tab.IsInitializing = false;
             }
             ReleaseBrowserEnvironmentIfIdle();
-            if (activeTab == tab && tab.IsDiscarded && !tab.IsClosed && !isClosing)
+            if (activeTab == tab
+                && tab.IsDiscarded
+                && !tab.IsClosed
+                && !isClosing
+                && !tab.IsInitializing
+                && tab.InitializationTask is null)
             {
                 RunUiTask(() => RestoreDiscardedTabAsync(tab, focusPage: true), "Could not restore the active tab");
             }
@@ -3069,10 +3316,6 @@ public sealed partial class MainForm
             && !tab.IsClosed)
         {
             MarkTabDiscarded(tab, "Waiting in the background");
-            if (activeTab == tab && !isClosing && !tab.IsClosed)
-            {
-                RunUiTask(() => RestoreDiscardedTabAsync(tab, focusPage: true), "Could not restore the active tab");
-            }
         }
     }
 
@@ -3106,9 +3349,19 @@ public sealed partial class MainForm
             handler => view.ZoomFactorChanged -= handler,
             (_, _) =>
             {
-                if (!IsCurrentCore()) return;
-                tab.ZoomFactor = Math.Clamp(view.ZoomFactor, BrowserStateStore.MinimumSiteZoom, BrowserStateStore.MaximumSiteZoom);
-                if (!applyingZoomPreference) SaveSiteZoomPreference(tab);
+                if (isClosing || IsDisposed || !IsCurrentCore()) return;
+                try
+                {
+                    tab.ZoomFactor = Math.Clamp(view.ZoomFactor, BrowserStateStore.MinimumSiteZoom, BrowserStateStore.MaximumSiteZoom);
+                    if (!applyingZoomPreference) SaveSiteZoomPreference(tab);
+                }
+                catch (Exception error) when (
+                    error is InvalidOperationException
+                        or COMException
+                        or ObjectDisposedException)
+                {
+                    stateStore.Log("Could not read tab zoom factor", error);
+                }
             });
         // None avoids WebView2's built-in tracking prevention from partitioning
         // IndexedDB, WebCrypto, and WebSockets across communication domains
@@ -3304,8 +3557,19 @@ public sealed partial class MainForm
             handler => core.IsDocumentPlayingAudioChanged -= handler,
             (_, _) =>
             {
-                if (!IsCurrentCore()) return;
-                tab.IsAudible = core.IsDocumentPlayingAudio;
+                if (isClosing || IsDisposed || !IsCurrentCore()) return;
+                try
+                {
+                    tab.IsAudible = core.IsDocumentPlayingAudio;
+                }
+                catch (Exception error) when (
+                    error is InvalidOperationException
+                        or COMException
+                        or ObjectDisposedException)
+                {
+                    stateStore.Log("Could not read tab audio state", error);
+                    return;
+                }
                 UpdateTabHeader(tab);
                 if (tab.IsAudible) tab.ConsecutiveSuspendFailures = 0;
                 ApplyLiveTabMemoryTarget(tab, IsTabForegroundForLifecycle(tab));

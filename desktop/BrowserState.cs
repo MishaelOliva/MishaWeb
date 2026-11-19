@@ -170,6 +170,7 @@ internal sealed class BrowserStateStore : IDisposable
     private readonly object backgroundWriterSync = new();
     private readonly object synchronousSaveSync = new();
     private readonly object persistenceSync = new();
+    private static readonly object LogSync = new();
     private readonly Action? beforeBackgroundWriteForTesting;
     private byte[]? pendingSerializedState;
     private Task backgroundWriterTask = Task.CompletedTask;
@@ -602,16 +603,18 @@ internal sealed class BrowserStateStore : IDisposable
         if (!diagnosticsEnabled) return;
         try
         {
-            var folder = Path.GetDirectoryName(logPath)!;
-            Directory.CreateDirectory(folder);
-            if (File.Exists(logPath) && new FileInfo(logPath).Length > 524_288)
+            var entry = $"[{DateTimeOffset.Now:O}] {operation}{Environment.NewLine}{error}{Environment.NewLine}{Environment.NewLine}";
+            lock (LogSync)
             {
-                File.Move(logPath, logPath + ".old", true);
-            }
+                var folder = Path.GetDirectoryName(logPath)!;
+                Directory.CreateDirectory(folder);
+                if (File.Exists(logPath) && new FileInfo(logPath).Length > 524_288)
+                {
+                    File.Move(logPath, logPath + ".old", true);
+                }
 
-            File.AppendAllText(
-                logPath,
-                $"[{DateTimeOffset.Now:O}] {operation}{Environment.NewLine}{error}{Environment.NewLine}{Environment.NewLine}");
+                File.AppendAllText(logPath, entry);
+            }
         }
         catch
         {
