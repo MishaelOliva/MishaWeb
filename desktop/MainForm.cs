@@ -445,11 +445,17 @@ public sealed partial class MainForm : Form
             {
                 _ = adBlocker.LoadAsync();
             }
-            if (this.startupAddress is not null || state.OpenTabs.Any(BrowserPolicy.IsHttpUrl))
+            Load += (_, _) =>
             {
-                _ = GetOrCreateEnvironmentAsync();
-            }
-            Load += (_, _) => RunUiTask(StartBrowserAsync, "MishaWeb could not start");
+                if (Application.MessageLoop)
+                {
+                    RunUiTask(StartBrowserAsync, "MishaWeb could not start");
+                }
+                else
+                {
+                    BeginInvoke(() => RunUiTask(StartBrowserAsync, "MishaWeb could not start"));
+                }
+            };
         }
         HandleCreated += (_, _) => ScheduleExternalNavigationDrain();
         FormClosing += OnFormClosing;
@@ -742,10 +748,19 @@ public sealed partial class MainForm : Form
     internal BrowserMode Mode => browserMode;
     internal bool IsPrivateMode => isPrivateMode;
 
+    private static void EnsureUiSynchronizationContext()
+    {
+        if (SynchronizationContext.Current is not WindowsFormsSynchronizationContext)
+        {
+            SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
+        }
+    }
+
     private async Task StartBrowserAsync()
     {
         try
         {
+            EnsureUiSynchronizationContext();
             ShowTransientStatus("Starting browser\u2026", false);
             if (priorUncleanShutdown)
             {
@@ -758,6 +773,7 @@ public sealed partial class MainForm : Form
                         : $"MishaWeb did not close cleanly last time. Restore your {webTabCount} open tabs from the previous session?",
                     "Restore tabs",
                     "Start fresh");
+                EnsureUiSynchronizationContext();
                 if (!restorePrevious)
                 {
                     foreach (var url in state.OpenTabs.Where(BrowserPolicy.IsHttpUrl).Reverse())
@@ -768,7 +784,13 @@ public sealed partial class MainForm : Form
                     state.OpenTabs.Clear();
                     state.PinnedOpenTabCount = 0;
                     state.ActiveTabIndex = null;
+                    state.MultiViewLayout = null;
                 }
+            }
+
+            if (startupAddress is not null || state.OpenTabs.Any(BrowserPolicy.IsHttpUrl))
+            {
+                _ = GetOrCreateEnvironmentAsync();
             }
 
             var restoredTabs = await RestoreOpenTabsFromStateAsync();

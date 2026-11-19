@@ -43,7 +43,23 @@ public sealed partial class MainForm
         }
 
         public WebView2? View { get; set; }
-        public CoreWebView2? Core => View?.CoreWebView2;
+        public CoreWebView2? Core
+        {
+            get
+            {
+                try
+                {
+                    return View?.CoreWebView2;
+                }
+                catch (Exception error) when (
+                    error is InvalidOperationException
+                        or COMException
+                        or ObjectDisposedException)
+                {
+                    return null;
+                }
+            }
+        }
         public Panel Host { get; }
         public TabHeader Header { get; }
         public NativeStartPage? StartPageView { get; set; }

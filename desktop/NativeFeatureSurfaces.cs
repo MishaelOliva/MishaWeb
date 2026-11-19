@@ -1726,12 +1726,24 @@ internal sealed class NativeAlertDialog : Form
         NativeUiTheme.Apply(this, primaryButton);
         badge.BackColor = SystemInformation.HighContrast ? SystemColors.Window : NativeUiTheme.Window;
         AcceptButton = primaryButton;
+        Shown += (_, _) => primaryButton.Focus();
     }
 
     internal static void ShowInfo(IWin32Window? owner, string title, string message, string okText = "OK")
     {
-        using var dialog = new NativeAlertDialog(title, message, isConfirmation: false, okText, secondaryText: null, hasOwner: owner is not null);
-        _ = dialog.ShowDialog(owner);
+        var hadWinFormsSyncContext = SynchronizationContext.Current is WindowsFormsSynchronizationContext;
+        try
+        {
+            using var dialog = new NativeAlertDialog(title, message, isConfirmation: false, okText, secondaryText: null, hasOwner: owner is not null);
+            _ = dialog.ShowDialog(owner);
+        }
+        finally
+        {
+            if (hadWinFormsSyncContext && SynchronizationContext.Current is not WindowsFormsSynchronizationContext)
+            {
+                SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
+            }
+        }
     }
 
     internal static bool Confirm(
@@ -1741,7 +1753,18 @@ internal sealed class NativeAlertDialog : Form
         string confirmText = "Continue",
         string cancelText = "Cancel")
     {
-        using var dialog = new NativeAlertDialog(title, message, isConfirmation: true, confirmText, cancelText, hasOwner: owner is not null);
-        return dialog.ShowDialog(owner) == DialogResult.OK;
+        var hadWinFormsSyncContext = SynchronizationContext.Current is WindowsFormsSynchronizationContext;
+        try
+        {
+            using var dialog = new NativeAlertDialog(title, message, isConfirmation: true, confirmText, cancelText, hasOwner: owner is not null);
+            return dialog.ShowDialog(owner) == DialogResult.OK;
+        }
+        finally
+        {
+            if (hadWinFormsSyncContext && SynchronizationContext.Current is not WindowsFormsSynchronizationContext)
+            {
+                SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
+            }
+        }
     }
 }
