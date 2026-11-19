@@ -58,7 +58,7 @@ internal sealed class SmartSearchBar : UserControl
     private static readonly Font HintFont = new("Segoe UI", 7.6f);
 
     private readonly GlassSurface surface = new();
-    private readonly TableLayoutPanel layout = new();
+    private readonly DoubleBufferedTableLayoutPanel layout = new();
     private readonly SearchGlyph icon = new();
     private readonly TextBox input = new();
     private readonly Label modeLabel = new();
@@ -68,6 +68,10 @@ internal sealed class SmartSearchBar : UserControl
     private readonly ToolTip toolTip = new();
     private string providerId = BrowserPolicy.DefaultSearchProviderId;
     private SmartSearchPresentation presentation;
+    private bool hasPresentedState;
+    private string lastToolTipText = string.Empty;
+    private bool compactMinimumSize;
+    private int lastAppliedCompactState = -1;
 
     public SmartSearchBar()
     {
@@ -218,7 +222,6 @@ internal sealed class SmartSearchBar : UserControl
             if (input.Text == (value ?? string.Empty)) return;
             input.Text = value ?? string.Empty;
             input.SelectionStart = input.TextLength;
-            UpdatePresentation();
         }
     }
 
@@ -392,12 +395,20 @@ internal sealed class SmartSearchBar : UserControl
         toolTip.SetToolTip(providerButton, "Choose search engine");
     }
 
+    internal void SetCompactMinimumSize(bool enabled)
+    {
+        if (compactMinimumSize == enabled) return;
+        compactMinimumSize = enabled;
+        ApplyDpiMetrics();
+    }
+
     private void UpdatePresentation()
     {
+        SmartSearchPresentation nextPresentation;
         var value = input.Text.Trim();
         if (value.Length == 0)
         {
-            presentation = new SmartSearchPresentation(
+            nextPresentation = new SmartSearchPresentation(
                 SmartSearchClassification.Empty,
                 "Search or open a site",
                 "Go",
@@ -408,7 +419,7 @@ internal sealed class SmartSearchBar : UserControl
             var resolution = BrowserPolicy.ResolveAddress(value, providerId);
             if (resolution.Error is not null)
             {
-                presentation = new SmartSearchPresentation(
+                nextPresentation = new SmartSearchPresentation(
                     SmartSearchClassification.Invalid,
                     "Check this address",
                     "Go",
@@ -416,7 +427,7 @@ internal sealed class SmartSearchBar : UserControl
             }
             else if (BrowserPolicy.IsRecognizedAddressInput(value))
             {
-                presentation = new SmartSearchPresentation(
+                nextPresentation = new SmartSearchPresentation(
                     SmartSearchClassification.Address,
                     "Open website",
                     "Open",
@@ -424,7 +435,7 @@ internal sealed class SmartSearchBar : UserControl
             }
             else
             {
-                presentation = new SmartSearchPresentation(
+                nextPresentation = new SmartSearchPresentation(
                     SmartSearchClassification.Search,
                     $"Search with {BrowserPolicy.GetSearchProviderName(providerId)}",
                     "Search",
@@ -432,27 +443,42 @@ internal sealed class SmartSearchBar : UserControl
             }
         }
 
-        modeLabel.Text = presentation.Label;
-        modeLabel.AccessibleName = presentation.Label;
-        input.AccessibleDescription = presentation.Error.Length == 0
-            ? "Type search terms or a website address. Press Enter to continue."
-            : $"{presentation.Error}. Correct the value and try again.";
-        actionButton.Text = presentation.ActionText;
-        actionButton.Enabled = presentation.CanSubmit;
-        actionButton.AccessibleName = presentation.Classification switch
+        if (!hasPresentedState || nextPresentation != presentation)
         {
-            SmartSearchClassification.Search => "Search",
-            SmartSearchClassification.Address => "Open website",
-            SmartSearchClassification.Invalid => "Invalid address",
-            _ => "Go"
-        };
-        actionButton.AccessibleDescription = presentation.Error.Length == 0
-            ? $"{presentation.ActionText} the current command"
-            : presentation.Error;
-        toolTip.SetToolTip(this, presentation.Error.Length == 0 ? presentation.Label : presentation.Error);
-        ApplyResponsiveVisibility();
+            presentation = nextPresentation;
+            hasPresentedState = true;
+
+            modeLabel.Text = presentation.Label;
+            modeLabel.AccessibleName = presentation.Label;
+            input.AccessibleDescription = presentation.Error.Length == 0
+                ? "Type search terms or a website address. Press Enter to continue."
+                : $"{presentation.Error}. Correct the value and try again.";
+            actionButton.Text = presentation.ActionText;
+            actionButton.Enabled = presentation.CanSubmit;
+            actionButton.AccessibleName = presentation.Classification switch
+            {
+                SmartSearchClassification.Search => "Search",
+                SmartSearchClassification.Address => "Open website",
+                SmartSearchClassification.Invalid => "Invalid address",
+                _ => "Go"
+            };
+            actionButton.AccessibleDescription = presentation.Error.Length == 0
+                ? $"{presentation.ActionText} the current command"
+                : presentation.Error;
+
+            var nextToolTip = presentation.Error.Length == 0 ? presentation.Label : presentation.Error;
+            if (!string.Equals(lastToolTipText, nextToolTip, StringComparison.Ordinal))
+            {
+                lastToolTipText = nextToolTip;
+                toolTip.SetToolTip(this, nextToolTip);
+            }
+        }
+
+        if (ApplyResponsiveVisibility())
+        {
+            layout.PerformLayout();
+        }
         surface.IsFocused = input.Focused || actionButton.Focused || providerButton.Focused;
-        Invalidate(true);
     }
 
     private void UpdateFocusState()
@@ -463,23 +489,33 @@ internal sealed class SmartSearchBar : UserControl
     private void ApplyResponsiveLayout()
     {
         if (layout.ColumnStyles.Count < 6) return;
-        ApplyResponsiveVisibility();
-        layout.PerformLayout();
-        Invalidate(true);
+        if (ApplyResponsiveVisibility())
+        {
+            layout.PerformLayout();
+            surface.Invalidate(false);
+        }
     }
 
-    private void ApplyResponsiveVisibility()
+    private bool ApplyResponsiveVisibility()
     {
-        if (layout.ColumnStyles.Count < 6) return;
+        if (layout.ColumnStyles.Count < 6) return false;
 
         var compact = Width > 0 && Width < Scale(CompactWidthLogical);
+        var micro = compactMinimumSize && Width > 0 && Width < Scale(260);
         var showHint = !compact
             && Width >= Scale(WideHintWidthLogical)
             && input.TextLength == 0;
+        var nextState = (compact ? 1 : 0) | (micro ? 2 : 0) | (showHint ? 4 : 0);
+        if (nextState == lastAppliedCompactState) return false;
+        lastAppliedCompactState = nextState;
 
         modeLabel.Visible = !compact;
         hintLabel.Visible = showHint;
         providerButton.Visible = !compact;
+        layout.ColumnStyles[0].SizeType = SizeType.Absolute;
+        layout.ColumnStyles[0].Width = Scale(micro ? 32 : 45);
+        layout.ColumnStyles[2].SizeType = SizeType.Absolute;
+        layout.ColumnStyles[2].Width = Scale(micro ? 2 : 8);
         layout.ColumnStyles[3].SizeType = SizeType.Absolute;
         layout.ColumnStyles[3].Width = showHint ? Scale(HintColumnWidthLogical) : 0;
         layout.ColumnStyles[4].SizeType = SizeType.Absolute;
@@ -487,11 +523,15 @@ internal sealed class SmartSearchBar : UserControl
         layout.ColumnStyles[5].SizeType = SizeType.Absolute;
         layout.ColumnStyles[5].Width = Scale(compact ? CompactActionWidthLogical : ActionWidthLogical);
         actionButton.Compact = compact;
+        return true;
     }
 
     private void ApplyDpiMetrics()
     {
-        MinimumSize = new Size(Scale(260), Scale(48));
+        MinimumSize = new Size(
+            Scale(compactMinimumSize ? 180 : 260),
+            Scale(compactMinimumSize ? 42 : 48));
+        lastAppliedCompactState = -1;
         surface.Padding = new Padding(Scale(2));
         surface.CornerRadius = Scale(20);
         layout.Padding = new Padding(Scale(7), Scale(5), Scale(7), Scale(5));
@@ -581,6 +621,19 @@ internal sealed class SmartSearchBar : UserControl
         finally
         {
             e.Graphics.Restore(state);
+        }
+    }
+
+    private sealed class DoubleBufferedTableLayoutPanel : TableLayoutPanel
+    {
+        public DoubleBufferedTableLayoutPanel()
+        {
+            DoubleBuffered = true;
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint
+                | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.ResizeRedraw,
+                true);
         }
     }
 

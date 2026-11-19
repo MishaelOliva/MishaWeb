@@ -1,8 +1,11 @@
 using System.Buffers.Binary;
 using System.Globalization;
 using System.IO.Compression;
+using System.Net;
+using System.Net.Http;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using MishaWeb;
 
 
@@ -83,6 +86,29 @@ if (args.Length == 1
     finally
     {
         DeleteMediaCaptureProbeFolder(probeFolder);
+    }
+}
+
+if (args.Length == 1
+    && args[0].Equals("--live-multiview-probe", StringComparison.Ordinal))
+{
+    var probeFolder = Path.Combine(
+        Path.GetTempPath(),
+        "MishaWeb-LiveMultiView-Probe-" + Environment.ProcessId + "-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var result = RunLiveMultiViewProbe(probeFolder);
+        Console.WriteLine(
+            $"ready={result.Ready}; panes={result.Panes}; liveWebViews={result.LiveWebViews}; "
+            + $"nonOverlapping={result.NonOverlapping}; actualWin32RectsMatch={result.ActualWin32RectsMatch}; "
+            + $"focusSwitch={result.FocusSwitch}; churnCycles={result.ChurnCycles}; udfCleaned={result.UdfCleaned}");
+        return result.Ready ? 0 : 1;
+    }
+    catch (Exception error)
+    {
+        var cause = error.GetBaseException();
+        Console.Error.WriteLine($"ready=False; error={cause.GetType().Name}: {cause.Message}");
+        return 1;
     }
 }
 
@@ -1156,7 +1182,8 @@ Check(
         && chromeStoreInstallBridge.Contains("event.isTrusted", StringComparison.Ordinal)
         && chromeStoreInstallBridge.Contains("177592", StringComparison.Ordinal)
         && chromeStoreInstallBridge.Contains("Install in MishaWeb", StringComparison.Ordinal)
-        && chromeStoreInstallBridge.Contains("MutationObserver", StringComparison.Ordinal)
+        && chromeStoreInstallBridge.Contains("navigatesuccess", StringComparison.Ordinal)
+        && !chromeStoreInstallBridge.Contains("MutationObserver", StringComparison.Ordinal)
         && chromeStoreInstallBridge.Contains("listingId", StringComparison.Ordinal)
         && chromeStoreInstallBridge.Contains("channel+':'+id", StringComparison.Ordinal)
         && chromeStoreInstallBridge.Contains("extension-install-channel", StringComparison.Ordinal));
@@ -3965,9 +3992,9 @@ var informationalVersion = System.Reflection.CustomAttributeExtensions
     .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(productAssembly)
     ?.InformationalVersion;
 Check(
-    "release assemblies carry the 2.4.1 product version",
-    productAssembly.GetName().Version == new Version(2, 4, 1, 0)
-        && informationalVersion == "2.4.1");
+    "release assemblies carry the 2.5.0 product version",
+    productAssembly.GetName().Version == new Version(2, 5, 0, 0)
+        && informationalVersion == "2.5.0");
 Check(
     "new sessions default to standard memory saver",
     new BrowserState().MemorySaverEnabled && new BrowserState().UltraLightModeEnabled == false);
@@ -4026,7 +4053,7 @@ Check(
         && loadingBackgroundMethod.Invoke(null, [false]) is Color lightLoadingColor
         && darkLoadingColor == NativeUiTheme.Window
         && lightLoadingColor == Color.White);
-var mainFormThemeSource = ReadRepositorySource("desktop", "MainForm.cs");
+var mainFormThemeSource = ReadMainFormSources();
 var nativeStartPageSecuritySource = ReadRepositorySource("desktop", "NativeStartPage.cs");
 var nativeFeatureSurfacesSource = ReadRepositorySource("desktop", "NativeFeatureSurfaces.cs");
 var savedItemsSecuritySource = ReadRepositorySource("desktop", "SavedItemsDialog.cs");
@@ -4215,7 +4242,9 @@ Check(
 Check(
     "browser-process recovery is posted after the WebView2 callback unwinds",
     configureWebViewSource.Contains("failedKind = e.ProcessFailedKind;", StringComparison.Ordinal)
-        && configureWebViewSource.Contains("BeginInvoke(new Action(() =>", StringComparison.Ordinal)
+        && configureWebViewSource.Contains("PostUi(() =>", StringComparison.Ordinal)
+        && mainFormThemeSource.Contains("private bool PostUi(Action action)", StringComparison.Ordinal)
+        && mainFormThemeSource.Contains("BeginInvoke(() =>", StringComparison.Ordinal)
         && configureWebViewSource.Contains(
             "OnProcessFailed(tab, failedKind);",
             StringComparison.Ordinal)
@@ -4227,14 +4256,20 @@ Check(
             > permissionCatchIndex
         && permissionRequestSource.IndexOf("CoreWebView2PermissionState.Deny", permissionCatchIndex, StringComparison.Ordinal)
             > permissionCatchIndex);
+var externalSchemeDeferralIndex = externalSchemeSource.IndexOf("e.GetDeferral()", StringComparison.Ordinal);
+var externalSchemePostUiIndex = externalSchemeSource.IndexOf("PostUi(", StringComparison.Ordinal);
+var externalSchemeDialogIndex = externalSchemeSource.IndexOf("NativeAlertDialog.Confirm", StringComparison.Ordinal);
 Check(
-    "external-app callbacks default-deny and contain apartment disconnects across user prompts",
+    "external-app callbacks default-deny, acquire a deferral, and prompt safely off the COM callback stack",
     externalSchemeSource.IndexOf("e.Cancel = true;", StringComparison.Ordinal)
             < externalSchemeSource.IndexOf("isUserInitiated = e.IsUserInitiated;", StringComparison.Ordinal)
         && externalSchemeSource.Contains("requestedUri = e.Uri;", StringComparison.Ordinal)
         && externalSchemeSource.Contains("initiatingOrigin = e.InitiatingOrigin;", StringComparison.Ordinal)
         && externalSchemeSource.Contains("e.Cancel = !allowed;", StringComparison.Ordinal)
-        && externalSchemeSource.Contains("tab.DocumentNavigationGeneration != documentGeneration", StringComparison.Ordinal));
+        && externalSchemeSource.Contains("tab.DocumentNavigationGeneration != documentGeneration", StringComparison.Ordinal)
+        && externalSchemeDeferralIndex >= 0
+        && externalSchemePostUiIndex > externalSchemeDeferralIndex
+        && externalSchemeDialogIndex > externalSchemePostUiIndex);
 Check(
     "native downloads suppress WebView2's duplicate default download dialog",
     normalDownloadHandledIndex >= 0
@@ -4357,7 +4392,13 @@ Check(
             "TextSafety.FormatUrlForDisplay(item.Url, MaximumDisplayUrlCharacters)",
             StringComparison.Ordinal)
         && addressSuggestionSecuritySource.Contains(
-            "TextSafety.FormatUrlForDisplay(candidate.Url, MaximumUrlCharactersToDisplay)",
+            "TextSafety.FormatUrlForDisplay(tab.Url, MaximumUrlCharactersToDisplay)",
+            StringComparison.Ordinal)
+        && addressSuggestionSecuritySource.Contains(
+            "TextSafety.FormatUrlForDisplay(url, MaximumUrlCharactersToDisplay)",
+            StringComparison.Ordinal)
+        && addressSuggestionSecuritySource.Contains(
+            "candidate.FormattedUrl",
             StringComparison.Ordinal)
         && addressSuggestionSecuritySource.Contains(
             "TextSafety.FormatUrlForDisplay(url, MaximumTitleCharactersToMatch)",
@@ -4607,8 +4648,11 @@ Check(
 Check(
     "an exact-host shield exception also permits its target document request",
     webResourceRequestedSecuritySource.Contains(
-        "IsExceptionHost(HostFromUrl(e.Request.Uri))",
-        StringComparison.Ordinal));
+        "var requestUri = request.Uri;",
+        StringComparison.Ordinal)
+        && webResourceRequestedSecuritySource.Contains(
+            "IsExceptionHost(HostFromUrl(requestUri))",
+            StringComparison.Ordinal));
 Check(
     "direct form disposal releases runtime queues and COM-backed records",
     mainFormDisposeSource.Contains("pendingExternalNavigations.Clear();", StringComparison.Ordinal)
@@ -4654,7 +4698,10 @@ Check(
         && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("addEventListener", StringComparison.Ordinal)
         && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("passive: true", StringComparison.Ordinal)
         && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("decoding = 'async'", StringComparison.Ordinal)
-        && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("font-display: swap", StringComparison.Ordinal)
+        && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("mouseover", StringComparison.Ordinal)
+        && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("currentAnchor", StringComparison.Ordinal)
+        && !BrowserPerformance.SiteResponsivenessDocumentScript.Contains("@font-face", StringComparison.Ordinal)
+        && !BrowserPerformance.SiteResponsivenessDocumentScript.Contains("pointerenter", StringComparison.Ordinal)
         && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("dns-prefetch", StringComparison.Ordinal));
 Check(
     "browser environment options configure GPU rasterization, zero-copy, and network acceleration",
@@ -4718,8 +4765,10 @@ Check(
     "YouTube document shield keeps the first-party player ad container compatible",
     !adBlockDocumentScript.Contains("'#player-ads'", StringComparison.Ordinal));
 Check(
-    "YouTube document shield keeps broad fallback cosmetics off the application shell",
-    adBlockDocumentScript.Contains("const selectors = isYouTube ? [] : [", StringComparison.Ordinal));
+    "YouTube document shield keeps broad fallback cosmetics off all pages and application shell",
+    adBlockDocumentScript.Contains("const selectors = [];", StringComparison.Ordinal)
+        && !adBlockDocumentScript.Contains("[id*=\"-ad-\"]", StringComparison.Ordinal)
+        && !adBlockDocumentScript.Contains("[class*=\"advert\"]", StringComparison.Ordinal));
 Check(
     "YouTube document shield does not replace inherited renderer methods",
     !adBlockDocumentScript.Contains("Object.defineProperty(Object.prototype", StringComparison.Ordinal)
@@ -4826,7 +4875,7 @@ Check(
     adBlockDocumentScript.Contains("const skipAdSelector = skipSelectors.join(',');", StringComparison.Ordinal)
         && adBlockDocumentScript.Contains("for (const button of document.querySelectorAll(skipAdSelector))", StringComparison.Ordinal)
         && adBlockDocumentScript.Contains("clickedSkipButtons.has(button)", StringComparison.Ordinal)
-        && adBlockDocumentScript.Contains("clickedSkipButtons.clear();", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("clickedSkipButtons = new WeakSet();", StringComparison.Ordinal)
         && !adBlockDocumentScript.Contains("for (const selector of skipSelectors)", StringComparison.Ordinal));
 Check(
     "urgent player passes are floored so an ad cannot storm the player API",
@@ -4956,8 +5005,9 @@ Check(
             && new[] { "location.hostname", "location.host", "isYouTube" }
                 .Any(marker => adBlockDocumentScript.Contains(marker, StringComparison.Ordinal))));
 Check(
-    "YouTube cleanup is activity-aware and sparse while pages are hidden",
-    adBlockDocumentScript.Contains("? 30_000", StringComparison.Ordinal)
+    "YouTube cleanup is activity-aware and pauses completely while hidden or off watch pages",
+    adBlockDocumentScript.Contains("if (!isEnabled() || document.hidden || !isYouTubeWatch()) return;", StringComparison.Ordinal)
+        && adBlockDocumentScript.Contains("visibilitychange", StringComparison.Ordinal)
         && adBlockDocumentScript.Contains("fastRecoveryPoll ? 250", StringComparison.Ordinal)
         && adBlockDocumentScript.Contains("window.setTimeout", StringComparison.Ordinal)
         && adBlockDocumentScript.Contains("playerObserver?.observe", StringComparison.Ordinal)
@@ -6432,6 +6482,63 @@ Check(
 Check(
     "SearchSuggestionService cache miss probe returns false synchronously",
     !SearchSuggestionService.Instance.TryGetCachedSuggestions("uncached_weak_laptop_probe", out _));
+Check(
+    "SearchSuggestionService handles caching, size caps, JSON validation, deduplication, caller cancellation, and circuit-breaker backoff",
+    VerifySearchSuggestionServiceContract());
+Check(
+    "AddressSuggestionEngine safely parses malformed percent-encoded search history queries",
+    VerifyMalformedHistoryPercentEncoding());
+Check(
+    "AddressSuggestionEngine.MergeWithLiveSearch enforces bounds, sanitization, URL deduplication, and strong vs weak ranking",
+    VerifyLiveMergeRankingAndBounds());
+Check(
+    "AddressSuggestionPopup preserves or resets selection across live updates according to preserveSelection",
+    VerifyAddressSuggestionPopupSelectionPreservation());
+Check(
+    "BrowserStateStore.FlushAsync normalizes and durably persists state asynchronously",
+    VerifyBrowserStateStoreFlushAsync());
+Check(
+    "MainForm.OnFormClosing completes bounded private-mode cleanup before locking isClosing",
+    VerifyOnFormClosingPrivateCleanupOrder(mainFormThemeSource));
+Check(
+    "AdBlockEngine $important overrides exceptions and short-circuits normal rules",
+    VerifyAdBlockImportantOverrideAndShortCircuit());
+Check(
+    "AdBlockEngine $badfilter cancels mixed-case option variants",
+    VerifyAdBlockBadfilterMixedCaseOptions());
+Check(
+    "AdBlockEngine CosmeticRuleSet batches selectors, shares generic CSS across hosts, and completes cached lookups synchronously",
+    VerifyCosmeticRuleSetBatchingAndSyncCache());
+Check(
+    "AdBlockEngine CanCommitFilterFile ignores corrupt sibling cache files",
+    VerifyAdBlockCanCommitWithCorruptSibling());
+Check(
+    "BrowserExtensions filters URL-scoped userscripts, caches directory scans, persists registry durably, and tolerates malformed icon manifests",
+    VerifyBrowserExtensionsPhase2Contracts());
+Check(
+    "StartPageArtwork 4-pane LRU cache retains 4 distinct viewports and releases cleanly at zero leases",
+    VerifyStartPageArtworkMultiPaneLruCache());
+Check(
+    "MainForm environment options tier flags by system memory without mutating WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+    VerifyEnvironmentOptionsTieringAndIsolation());
+Check(
+    "NativeStartPage adapts to 260x220 micro-pane dimensions without horizontal overflow or overlapping controls",
+    VerifyNativeStartPageMicroPaneLayout());
+Check(
+    "MultiViewLayoutEngine computes gapless non-overlapping Single, Split, Tri, and Quad panes and enforces clamping and swap rules",
+    VerifyMultiViewLayoutGeometryAndState());
+Check(
+    "TabLifecyclePolicy never suspends or discards visible Multi-View panes under Ultra memory pressure",
+    VerifyTabLifecycleProtectsMultiViewPanes());
+Check(
+    "BrowserStateStore persists SavedMultiViewLayout and remaps or drops invalid indices safely",
+    VerifyBrowserStateStoreMultiViewPersistence());
+Check(
+    "MainForm Multi-View progresses Single -> Split -> Tri -> Quad -> Single with 4 concurrent live start pages and responsive toolbar layout",
+    VerifyMainFormMultiViewProgressionSta());
+Check(
+    "UI controls exhibit zero GDI and USER handle growth across 200 layout and DrawToBitmap cycles",
+    VerifyControlsHaveZeroGdiAndUserHandleLeakSta());
 
 var attributionEngine = new AdBlockEngine(initialRules:
 [
@@ -7978,7 +8085,7 @@ bool CanPrepareRendererFreeBrowser()
 
 (bool AudibleGlyph, bool MutedGlyph, bool RefreshWired) VerifyTabAudioIndicator()
 {
-    var source = ReadRepositorySource("desktop", "MainForm.cs");
+    var source = ReadMainFormSources();
     var audioEventStart = source.IndexOf(
         "core.IsDocumentPlayingAudioChanged +=",
         StringComparison.Ordinal);
@@ -8099,7 +8206,7 @@ int CountPixelDifferences(Bitmap first, Bitmap second, Rectangle area)
 
 bool WindowCaptionDragUsesNativeMove()
 {
-    var source = ReadRepositorySource("desktop", "MainForm.cs");
+    var source = ReadMainFormSources();
     return source.Contains("titleBar.MouseDown += BeginWindowDrag;", StringComparison.Ordinal)
         && source.Contains("appMark.MouseDown += BeginWindowDrag;", StringComparison.Ordinal)
         && source.Contains("tabArea.MouseDown += BeginWindowDrag;", StringComparison.Ordinal)
@@ -8838,7 +8945,9 @@ bool CanRenderHighContrastChrome()
             downloadsBtn.PerformClick();
             Application.DoEvents();
 
-            lifecycleTransitions = transitionsOk && openActionOk && openedDownloadsList && !notification.Visible;
+            notification.Dismiss();
+            var releasedCurrentState = notification.CurrentStateForTesting is null;
+            lifecycleTransitions = transitionsOk && openActionOk && openedDownloadsList && !notification.Visible && releasedCurrentState;
 
             const System.Reflection.BindingFlags flags =
                 System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
@@ -8889,7 +8998,7 @@ bool FrontendSourcesAreEncodingClean()
 {
     var sources = new[]
     {
-        ReadRepositorySource("desktop", "MainForm.cs"),
+        ReadMainFormSources(),
         ReadRepositorySource("desktop", "NativeStartPage.cs"),
         ReadRepositorySource("desktop", "SmartSearchBar.cs"),
         ReadRepositorySource("desktop", "NativeFeatureSurfaces.cs"),
@@ -9119,6 +9228,25 @@ string ReadRepositorySource(params string[] parts)
 {
     var path = FindRepositoryFile(parts);
     return path is null ? string.Empty : File.ReadAllText(path);
+}
+
+string ReadMainFormSources()
+{
+    string[] parts =
+    [
+        "MainForm.cs",
+        "MainForm.Chrome.cs",
+        "MainForm.Tabs.cs",
+        "MainForm.WebView.cs",
+        "MainForm.AdBlock.cs",
+        "MainForm.Lifecycle.cs",
+        "MainForm.Extensions.cs",
+        "MainForm.Dialogs.cs",
+        "MainForm.MultiView.cs",
+        "MainForm.BrowserTab.cs",
+        "MainForm.Controls.cs"
+    ];
+    return string.Concat(parts.Select(name => ReadRepositorySource("desktop", name)));
 }
 
 /// <summary>
@@ -11750,4 +11878,1596 @@ bool VerifyNativeAlertDialogLifecycle()
     thread.Join();
     if (error is not null) Console.Error.WriteLine($"Tab favicon/audio-toggle probe failed: {error}");
     return (error is null && audioToggled, error is null && faviconHandled);
+}
+
+bool VerifyMalformedHistoryPercentEncoding()
+{
+    var state = new BrowserState
+    {
+        History =
+        [
+            new HistoryEntry("Google Search", "https://www.google.com/search?q=100%ZZ+match", DateTime.UtcNow)
+        ]
+    };
+    var results = AddressSuggestionEngine.GetSuggestions("100%", state);
+    return results.Any(item =>
+        item.Source == AddressSuggestionSource.History
+        && item.IsSearchHistory
+        && item.Title.Contains("100%ZZ", StringComparison.Ordinal));
+}
+
+bool VerifyLiveMergeRankingAndBounds()
+{
+    var state = new BrowserState
+    {
+        Bookmarks =
+        [
+            new BookmarkEntry("Very Long Title Match", "https://example.com/item")
+        ]
+    };
+    var strongFirst = new AddressSuggestion[]
+    {
+        new(0, AddressSuggestionSource.OpenTab, AddressSuggestionMatch.Prefix, "Open Site", "Switch to tab · https://example.com/", "https://example.com/", "https://example.com/"),
+        new(1, AddressSuggestionSource.History, AddressSuggestionMatch.Fuzzy, "Other Item", "other.example/", "https://other.example/", "https://other.example/")
+    };
+    var mergedStrong = AddressSuggestionEngine.MergeWithLiveSearch(
+        strongFirst,
+        ["  hello\nworld  ", "HELLO WORLD", "open site"],
+        "op",
+        state,
+        6);
+    if (mergedStrong.Count != 4
+        || mergedStrong[0].NavigationTarget != "https://example.com/"
+        || mergedStrong[1].Title != "hello world"
+        || !mergedStrong[^1].IsSearch)
+    {
+        return false;
+    }
+
+    var weakFuzzyFirst = new AddressSuggestion[]
+    {
+        new(0, AddressSuggestionSource.History, AddressSuggestionMatch.Fuzzy, "Weak Fuzzy", "weak.example/", "https://weak.example/", "https://weak.example/")
+    };
+    var mergedWeak = AddressSuggestionEngine.MergeWithLiveSearch(
+        weakFuzzyFirst,
+        ["live one", "live two"],
+        "liv",
+        state,
+        6);
+    return mergedWeak.Count == 4
+        && mergedWeak[0].IsSearch
+        && mergedWeak[0].Title == "live one"
+        && mergedWeak[1].Title == "live two"
+        && mergedWeak[2].NavigationTarget == "https://weak.example/"
+        && mergedWeak[^1].IsSearch;
+}
+
+bool VerifyAddressSuggestionPopupSelectionPreservation()
+{
+    Exception? error = null;
+    var ok = false;
+    var thread = new Thread(() =>
+    {
+        try
+        {
+            using var popup = new AddressSuggestionPopup();
+            var initial = new AddressSuggestion[]
+            {
+                new(0, AddressSuggestionSource.Bookmark, AddressSuggestionMatch.Prefix, "One", "one.example", "https://one.example/", "https://one.example/"),
+                new(1, AddressSuggestionSource.Bookmark, AddressSuggestionMatch.Prefix, "Two", "two.example", "https://two.example/", "https://two.example/"),
+                new(2, AddressSuggestionSource.Search, AddressSuggestionMatch.Search, "Search", "Google search", "x", "https://www.google.com/search?q=x")
+            };
+            popup.SetSuggestions(initial);
+            popup.SelectedIndex = 1;
+
+            var reordered = new AddressSuggestion[]
+            {
+                initial[0],
+                new(1, AddressSuggestionSource.Search, AddressSuggestionMatch.Search, "x live", "Google search", "x live", "https://www.google.com/search?q=x%20live"),
+                initial[1] with { KeyboardIndex = 2 },
+                initial[2] with { KeyboardIndex = 3 }
+            };
+            popup.SetSuggestions(reordered, preserveSelection: true);
+            var preserved = popup.TryGetSelected(out var selected)
+                && selected.NavigationTarget == "https://two.example/"
+                && popup.SelectedIndex == 2;
+
+            popup.SetSuggestions(reordered, preserveSelection: false);
+            var reset = !popup.TryGetSelected(out _) && popup.SelectedIndex == -1;
+            ok = preserved && reset;
+        }
+        catch (Exception caught)
+        {
+            error = caught;
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+    if (error is not null) Console.Error.WriteLine($"Popup selection probe failed: {error}");
+    return error is null && ok;
+}
+
+bool VerifyBrowserStateStoreFlushAsync()
+{
+    var tempDir = Path.Combine(
+        Path.GetTempPath(),
+        "MishaWeb-FlushTest-" + Environment.ProcessId + "-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        using var store = new BrowserStateStore(tempDir);
+        var state = new BrowserState
+        {
+            EnableLiveSearchSuggestions = false,
+            Bookmarks = [new BookmarkEntry("Flush Test", "https://flush.example/")]
+        };
+        var saved = store.FlushAsync(state).GetAwaiter().GetResult();
+        using var verifyStore = new BrowserStateStore(tempDir);
+        var loaded = verifyStore.Load();
+        return saved
+            && !loaded.EnableLiveSearchSuggestions
+            && loaded.Bookmarks.Any(b => b.Url == "https://flush.example/");
+    }
+    finally
+    {
+        if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+    }
+}
+
+bool VerifyOnFormClosingPrivateCleanupOrder(string mainFormSource)
+{
+    var onFormClosing = ExtractSourceSection(
+        mainFormSource,
+        "private void OnFormClosing(",
+        "private void DisposeAllTabs()");
+    var privateCleanupIndex = onFormClosing.IndexOf("privateCleanupInProgress = true;", StringComparison.Ordinal);
+    var isClosingIndex = onFormClosing.IndexOf("isClosing = true;", StringComparison.Ordinal);
+    return privateCleanupIndex >= 0
+        && isClosingIndex > privateCleanupIndex
+        && onFormClosing.Contains("privateCleanupCompleted = true;", StringComparison.Ordinal)
+        && onFormClosing.Contains("WaitAsync(TimeSpan.FromMilliseconds(750))", StringComparison.Ordinal);
+}
+
+bool VerifySearchSuggestionServiceContract()
+{
+    return VerifySearchSuggestionServiceContractAsync().GetAwaiter().GetResult();
+}
+
+async Task<bool> VerifySearchSuggestionServiceContractAsync()
+{
+    var timeProvider = new MutableFakeTimeProvider(new DateTimeOffset(2026, 7, 12, 12, 0, 0, TimeSpan.Zero));
+    var callCount = 0;
+    var dedupeGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> responder = (_, _) =>
+        Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+
+    using var handler = new DelegateHttpMessageHandler((req, ct) =>
+    {
+        Interlocked.Increment(ref callCount);
+        return responder(req, ct);
+    });
+    var service = new SearchSuggestionService(handler, timeProvider, TimeSpan.FromMilliseconds(150));
+
+    // 1. JSON validation + sanitization + provider cache partitioning
+    responder = (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+    {
+        Content = new StringContent("[\"alp\",[\"alp\\npha\",123,{\"x\":1},null,\"alphabet\",\"alphabet\"]]", Encoding.UTF8, "application/json")
+    });
+    var parsed = await service.GetSearchSuggestionsAsync("alp", "google");
+    if (!parsed.SequenceEqual(["alp pha", "alphabet"])) return false;
+    if (!service.TryGetCachedSuggestions("alp", "google", out var cachedHit)
+        || !cachedHit.SequenceEqual(["alp pha", "alphabet"]))
+    {
+        return false;
+    }
+
+    // Cache hit should avoid another HTTP request
+    var countBeforeCachedCall = Volatile.Read(ref callCount);
+    var secondHit = await service.GetSearchSuggestionsAsync("alp", "google");
+    if (Volatile.Read(ref callCount) != countBeforeCachedCall || !secondHit.SequenceEqual(["alp pha", "alphabet"]))
+    {
+        return false;
+    }
+
+    // 2. Oversized Content-Length (> 64 KiB) rejected cleanly (isolated instance so backoff state stays separate)
+    var capService = new SearchSuggestionService(handler, timeProvider, TimeSpan.FromMilliseconds(150));
+    responder = (_, _) =>
+    {
+        var msg = new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new ByteArrayContent(new byte[SearchSuggestionService.MaximumResponseBytes + 16])
+        };
+        return Task.FromResult(msg);
+    };
+    var oversized = await capService.GetSearchSuggestionsAsync("huge", "google");
+    if (oversized.Count != 0) return false;
+
+    // Advance past 15s backoff and test streaming chunk cap (> 64 KiB without Content-Length)
+    timeProvider.Advance(TimeSpan.FromSeconds(16));
+    responder = (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+    {
+        Content = new ChunkedLargeContent(SearchSuggestionService.MaximumResponseBytes + 1024)
+    });
+    var oversizedStream = await capService.GetSearchSuggestionsAsync("chunkedhuge", "google");
+    if (oversizedStream.Count != 0) return false;
+
+    // 3. Caller cancellation does NOT trigger backoff; immediate retry succeeds
+    var cancelService = new SearchSuggestionService(handler, timeProvider, TimeSpan.FromMilliseconds(150));
+    var cancelReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var releaseCanceled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    responder = async (_, _) =>
+    {
+        cancelReady.TrySetResult();
+        await releaseCanceled.Task;
+        return new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent("[\"canc\",[\"canceled but finished\"]]", Encoding.UTF8, "application/json")
+        };
+    };
+    using var callerCts = new CancellationTokenSource();
+    var canceledTask = cancelService.GetSearchSuggestionsAsync("canc", "google", callerCts.Token);
+    await cancelReady.Task;
+    callerCts.Cancel();
+    var canceledResult = await canceledTask;
+    releaseCanceled.TrySetResult();
+    if (canceledResult.Count != 0) return false;
+
+    // Separate query immediately succeeds (backoff was not armed by caller cancellation)
+    responder = (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+    {
+        Content = new StringContent("[\"ok\",[\"ok one\"]]", Encoding.UTF8, "application/json")
+    });
+    var immediateAfterCancel = await cancelService.GetSearchSuggestionsAsync("ok", "google");
+    if (!immediateAfterCancel.SequenceEqual(["ok one"])) return false;
+
+    // 4. In-flight deduplication: concurrent requests issue only 1 HTTP call
+    Volatile.Write(ref callCount, 0);
+    dedupeGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    responder = async (_, _) =>
+    {
+        await dedupeGate.Task;
+        return new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent("[\"tea\",[\"tea time\"]]", Encoding.UTF8, "application/json")
+        };
+    };
+    var t1 = cancelService.GetSearchSuggestionsAsync("tea", "google");
+    var t2 = cancelService.GetSearchSuggestionsAsync("tea", "google");
+    dedupeGate.TrySetResult();
+    var joined = await Task.WhenAll(t1, t2);
+    if (Volatile.Read(ref callCount) != 1
+        || !joined[0].SequenceEqual(["tea time"])
+        || !joined[1].SequenceEqual(["tea time"]))
+    {
+        return false;
+    }
+
+    // 5. Circuit-breaker exponential backoff (15s -> 60s -> 180s) on 503 & Timeout, reset on success
+    var backoffService = new SearchSuggestionService(handler, timeProvider, TimeSpan.FromMilliseconds(150));
+    Volatile.Write(ref callCount, 0);
+    responder = (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable));
+    _ = await backoffService.GetSearchSuggestionsAsync("fail1", "google"); // arms 15s backoff
+    var before15 = Volatile.Read(ref callCount);
+    _ = await backoffService.GetSearchSuggestionsAsync("fail1-blocked", "google"); // skipped during backoff
+    if (Volatile.Read(ref callCount) != before15) return false;
+
+    timeProvider.Advance(TimeSpan.FromSeconds(16));
+    _ = await backoffService.GetSearchSuggestionsAsync("fail2", "google"); // 2nd failure arms 60s backoff
+    timeProvider.Advance(TimeSpan.FromSeconds(30));
+    var during60 = Volatile.Read(ref callCount);
+    _ = await backoffService.GetSearchSuggestionsAsync("fail2-blocked", "google"); // still blocked at +30s
+    if (Volatile.Read(ref callCount) != during60) return false;
+
+    timeProvider.Advance(TimeSpan.FromSeconds(31)); // past 60s
+    responder = async (_, ct) =>
+    {
+        await Task.Delay(TimeSpan.FromSeconds(5), ct); // triggers HttpClient.Timeout (150ms) -> 180s backoff
+        return new HttpResponseMessage(HttpStatusCode.OK);
+    };
+    _ = await backoffService.GetSearchSuggestionsAsync("timeout3", "google");
+    timeProvider.Advance(TimeSpan.FromSeconds(120));
+    var during180 = Volatile.Read(ref callCount);
+    _ = await backoffService.GetSearchSuggestionsAsync("timeout3-blocked", "google"); // blocked at +120s (<180s)
+    if (Volatile.Read(ref callCount) != during180) return false;
+
+    timeProvider.Advance(TimeSpan.FromSeconds(61)); // past 180s
+    responder = (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+    {
+        Content = new StringContent("[\"rec\",[\"recovered\"]]", Encoding.UTF8, "application/json")
+    });
+    var recovered = await backoffService.GetSearchSuggestionsAsync("rec", "google");
+    return recovered.SequenceEqual(["recovered"]);
+}
+
+bool VerifyAdBlockImportantOverrideAndShortCircuit()
+{
+    var engine = new AdBlockEngine(initialRules:
+    [
+        "||ad.doubleclick.test^$script",
+        "@@||ad.doubleclick.test^$script",
+        "||ad.doubleclick.test/must-block.js$script,important"
+    ]);
+    var allowedNormal = engine.EvaluateRequest(
+        "https://ad.doubleclick.test/normal.js",
+        "https://publisher.example/",
+        "script");
+    var blockedImportant = engine.EvaluateRequest(
+        "https://ad.doubleclick.test/must-block.js",
+        "https://publisher.example/",
+        "script");
+    return !allowedNormal.Blocked
+        && allowedNormal.RuleKind == "Exception"
+        && blockedImportant.Blocked
+        && blockedImportant.RuleKind == "HostAnchored";
+}
+
+bool VerifyAdBlockBadfilterMixedCaseOptions()
+{
+    var engine = new AdBlockEngine(initialRules:
+    [
+        "||ads.example^$SCRIPT,Domain=site.test",
+        "||ads.example^$domain=site.test,script,badfilter"
+    ]);
+    return !engine.ShouldBlock(
+        "https://ads.example/banner.js",
+        "https://site.test/article",
+        AdBlockResourceType.Script);
+}
+
+bool VerifyCosmeticRuleSetBatchingAndSyncCache()
+{
+    var engine = new AdBlockEngine(initialRules:
+    [
+        "##.ad-slot-one",
+        "##.ad-slot-two",
+        "special.example##.site-specific-slot"
+    ]);
+    var genericHost1 = engine.GetCosmeticCss("https://alpha.example/home");
+    var genericHost2 = engine.GetCosmeticCss("https://beta.example/article");
+    var asyncCachedTask = engine.GetCosmeticCssAsync("https://alpha.example/other");
+    var specialCss = engine.GetCosmeticCss("https://special.example/page");
+    return genericHost1.Contains(".ad-slot-one,.ad-slot-two{display:none!important;", StringComparison.Ordinal)
+        && ReferenceEquals(genericHost1, genericHost2)
+        && asyncCachedTask.IsCompletedSuccessfully
+        && ReferenceEquals(asyncCachedTask.GetAwaiter().GetResult(), genericHost1)
+        && specialCss.Contains(".site-specific-slot", StringComparison.Ordinal)
+        && specialCss.Contains(".ad-slot-one", StringComparison.Ordinal);
+}
+
+bool VerifyAdBlockCanCommitWithCorruptSibling()
+{
+    var tempDir = Path.Combine(
+        Path.GetTempPath(),
+        "MishaWeb-AdBlockSibling-" + Environment.ProcessId + "-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(tempDir);
+    try
+    {
+        var engine = new AdBlockEngine(cacheFolder: tempDir, updateRemoteLists: false);
+        var corruptSibling = Path.Combine(tempDir, "list-1.txt");
+        using (var siblingStream = new FileStream(corruptSibling, FileMode.CreateNew, FileAccess.Write))
+        {
+            // Exceeds MaximumFilterListBytes so old aggregate calculation would trip on it.
+            siblingStream.SetLength(20L * 1024 * 1024);
+        }
+        var targetPath = Path.Combine(tempDir, "list-0.txt");
+        var candidatePath = targetPath + ".tmp";
+        File.WriteAllText(candidatePath, "||ads.invalid^\n", Encoding.UTF8);
+        return engine.CanCommitFilterFile(targetPath, candidatePath);
+    }
+    finally
+    {
+        if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+    }
+}
+
+bool VerifyBrowserExtensionsPhase2Contracts()
+{
+    var tempDir = Path.Combine(
+        Path.GetTempPath(),
+        "MishaWeb-ExtPhase2-" + Environment.ProcessId + "-" + Guid.NewGuid().ToString("N"));
+    var sampleExtensionDir = Path.Combine(tempDir, "sample-ext");
+    Directory.CreateDirectory(tempDir);
+    Directory.CreateDirectory(sampleExtensionDir);
+    try
+    {
+        var userscriptPath = Path.Combine(tempDir, "scoped.user.js");
+        File.WriteAllText(
+            userscriptPath,
+            """
+            // ==UserScript==
+            // @name Scoped Script
+            // @match https://allowed.example/*
+            // @exclude https://allowed.example/blocked*
+            // ==/UserScript==
+            window.__scopedApplied = true;
+            """);
+
+        var service = new BrowserExtensions(tempDir);
+        var matched = service.GetScriptsForUrl("https://allowed.example/app");
+        var excluded = service.GetScriptsForUrl("https://allowed.example/blocked/page");
+        var otherHost = service.GetScriptsForUrl("https://other.example/app");
+        if (matched.Count != 1 || excluded.Count != 0 || otherHost.Count != 0) return false;
+
+        var scan1 = service.LoadScripts();
+        var scan2 = service.LoadScripts();
+        if (scan1.Count != 1 || !ReferenceEquals(scan1, scan2)) return false;
+
+        // Icon parsing tolerates malformed non-string entries and picks valid fallback icon.
+        File.WriteAllBytes(Path.Combine(sampleExtensionDir, "icon32.png"), [1, 2, 3, 4]);
+        var manifest = JsonNode.Parse("""
+            {
+              "manifest_version": 3,
+              "name": "Icon Edge Case",
+              "version": "1.0.0",
+              "icons": {
+                "128": 42,
+                "64": { "nested": true },
+                "48": "missing.png",
+                "32": "icon32.png"
+              }
+            }
+            """)!.AsObject();
+        var bestIcon = BrowserExtensions.ReadBestIconPath(sampleExtensionDir, manifest);
+        if (bestIcon is null || !bestIcon.EndsWith("icon32.png", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // Durable SaveManagedRecords via ImportUnpackedAsync + RememberInstalled.
+        File.WriteAllText(
+            Path.Combine(sampleExtensionDir, "manifest.json"),
+            """{"manifest_version":3,"name":"Durable Reg","version":"1.0.0"}""");
+        var prepared = service.ImportUnpackedAsync(sampleExtensionDir).GetAwaiter().GetResult();
+        const string runtimeId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        service.RememberInstalled(runtimeId, prepared);
+        var reloaded = new BrowserExtensions(tempDir).GetManagedExtension(runtimeId);
+        return reloaded is not null && reloaded.Name == "Durable Reg";
+    }
+    finally
+    {
+        if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+    }
+}
+
+bool VerifyStartPageArtworkMultiPaneLruCache()
+{
+    var baseline = StartPageArtwork.GetBackdropFrameStateForTesting();
+    if (baseline.Leases != 0 || baseline.Allocated) return false;
+
+    StartPageArtwork.AcquireBackdropFrame();
+    try
+    {
+        var sizes = new[]
+        {
+            new Size(320, 240),
+            new Size(340, 240),
+            new Size(360, 240),
+            new Size(380, 240)
+        };
+        foreach (var size in sizes)
+        {
+            using var target = new Bitmap(size.Width, size.Height, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+            using var graphics = Graphics.FromImage(target);
+            StartPageArtwork.DrawBackdropSlice(
+                graphics,
+                size,
+                new Rectangle(Point.Empty, size),
+                new Rectangle(Point.Empty, size));
+        }
+
+        if (StartPageArtwork.GetCachedFrameCountForTesting() != 4) return false;
+    }
+    finally
+    {
+        StartPageArtwork.ReleaseBackdropFrame();
+    }
+
+    var after = StartPageArtwork.GetBackdropFrameStateForTesting();
+    return after.Leases == 0
+        && !after.Allocated
+        && StartPageArtwork.GetCachedFrameCountForTesting() == 0;
+}
+
+bool VerifyEnvironmentOptionsTieringAndIsolation()
+{
+    var beforeEnv = Environment.GetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
+    var snapshot = MainForm.GetEnvironmentOptionsSnapshotForTesting();
+    var afterEnv = Environment.GetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
+    if (!string.Equals(beforeEnv, afterEnv, StringComparison.Ordinal)) return false;
+
+    const ulong giB = 1024UL * 1024 * 1024;
+    var tiny = MainForm.BuildAdditionalBrowserArguments(
+        "--autoplay-policy=document-user-activation-required --enable-features=CustomFeature --disk-cache-size=999",
+        disableGpuRasterization: false,
+        new SystemMemorySnapshot(50, 4UL * giB, 2UL * giB, 2, true));
+    var mid = MainForm.BuildAdditionalBrowserArguments(
+        null,
+        disableGpuRasterization: false,
+        new SystemMemorySnapshot(50, 8UL * giB, 4UL * giB, 4, true));
+    var high = MainForm.BuildAdditionalBrowserArguments(
+        null,
+        disableGpuRasterization: false,
+        new SystemMemorySnapshot(50, 16UL * giB, 8UL * giB, 8, true));
+
+    return snapshot.AdditionalBrowserArguments is not null
+        && CountOccurrences(tiny, "--autoplay-policy") == 1
+        && tiny.Contains("--autoplay-policy=document-user-activation-required", StringComparison.Ordinal)
+        && tiny.Contains("--enable-features=CanvasOopRasterization,ParallelDownloading,CustomFeature", StringComparison.Ordinal)
+        && CountOccurrences(tiny, "--disk-cache-size=") == 1
+        && tiny.Contains("--disk-cache-size=999", StringComparison.Ordinal)
+        && tiny.Contains("--media-cache-size=26214400", StringComparison.Ordinal)
+        && tiny.Contains("--renderer-process-limit=4", StringComparison.Ordinal)
+        && mid.Contains("--disk-cache-size=104857600", StringComparison.Ordinal)
+        && mid.Contains("--media-cache-size=52428800", StringComparison.Ordinal)
+        && mid.Contains("--renderer-process-limit=8", StringComparison.Ordinal)
+        && high.Contains("--disk-cache-size=209715200", StringComparison.Ordinal)
+        && high.Contains("--media-cache-size=104857600", StringComparison.Ordinal)
+        && !high.Contains("--renderer-process-limit", StringComparison.Ordinal);
+
+    static int CountOccurrences(string source, string marker)
+    {
+        var count = 0;
+        var idx = 0;
+        while ((idx = source.IndexOf(marker, idx, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            idx += marker.Length;
+        }
+        return count;
+    }
+}
+
+bool VerifyNativeStartPageMicroPaneLayout()
+{
+    Exception? error = null;
+    var ok = false;
+    var thread = new Thread(() =>
+    {
+        try
+        {
+            using var host = new Form
+            {
+                FormBorderStyle = FormBorderStyle.None,
+                StartPosition = FormStartPosition.Manual,
+                Location = new Point(-20_000, -20_000),
+                ShowInTaskbar = false,
+                ClientSize = new Size(260, 220)
+            };
+            using var page = new NativeStartPage { Dock = DockStyle.Fill };
+            page.SetQuickLinks(
+            [
+                new StartPageLink("YouTube", "https://youtube.com", "Media"),
+                new StartPageLink("GitHub", "https://github.com", "Code")
+            ]);
+            host.Controls.Add(page);
+            host.Show();
+            host.PerformLayout();
+            page.PerformLayout();
+            Application.DoEvents();
+
+            using var rendered = new Bitmap(260, 220);
+            page.DrawToBitmap(rendered, new Rectangle(0, 0, 260, 220));
+
+            var search = page.SearchBar;
+            var card = page.Controls[0] as ScrollableControl;
+            ok = search.Visible
+                && search.Width is >= 170 and <= 260
+                && card is not null
+                && !card.HorizontalScroll.Visible
+                && SurfaceHasVisualDetail(rendered);
+        }
+        catch (Exception caught)
+        {
+            error = caught;
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+    if (error is not null) Console.Error.WriteLine($"Micro-pane probe failed: {error}");
+    return error is null && ok;
+}
+
+bool VerifyMultiViewLayoutGeometryAndState()
+{
+    var state = new MultiViewState();
+    state.SetSingle(101);
+    var host = new Rectangle(0, 0, 1200, 800);
+
+    var single = MultiViewLayoutEngine.ComputeLayout(host, state, 4, 26);
+    if (single.PaneCount != 1 || single.PaneBounds[0] != host || single.Splitters.Length != 0)
+    {
+        return false;
+    }
+
+    if (!state.AddPane(102) || state.Preset != MultiViewPreset.Split || state.FocusedPaneIndex != 1)
+    {
+        return false;
+    }
+    var split = MultiViewLayoutEngine.ComputeLayout(host, state, 4, 26);
+    if (!LayoutFillsWithoutOverlap(host, split) || split.Splitters.Length != 1) return false;
+
+    if (!state.AddPane(103) || state.Preset != MultiViewPreset.Tri || state.FocusedPaneIndex != 2)
+    {
+        return false;
+    }
+    var tri = MultiViewLayoutEngine.ComputeLayout(host, state, 4, 26);
+    if (!LayoutFillsWithoutOverlap(host, tri) || tri.Splitters.Length != 2) return false;
+
+    if (!state.AddPane(104) || state.Preset != MultiViewPreset.Quad || state.FocusedPaneIndex != 3)
+    {
+        return false;
+    }
+    var quad = MultiViewLayoutEngine.ComputeLayout(host, state, 4, 26);
+    if (!LayoutFillsWithoutOverlap(host, quad) || quad.Splitters.Length != 2) return false;
+
+    // Adding beyond Quad is a no-op; assigning already-visible tab swaps cleanly.
+    if (state.AddPane(105)) return false;
+    state.AssignTabToPane(0, 104);
+    if (state.GetTabIdForPane(0) != 104 || state.GetTabIdForPane(3) != 101) return false;
+
+    // Clamping ratios & tight host size stay non-overlapping.
+    state.SetSplitRatios(0.99f, 0.01f);
+    if (Math.Abs(state.HorizontalSplitRatio - MultiViewState.MaximumHorizontalRatio) > 0.001f
+        || Math.Abs(state.VerticalSplitRatio - MultiViewState.MinimumVerticalRatio) > 0.001f)
+    {
+        return false;
+    }
+    var tight = MultiViewLayoutEngine.ComputeLayout(new Rectangle(0, 0, 360, 240), state, 4, 26);
+    if (!LayoutFillsWithoutOverlap(new Rectangle(0, 0, 360, 240), tight)) return false;
+
+    // Pane swap and focused-pane maximize toggle preserve preset and assignments.
+    state.FocusPane(0);
+    if (!state.SwapFocusedPaneWithNext() || state.FocusedPaneIndex != 1 || state.GetTabIdForPane(1) != 104)
+    {
+        return false;
+    }
+    if (!state.SwapFocusedPaneWithNext() || state.FocusedPaneIndex != 2) return false;
+    state.AssignTabToPane(0, 104);
+    if (!state.ToggleFocusedPaneMaximized() || !state.IsFocusedPaneMaximized) return false;
+    if (!state.ToggleFocusedPaneMaximized() || state.IsFocusedPaneMaximized) return false;
+
+    // Closing a pane shrinks Quad -> Tri -> Split -> Single.
+    if (!state.HandleTabClosed(101, replacementTabId: 105) || state.GetTabIdForPane(3) != 105) return false;
+    if (!state.ClosePane(3) || state.Preset != MultiViewPreset.Tri) return false;
+    if (!state.ClosePane(2) || state.Preset != MultiViewPreset.Split) return false;
+    if (!state.ClosePane(1) || state.Preset != MultiViewPreset.Single) return false;
+    return true;
+
+    static bool LayoutFillsWithoutOverlap(Rectangle bounds, MultiViewComputedLayout layout)
+    {
+        var area = 0L;
+        for (var i = 0; i < layout.PaneCount; i++)
+        {
+            var pane = layout.PaneBounds[i];
+            var hdr = layout.HeaderBounds[i];
+            var cnt = layout.ContentBounds[i];
+            if (!bounds.Contains(pane) || pane.Width <= 0 || pane.Height <= 0) return false;
+            if (hdr.Bottom != cnt.Top || hdr.X != pane.X || cnt.X != pane.X
+                || hdr.Width != pane.Width || cnt.Width != pane.Width
+                || hdr.Height + cnt.Height != pane.Height)
+            {
+                return false;
+            }
+            area += (long)pane.Width * pane.Height;
+            for (var j = i + 1; j < layout.PaneCount; j++)
+            {
+                if (pane.IntersectsWith(layout.PaneBounds[j])) return false;
+            }
+        }
+        foreach (var splitter in layout.Splitters)
+        {
+            if (!bounds.Contains(splitter.Bounds)) return false;
+            area += (long)splitter.Bounds.Width * splitter.Bounds.Height;
+            for (var i = 0; i < layout.PaneCount; i++)
+            {
+                if (splitter.Bounds.IntersectsWith(layout.PaneBounds[i])) return false;
+            }
+        }
+        for (var i = 0; i < layout.Splitters.Length; i++)
+        {
+            for (var j = i + 1; j < layout.Splitters.Length; j++)
+            {
+                var overlap = Rectangle.Intersect(layout.Splitters[i].Bounds, layout.Splitters[j].Bounds);
+                if (!overlap.IsEmpty)
+                {
+                    area -= (long)overlap.Width * overlap.Height;
+                }
+            }
+        }
+        return area == (long)bounds.Width * bounds.Height;
+    }
+}
+
+bool VerifyTabLifecycleProtectsMultiViewPanes()
+{
+    var now = DateTime.UtcNow;
+    var old = now - TimeSpan.FromMinutes(10);
+    var snapshots = new[]
+    {
+        new TabLifecycleSnapshot(0, old, IsActive: true, IsClosed: false, IsLoading: false, IsInitializing: false, IsAudible: false, HasActiveDownload: false, HasCore: true, IsSuspended: false, KeepAwake: false, ProtectedResidentRank: 0, IsVisibleInPane: true),
+        new TabLifecycleSnapshot(1, old, IsActive: false, IsClosed: false, IsLoading: false, IsInitializing: false, IsAudible: false, HasActiveDownload: false, HasCore: true, IsSuspended: false, KeepAwake: false, ProtectedResidentRank: 1, IsVisibleInPane: true),
+        new TabLifecycleSnapshot(2, old, IsActive: false, IsClosed: false, IsLoading: false, IsInitializing: false, IsAudible: false, HasActiveDownload: false, HasCore: true, IsSuspended: false, KeepAwake: false, ProtectedResidentRank: 2, IsVisibleInPane: true),
+        new TabLifecycleSnapshot(3, old, IsActive: false, IsClosed: false, IsLoading: false, IsInitializing: false, IsAudible: false, HasActiveDownload: false, HasCore: true, IsSuspended: false, KeepAwake: false, ProtectedResidentRank: 3, IsVisibleInPane: true),
+        new TabLifecycleSnapshot(4, old, IsActive: false, IsClosed: false, IsLoading: false, IsInitializing: false, IsAudible: false, HasActiveDownload: false, HasCore: true, IsSuspended: false, KeepAwake: false, ProtectedResidentRank: 4, IsVisibleInPane: false),
+        new TabLifecycleSnapshot(5, old - TimeSpan.FromMinutes(5), IsActive: false, IsClosed: false, IsLoading: false, IsInitializing: false, IsAudible: false, HasActiveDownload: false, HasCore: true, IsSuspended: true, KeepAwake: false, ProtectedResidentRank: 5, IsVisibleInPane: false)
+    };
+    var decisions = TabLifecyclePolicy.PlanSweep(
+        snapshots,
+        TabLifecycleMode.Ultra,
+        now,
+        memoryLoadPercent: 95,
+        memorySnapshotIsValid: true,
+        totalPhysicalBytes: 4UL * 1024 * 1024 * 1024,
+        logicalProcessorCount: 2,
+        maximumActions: 6);
+    var failedSuspendProtected = !TabLifecyclePolicy.ShouldDiscardAfterFailedSuspend(
+        snapshots[3],
+        TabLifecycleMode.Ultra,
+        now,
+        memoryLoadPercent: 95,
+        memorySnapshotIsValid: true,
+        totalPhysicalBytes: 4UL * 1024 * 1024 * 1024,
+        logicalProcessorCount: 2,
+        residentCoreCount: 6,
+        consecutiveFailures: TabLifecyclePolicy.SuspendFailureFallbackThreshold);
+    var multiViewSource = ReadRepositorySource("desktop", "MainForm.MultiView.cs");
+    var multiViewControlsSource = ReadRepositorySource("desktop", "MultiViewControls.cs");
+    var lifecycleGuardsAligned = failedSuspendDiscardSource.Contains(
+            "IsVisibleInPane: !isWindowMinimized && IsTabVisibleInAnyPane(tab)",
+            StringComparison.Ordinal)
+        && refreshMemorySweepSource.Contains(
+            "(!IsTabVisibleInAnyPane(tab) || isWindowMinimized)",
+            StringComparison.Ordinal)
+        && mainFormThemeSource.Contains(
+            "includeActiveTab: isWindowMinimized && IsTabVisibleInAnyPane(tab)",
+            StringComparison.Ordinal)
+        && multiViewSource.Contains(
+            "if (!isWindowMinimized && paneTab.IsSuspended) ResumeTab(paneTab);",
+            StringComparison.Ordinal)
+        && CountOccurrences(
+            mainFormThemeSource,
+            "(!IsTabVisibleInAnyPane(tab) || isWindowMinimized)") >= 2;
+    var splitterCoalescedAndPreallocated = multiViewControlsSource.Contains("DragCoalesceIntervalMs", StringComparison.Ordinal)
+        && multiViewControlsSource.Contains("DragCompleted", StringComparison.Ordinal)
+        && multiViewControlsSource.Contains("AudioToggleRequested", StringComparison.Ordinal)
+        && multiViewControlsSource.Contains("MaximizeToggleRequested", StringComparison.Ordinal)
+        && multiViewSource.Contains("DragCompleted += () => ScheduleStateSave();", StringComparison.Ordinal)
+        && multiViewSource.Contains("multiViewPlacements.AsSpan(0, placementCount)", StringComparison.Ordinal)
+        && !multiViewSource.Contains("placements.ToArray()", StringComparison.Ordinal)
+        && multiViewSource.Contains("Task.WhenAll(restoreTasks)", StringComparison.Ordinal)
+        && multiViewSource.Contains("OpenUrlInSplitViewAsync", StringComparison.Ordinal)
+        && multiViewSource.Contains("TryDropTabOntoMultiViewPane", StringComparison.Ordinal);
+    var adBlockMainFormSource = ReadRepositorySource("desktop", "MainForm.AdBlock.cs");
+    var adBlockEngineSource = ReadRepositorySource("desktop", "AdBlockEngine.cs");
+    var browserStateSource = ReadRepositorySource("desktop", "BrowserState.cs");
+    var searchSuggestionSource = ReadRepositorySource("desktop", "SearchSuggestionService.cs");
+    var ipcAndStartupOptimizations = adBlockMainFormSource.Contains("AdBlockWebResourceFilterPatterns", StringComparison.Ordinal)
+        && adBlockMainFormSource.Contains("SerializedCosmeticCssCacheMap", StringComparison.Ordinal)
+        && adBlockEngineSource.Contains("compiled-rules-v1.bin", StringComparison.Ordinal)
+        && browserStateSource.Contains("BrowserStateJsonContext", StringComparison.Ordinal)
+        && searchSuggestionSource.Contains("ArrayPool<byte>.Shared", StringComparison.Ordinal)
+        && searchSuggestionSource.Contains("DecompressionMethods.All", StringComparison.Ordinal)
+        && !SystemResourceInfo.TrySetProcessEfficiencyMode(-1, enable: true);
+
+    return decisions.All(d => d.Id >= 4)
+        && decisions.Any(d => d.Id == 4 && d.Action == TabLifecycleAction.Suspend)
+        && decisions.Any(d => d.Id == 5 && d.Action == TabLifecycleAction.Discard)
+        && failedSuspendProtected
+        && lifecycleGuardsAligned
+        && splitterCoalescedAndPreallocated
+        && ipcAndStartupOptimizations;
+}
+
+bool VerifyBrowserStateStoreMultiViewPersistence()
+{
+    var tempDir = Path.Combine(
+        Path.GetTempPath(),
+        "MishaWeb-MVState-" + Environment.ProcessId + "-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(tempDir);
+    try
+    {
+        using var store = new BrowserStateStore(tempDir);
+        var state = new BrowserState
+        {
+            OpenTabs = ["https://one.example/", "https://pinned.example/", "https://two.example/"],
+            PinnedOpenTabCount = 1,
+            ActiveTabIndex = 2,
+            MultiViewLayout = new SavedMultiViewLayout("Tri", [0, 1, 2, 0, 99], FocusedPaneIndex: 2, HorizontalRatio: 1.5f, VerticalRatio: -0.2f)
+        };
+        if (!store.Save(state)) return false;
+
+        var reloaded = new BrowserStateStore(tempDir).Load();
+        if (reloaded.MultiViewLayout is not { } mv) return false;
+        if (mv.Preset != "Tri"
+            || !mv.PaneTabIndices.SequenceEqual([0, 1, 2])
+            || mv.FocusedPaneIndex != 2
+            || Math.Abs(mv.HorizontalRatio - 0.78f) > 0.001f
+            || Math.Abs(mv.VerticalRatio - 0.25f) > 0.001f)
+        {
+            return false;
+        }
+
+        // Single valid pane collapses MultiViewLayout to null.
+        var degenerate = new BrowserState
+        {
+            OpenTabs = ["https://only.example/"],
+            MultiViewLayout = new SavedMultiViewLayout("Split", [0, 5], 1)
+        };
+        BrowserStateStore.NormalizeOpenTabs(degenerate);
+        return degenerate.MultiViewLayout is null;
+    }
+    finally
+    {
+        if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+    }
+}
+
+bool VerifyMainFormMultiViewProgressionSta()
+{
+    Exception? error = null;
+    var ok = false;
+    var thread = new Thread(() =>
+    {
+        var previousSyncContext = SynchronizationContext.Current;
+        using var syncContext = new WindowsFormsSynchronizationContext();
+        SynchronizationContext.SetSynchronizationContext(syncContext);
+        try
+        {
+            using var form = new MainForm(startBrowserOnShown: false, mode: BrowserMode.Private)
+            {
+                StartPosition = FormStartPosition.Manual,
+                Location = new Point(-20_000, -20_000),
+                ShowInTaskbar = false,
+                ClientSize = new Size(1280, 800)
+            };
+            form.Show();
+            form.PrepareChromePreviewForTesting();
+            Application.DoEvents();
+
+            static T Pump<T>(Task<T> task)
+            {
+                while (!task.IsCompleted)
+                {
+                    Application.DoEvents();
+                    Thread.Sleep(5);
+                }
+                return task.GetAwaiter().GetResult();
+            }
+
+            static void PumpVoid(Task task)
+            {
+                while (!task.IsCompleted)
+                {
+                    Application.DoEvents();
+                    Thread.Sleep(5);
+                }
+                task.GetAwaiter().GetResult();
+            }
+
+            bool ActualStartPageHostsMatchLayout(MainForm hostForm, MultiViewSnapshot snapshot)
+            {
+                hostForm.PerformLayout();
+                Application.DoEvents();
+                var actual = hostForm.GetActualMultiViewGeometryForTesting();
+                if (actual.HostBounds.Length != snapshot.PaneCount || actual.HeaderBounds.Length != snapshot.PaneCount)
+                {
+                    return false;
+                }
+                for (var i = 0; i < snapshot.PaneCount; i++)
+                {
+                    if (actual.HostBounds[i] != snapshot.ContentBounds[i] || actual.HeaderBounds[i] != snapshot.HeaderBounds[i])
+                    {
+                        return false;
+                    }
+                    for (var j = 0; j < snapshot.PaneCount; j++)
+                    {
+                        if (actual.HostBounds[i].IntersectsWith(actual.HeaderBounds[j])) return false;
+                    }
+                }
+                return RectanglesDoNotOverlap(actual.HostBounds);
+            }
+
+            if (!Pump(form.AddMultiViewPaneForTestingAsync())) return;
+            var split = form.GetMultiViewSnapshotForTesting();
+            if (split.Preset != MultiViewPreset.Split || split.PaneCount != 2) return;
+            if (!ActualStartPageHostsMatchLayout(form, split)) return;
+
+            if (!Pump(form.AddMultiViewPaneForTestingAsync())) return;
+            var tri = form.GetMultiViewSnapshotForTesting();
+            if (tri.Preset != MultiViewPreset.Tri || tri.PaneCount != 3) return;
+            if (!ActualStartPageHostsMatchLayout(form, tri)) return;
+
+            if (!Pump(form.AddMultiViewPaneForTestingAsync())) return;
+            var quad = form.GetMultiViewSnapshotForTesting();
+            if (quad.Preset != MultiViewPreset.Quad || quad.PaneCount != 4) return;
+            if (!ActualStartPageHostsMatchLayout(form, quad)) return;
+
+            // 4 distinct visible NativeStartPage controls whose parent hosts match each pane's ContentBounds.
+            var visibleStartPages = GetDescendants(form)
+                .OfType<NativeStartPage>()
+                .Where(p => p.Visible && p.Width > 0 && p.Height > 0)
+                .ToArray();
+            if (visibleStartPages.Length != 4) return;
+            if (visibleStartPages.Any(p => p.Parent is null || !quad.ContentBounds.Take(4).Contains(p.Parent.Bounds)))
+            {
+                return;
+            }
+            if (!RectanglesDoNotOverlap(quad.PaneBounds.Take(4))) return;
+
+            form.FocusMultiViewPaneForTesting(1);
+            Application.DoEvents();
+            if (form.GetMultiViewSnapshotForTesting().FocusedPaneIndex != 1) return;
+
+            // Multi-View button compact behavior at 640px and hidden at 480px.
+            var dpi = Math.Max(96, form.DeviceDpi);
+            form.ClientSize = new Size(ScaleForDpi(640, dpi), ScaleForDpi(720, dpi));
+            form.PerformLayout();
+            Application.DoEvents();
+            var mvBtn = GetDescendants(form).OfType<MultiViewToolbarButton>().SingleOrDefault();
+            var snap640 = form.GetToolbarLayoutSnapshotForTesting();
+            if (mvBtn is null || !mvBtn.Visible || !mvBtn.Compact || snap640.Menu.Right > snap640.ToolbarWidth)
+            {
+                return;
+            }
+
+            form.ClientSize = new Size(ScaleForDpi(480, dpi), ScaleForDpi(720, dpi));
+            form.PerformLayout();
+            Application.DoEvents();
+            var snap480 = form.GetToolbarLayoutSnapshotForTesting();
+            if (mvBtn.Visible || snap480.Omnibox.Width < snap480.MinimumOmniboxWidth - 1)
+            {
+                return;
+            }
+
+            PumpVoid(form.SetMultiViewPresetForTestingAsync(MultiViewPreset.Single));
+            Application.DoEvents();
+            var backSingle = form.GetMultiViewSnapshotForTesting();
+            var remainingHeaders = GetDescendants(form).OfType<PaneHeaderBar>().Count(h => h.Visible);
+            ok = backSingle.Preset == MultiViewPreset.Single && remainingHeaders == 0;
+        }
+        catch (Exception caught)
+        {
+            error = caught;
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previousSyncContext);
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+    if (error is not null) Console.Error.WriteLine($"Multi-View STA probe failed: {error}");
+    return error is null && ok;
+}
+
+bool VerifyControlsHaveZeroGdiAndUserHandleLeakSta()
+{
+    Exception? error = null;
+    var ok = false;
+    uint gdiBefore = 0, userBefore = 0, gdiAfter = 0, userAfter = 0;
+
+    var thread = new Thread(() =>
+    {
+        var previousSyncContext = SynchronizationContext.Current;
+        using var syncContext = new WindowsFormsSynchronizationContext();
+        SynchronizationContext.SetSynchronizationContext(syncContext);
+        try
+        {
+            using var form = new Form
+            {
+                StartPosition = FormStartPosition.Manual,
+                Location = new Point(-20_000, -20_000),
+                ShowInTaskbar = false,
+                FormBorderStyle = FormBorderStyle.None,
+                ClientSize = new Size(900, 620)
+            };
+            using var topStrip = new Panel { Dock = DockStyle.Top, Height = 96 };
+            using var searchBar = new SmartSearchBar { Location = new Point(4, 4), Size = new Size(460, 44) };
+            using var logo = new BrandLogoControl { Location = new Point(472, 4), Size = new Size(56, 56) };
+            using var mvButton = new MultiViewToolbarButton { Location = new Point(536, 4), Size = new Size(136, 32) };
+            using var paneHeader = new PaneHeaderBar(0) { Location = new Point(4, 54), Size = new Size(320, 26) };
+            using var splitter = new MultiViewSplitter(isVertical: true) { Location = new Point(332, 54), Size = new Size(4, 32) };
+            using var startPage = new NativeStartPage { Dock = DockStyle.Fill };
+
+            topStrip.Controls.Add(searchBar);
+            topStrip.Controls.Add(logo);
+            topStrip.Controls.Add(mvButton);
+            topStrip.Controls.Add(paneHeader);
+            topStrip.Controls.Add(splitter);
+            form.Controls.Add(startPage);
+            form.Controls.Add(topStrip);
+
+            form.Show();
+            Application.DoEvents();
+
+            static void RunCycle(
+                Form hostForm,
+                NativeStartPage page,
+                SmartSearchBar bar,
+                BrandLogoControl brandLogo,
+                MultiViewToolbarButton mvBtn,
+                PaneHeaderBar header,
+                int iteration)
+            {
+                var compact = (iteration & 1) == 1;
+                hostForm.ClientSize = compact ? new Size(380, 290) : new Size(900, 620);
+                bar.SetCompactMinimumSize(compact);
+                bar.Size = compact ? new Size(210, 40) : new Size(460, 44);
+                bar.Text = compact ? "search" : "https://example.com";
+                brandLogo.Size = compact ? new Size(32, 32) : new Size(56, 56);
+                mvBtn.Compact = compact;
+                mvBtn.ActiveViewCount = compact ? 4 : 2;
+                header.UpdateMetadata(
+                    compact ? "Pane B" : "Pane A",
+                    focused: !compact,
+                    privateMode: compact,
+                    highContrastActive: false);
+                hostForm.PerformLayout();
+                Application.DoEvents();
+                using var bmp = new Bitmap(hostForm.ClientSize.Width, hostForm.ClientSize.Height);
+                hostForm.DrawToBitmap(bmp, new Rectangle(Point.Empty, hostForm.ClientSize));
+                using var pageBmp = new Bitmap(Math.Max(1, page.Width), Math.Max(1, page.Height));
+                page.DrawToBitmap(pageBmp, new Rectangle(Point.Empty, pageBmp.Size));
+            }
+
+            // Warmup covers both viewport sizes and primes static/LRU graphic caches before snapshotting.
+            for (var i = 0; i < 10; i++)
+            {
+                RunCycle(form, startPage, searchBar, logo, mvButton, paneHeader, i);
+            }
+            Application.DoEvents();
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            Thread.Sleep(25);
+            Application.DoEvents();
+
+            (gdiBefore, userBefore) = NativeResourceGuard.CaptureGuiResourceCounts();
+            for (var settle = 0; settle < 5; settle++)
+            {
+                Thread.Sleep(25);
+                Application.DoEvents();
+                var next = NativeResourceGuard.CaptureGuiResourceCounts();
+                if (next == (gdiBefore, userBefore)) break;
+                (gdiBefore, userBefore) = next;
+            }
+
+            for (var i = 0; i < 200; i++)
+            {
+                RunCycle(form, startPage, searchBar, logo, mvButton, paneHeader, i);
+            }
+
+            Application.DoEvents();
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            Thread.Sleep(25);
+            Application.DoEvents();
+
+            (gdiAfter, userAfter) = NativeResourceGuard.CaptureGuiResourceCounts();
+            ok = gdiAfter <= gdiBefore && userAfter <= userBefore;
+        }
+        catch (Exception caught)
+        {
+            error = caught;
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previousSyncContext);
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+
+    if (error is not null)
+    {
+        Console.Error.WriteLine($"GDI/USER handle guard threw: {error}");
+        return false;
+    }
+    if (!ok)
+    {
+        Console.Error.WriteLine(
+            $"GDI/USER handle delta non-zero after 200 cycles: GDI {gdiBefore}->{gdiAfter}, USER {userBefore}->{userAfter}");
+    }
+    return ok;
+}
+
+(bool Ready, int Panes, int LiveWebViews, bool NonOverlapping, bool ActualWin32RectsMatch, bool FocusSwitch, int ChurnCycles, bool UdfCleaned)
+    RunLiveMultiViewProbe(string probeFolder)
+{
+    int port;
+    using (var portProbe = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0))
+    {
+        portProbe.Start();
+        port = ((IPEndPoint)portProbe.LocalEndpoint).Port;
+    }
+
+    var paneHits = new int[5];
+    using var listener = new HttpListener();
+    listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+    listener.Start();
+
+    using var serverCts = new CancellationTokenSource();
+    var serverLoop = Task.Run(async () =>
+    {
+        while (!serverCts.IsCancellationRequested)
+        {
+            HttpListenerContext? context = null;
+            try
+            {
+                context = await listener.GetContextAsync().ConfigureAwait(false);
+            }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
+            catch (HttpListenerException)
+            {
+                break;
+            }
+
+            try
+            {
+                var path = context.Request.Url?.AbsolutePath ?? "/";
+                if (path.Equals("/favicon.ico", StringComparison.OrdinalIgnoreCase))
+                {
+                    context.Response.StatusCode = 204;
+                    context.Response.Close();
+                    continue;
+                }
+
+                var paneNumber = 0;
+                if (path.StartsWith("/pane/", StringComparison.OrdinalIgnoreCase)
+                    && int.TryParse(path.AsSpan(6), CultureInfo.InvariantCulture, out var parsed)
+                    && parsed is >= 1 and <= 4)
+                {
+                    paneNumber = parsed;
+                    Interlocked.Increment(ref paneHits[parsed]);
+                }
+
+                var body = paneNumber > 0
+                    ? $"<!doctype html><html><head><meta charset='utf-8'><title>Pane {paneNumber}</title></head>"
+                      + $"<body style='margin:0;background:#190f19;color:#fce8f7;font-family:sans-serif'>"
+                      + $"<main id='pane-{paneNumber}' style='padding:24px'><h1>Pane {paneNumber}</h1></main></body></html>"
+                    : "<!doctype html><html><body>Not Found</body></html>";
+                context.Response.StatusCode = paneNumber > 0 ? 200 : 404;
+                context.Response.ContentType = "text/html; charset=utf-8";
+                var bytes = Encoding.UTF8.GetBytes(body);
+                context.Response.ContentLength64 = bytes.Length;
+                await context.Response.OutputStream.WriteAsync(bytes).ConfigureAwait(false);
+                context.Response.Close();
+            }
+            catch
+            {
+                try { context.Response.Abort(); } catch { }
+            }
+        }
+    });
+
+    Exception? probeError = null;
+    var ready = false;
+    var panes = 0;
+    var liveWebViews = 0;
+    var nonOverlapping = false;
+    var actualWin32RectsMatch = false;
+    var focusSwitch = false;
+    const int churnCycles = 3;
+
+    try
+    {
+        var thread = new Thread(() =>
+        {
+            var previousSyncContext = SynchronizationContext.Current;
+            using var syncContext = new WindowsFormsSynchronizationContext();
+            SynchronizationContext.SetSynchronizationContext(syncContext);
+            try
+            {
+                static T Pump<T>(Task<T> task, int timeoutMs = 25_000)
+                {
+                    var started = Environment.TickCount64;
+                    while (!task.IsCompleted)
+                    {
+                        if (Environment.TickCount64 - started > timeoutMs)
+                        {
+                            throw new TimeoutException($"Async task timed out after {timeoutMs}ms.");
+                        }
+                        Application.DoEvents();
+                        Thread.Sleep(5);
+                    }
+                    return task.GetAwaiter().GetResult();
+                }
+
+                static void PumpVoid(Task task, int timeoutMs = 25_000)
+                {
+                    var started = Environment.TickCount64;
+                    while (!task.IsCompleted)
+                    {
+                        if (Environment.TickCount64 - started > timeoutMs)
+                        {
+                            throw new TimeoutException($"Async task timed out after {timeoutMs}ms.");
+                        }
+                        Application.DoEvents();
+                        Thread.Sleep(5);
+                    }
+                    task.GetAwaiter().GetResult();
+                }
+
+                static void WaitUntil(Func<bool> condition, string failureMessage, int timeoutMs = 25_000)
+                {
+                    var started = Environment.TickCount64;
+                    while (!condition())
+                    {
+                        if (Environment.TickCount64 - started > timeoutMs)
+                        {
+                            throw new TimeoutException(failureMessage);
+                        }
+                        Application.DoEvents();
+                        Thread.Sleep(15);
+                    }
+                }
+
+                using var form = new MainForm(
+                    startBrowserOnShown: false,
+                    mode: BrowserMode.Private,
+                    webViewUserDataFolderOverride: probeFolder)
+                {
+                    StartPosition = FormStartPosition.Manual,
+                    Location = new Point(-20_000, -20_000),
+                    ShowInTaskbar = false,
+                    ClientSize = new Size(1280, 800)
+                };
+                form.Show();
+                form.PrepareChromePreviewForTesting();
+                Application.DoEvents();
+
+                void AssertLiveWin32RectsMatch(MainForm hostForm, int expectedPaneCount)
+                {
+                    hostForm.PerformLayout();
+                    Application.DoEvents();
+                    var snapshot = hostForm.GetMultiViewSnapshotForTesting();
+                    var pageHostScreen = hostForm.GetPageHostScreenRectangleForTesting();
+                    var actual = hostForm.GetActualMultiViewGeometryForTesting();
+                    if (snapshot.PaneCount != expectedPaneCount || actual.HostBounds.Length != expectedPaneCount)
+                    {
+                        throw new InvalidOperationException(
+                            $"Expected {expectedPaneCount} Multi-View panes, saw {snapshot.PaneCount}.");
+                    }
+                    if (!RectanglesDoNotOverlap(actual.HostBounds))
+                    {
+                        throw new InvalidOperationException("Actual WinForms pane HostBounds overlapped.");
+                    }
+
+                    var viewScreenRects = new Rectangle[expectedPaneCount];
+                    var headerScreenRects = new Rectangle[expectedPaneCount];
+                    for (var i = 0; i < expectedPaneCount; i++)
+                    {
+                        var expectedContent = snapshot.ContentBounds[i];
+                        var expectedHeader = snapshot.HeaderBounds[i];
+                        if (actual.HostBounds[i] != expectedContent)
+                        {
+                            throw new InvalidOperationException(
+                                $"Pane {i} Host.Bounds={actual.HostBounds[i]} drifted from ContentBounds={expectedContent}.");
+                        }
+                        if (actual.HeaderBounds[i] != expectedHeader)
+                        {
+                            throw new InvalidOperationException(
+                                $"Pane {i} Header.Bounds={actual.HeaderBounds[i]} drifted from HeaderBounds={expectedHeader}.");
+                        }
+                        if (actual.HostHandles[i] == IntPtr.Zero
+                            || actual.ViewHandles[i] == IntPtr.Zero
+                            || actual.HeaderHandles[i] == IntPtr.Zero)
+                        {
+                            throw new InvalidOperationException($"Pane {i} did not have live Win32 handles.");
+                        }
+
+                        var expectedContentScreen = new Rectangle(
+                            pageHostScreen.X + expectedContent.X,
+                            pageHostScreen.Y + expectedContent.Y,
+                            expectedContent.Width,
+                            expectedContent.Height);
+                        var expectedHeaderScreen = new Rectangle(
+                            pageHostScreen.X + expectedHeader.X,
+                            pageHostScreen.Y + expectedHeader.Y,
+                            expectedHeader.Width,
+                            expectedHeader.Height);
+
+                        if (!NativeResourceGuard.GetWindowRect(actual.HostHandles[i], out var hostNative)
+                            || hostNative.ToRectangle() != expectedContentScreen)
+                        {
+                            throw new InvalidOperationException(
+                                $"Pane {i} Win32 Host rect {hostNative.ToRectangle()} != expected {expectedContentScreen}.");
+                        }
+                        if (!NativeResourceGuard.GetWindowRect(actual.ViewHandles[i], out var viewNative)
+                            || viewNative.ToRectangle() != expectedContentScreen)
+                        {
+                            throw new InvalidOperationException(
+                                $"Pane {i} Win32 WebView2 rect {viewNative.ToRectangle()} != expected {expectedContentScreen}.");
+                        }
+                        if (!NativeResourceGuard.GetWindowRect(actual.HeaderHandles[i], out var headerNative)
+                            || headerNative.ToRectangle() != expectedHeaderScreen)
+                        {
+                            throw new InvalidOperationException(
+                                $"Pane {i} Win32 Header rect {headerNative.ToRectangle()} != expected {expectedHeaderScreen}.");
+                        }
+
+                        var childHwnd = NativeResourceGuard.GetWindow(actual.ViewHandles[i], NativeResourceGuard.GwChild);
+                        if (childHwnd != IntPtr.Zero && NativeResourceGuard.GetWindowRect(childHwnd, out var childNative))
+                        {
+                            var childRect = childNative.ToRectangle();
+                            if (!expectedContentScreen.Contains(childRect)
+                                || Math.Abs(childRect.Width - expectedContentScreen.Width) > 2
+                                || Math.Abs(childRect.Height - expectedContentScreen.Height) > 2)
+                            {
+                                throw new InvalidOperationException(
+                                    $"Pane {i} Chromium child HWND rect {childRect} outside/mismatched {expectedContentScreen}.");
+                            }
+                        }
+
+                        viewScreenRects[i] = viewNative.ToRectangle();
+                        headerScreenRects[i] = headerNative.ToRectangle();
+                    }
+
+                    if (!RectanglesDoNotOverlap(viewScreenRects))
+                    {
+                        throw new InvalidOperationException("Win32 WebView2 screen rectangles overlapped.");
+                    }
+                    for (var i = 0; i < expectedPaneCount; i++)
+                    {
+                        for (var j = 0; j < expectedPaneCount; j++)
+                        {
+                            if (viewScreenRects[i].IntersectsWith(headerScreenRects[j]))
+                            {
+                                throw new InvalidOperationException(
+                                    $"Pane {i} WebView2 screen rect intersected PaneHeader {j}.");
+                            }
+                        }
+                    }
+                }
+
+                PumpVoid(form.NavigateActiveTabForTestingAsync($"http://127.0.0.1:{port}/pane/1"));
+                if (!Pump(form.AddMultiViewPaneForTestingAsync()))
+                {
+                    throw new InvalidOperationException("Failed to add Multi-View pane 2.");
+                }
+                PumpVoid(form.NavigateActiveTabForTestingAsync($"http://127.0.0.1:{port}/pane/2"));
+                WaitUntil(
+                    () => Volatile.Read(ref paneHits[1]) >= 1
+                        && Volatile.Read(ref paneHits[2]) >= 1
+                        && form.GetLiveVisiblePaneWebViewCountForTesting() == 2,
+                    "Split Multi-View did not load 2 live WebView2 panes in time.");
+
+                // Switch active tab in the tab strip and resize the window while Split is active.
+                form.ActivateTabAtIndexForTesting(0);
+                Application.DoEvents();
+                form.ActivateTabAtIndexForTesting(1);
+                Application.DoEvents();
+                form.ClientSize = new Size(1320, 820);
+                Application.DoEvents();
+                form.ClientSize = new Size(1280, 800);
+                Application.DoEvents();
+                AssertLiveWin32RectsMatch(form, 2);
+
+                for (var paneIndex = 3; paneIndex <= 4; paneIndex++)
+                {
+                    if (!Pump(form.AddMultiViewPaneForTestingAsync()))
+                    {
+                        throw new InvalidOperationException($"Failed to add Multi-View pane {paneIndex}.");
+                    }
+                    PumpVoid(form.NavigateActiveTabForTestingAsync($"http://127.0.0.1:{port}/pane/{paneIndex}"));
+                }
+
+                WaitUntil(
+                    () => Enumerable.Range(1, 4).All(i => Volatile.Read(ref paneHits[i]) >= 1)
+                        && form.GetLiveVisiblePaneWebViewCountForTesting() == 4
+                        && Enumerable.Range(1, 4).All(i =>
+                            form.GetVisiblePaneUrlsForTesting().Any(u => u.EndsWith($"/pane/{i}", StringComparison.OrdinalIgnoreCase))),
+                    "Quad Multi-View did not load all 4 distinct live WebView2 panes in time.");
+
+                AssertLiveWin32RectsMatch(form, 4);
+                actualWin32RectsMatch = true;
+
+                var quad = form.GetMultiViewSnapshotForTesting();
+                panes = quad.PaneCount;
+                liveWebViews = form.GetLiveVisiblePaneWebViewCountForTesting();
+                nonOverlapping = quad.Preset == MultiViewPreset.Quad
+                    && quad.PaneCount == 4
+                    && RectanglesDoNotOverlap(quad.PaneBounds.Take(4))
+                    && quad.ContentBounds.Take(4).All(b => b.Width > 200 && b.Height > 200);
+                if (!nonOverlapping)
+                {
+                    throw new InvalidOperationException("Quad Multi-View layout bounds overlapped or collapsed below 200x200.");
+                }
+
+                focusSwitch = true;
+                for (var p = 0; p < 4; p++)
+                {
+                    form.FocusMultiViewPaneForTesting(p);
+                    Application.DoEvents();
+                    if (form.GetMultiViewSnapshotForTesting().FocusedPaneIndex != p)
+                    {
+                        focusSwitch = false;
+                        throw new InvalidOperationException($"Multi-View focus did not switch cleanly to pane {p}.");
+                    }
+                }
+
+                for (var cycle = 0; cycle < churnCycles; cycle++)
+                {
+                    var previousHits = Volatile.Read(ref paneHits[4]);
+                    form.CloseMultiViewPaneForTesting(3);
+                    Application.DoEvents();
+                    var tri = form.GetMultiViewSnapshotForTesting();
+                    if (tri.Preset != MultiViewPreset.Tri || tri.PaneCount != 3)
+                    {
+                        throw new InvalidOperationException($"Churn cycle {cycle + 1}: expected Tri after closing pane 3.");
+                    }
+
+                    if (!Pump(form.AddMultiViewPaneForTestingAsync()))
+                    {
+                        throw new InvalidOperationException($"Churn cycle {cycle + 1}: failed to re-add pane 4.");
+                    }
+                    PumpVoid(form.NavigateActiveTabForTestingAsync($"http://127.0.0.1:{port}/pane/4"));
+                    WaitUntil(
+                        () => Volatile.Read(ref paneHits[4]) > previousHits
+                            && form.GetLiveVisiblePaneWebViewCountForTesting() == 4,
+                        $"Churn cycle {cycle + 1}: replacement pane 4 WebView2 did not load cleanly.");
+                }
+
+                PumpVoid(form.SetMultiViewPresetForTestingAsync(MultiViewPreset.Single));
+                Application.DoEvents();
+                if (form.GetMultiViewSnapshotForTesting().Preset != MultiViewPreset.Single
+                    || form.GetLiveVisiblePaneWebViewCountForTesting() != 1)
+                {
+                    throw new InvalidOperationException("Returning from Quad to Single did not converge to 1 live pane.");
+                }
+
+                ready = panes == 4 && liveWebViews == 4 && nonOverlapping && actualWin32RectsMatch && focusSwitch;
+            }
+            catch (Exception caught)
+            {
+                probeError = caught;
+            }
+            finally
+            {
+                SynchronizationContext.SetSynchronizationContext(previousSyncContext);
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+    }
+    finally
+    {
+        serverCts.Cancel();
+        try { listener.Stop(); } catch { }
+        try { listener.Close(); } catch { }
+        try { serverLoop.Wait(1000); } catch { }
+    }
+
+    var udfCleaned = DeleteScopedTempProbeFolder(
+        probeFolder,
+        "MishaWeb-LiveMultiView-Probe-",
+        attempts: 15,
+        delayMs: 300);
+
+    if (probeError is not null)
+    {
+        ExceptionDispatchInfoThrow(probeError);
+    }
+
+    return (ready, panes, liveWebViews, nonOverlapping, actualWin32RectsMatch, focusSwitch, churnCycles, udfCleaned);
+
+    static void ExceptionDispatchInfoThrow(Exception ex) =>
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(ex);
+}
+
+bool DeleteScopedTempProbeFolder(string probeFolder, string expectedPrefix, int attempts, int delayMs)
+{
+    var fullPath = Path.GetFullPath(probeFolder);
+    var tempRoot = Path.GetFullPath(Path.GetTempPath());
+    if (!fullPath.StartsWith(tempRoot, StringComparison.OrdinalIgnoreCase)
+        || !Path.GetFileName(fullPath).StartsWith(expectedPrefix, StringComparison.Ordinal))
+    {
+        return false;
+    }
+
+    GC.Collect();
+    GC.WaitForPendingFinalizers();
+    for (var attempt = 0; attempt < attempts && Directory.Exists(fullPath); attempt++)
+    {
+        try
+        {
+            Directory.Delete(fullPath, recursive: true);
+        }
+        catch (IOException) when (attempt < attempts - 1)
+        {
+            Thread.Sleep(delayMs);
+        }
+        catch (UnauthorizedAccessException) when (attempt < attempts - 1)
+        {
+            Thread.Sleep(delayMs);
+        }
+    }
+
+    return !Directory.Exists(fullPath);
+}
+
+sealed class MutableFakeTimeProvider(DateTimeOffset startUtc) : TimeProvider
+{
+    private DateTimeOffset currentUtc = startUtc;
+
+    public void Advance(TimeSpan delta) => currentUtc += delta;
+
+    public override DateTimeOffset GetUtcNow() => currentUtc;
+}
+
+sealed class DelegateHttpMessageHandler(
+    Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> handler) : HttpMessageHandler
+{
+    protected override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken) =>
+        handler(request, cancellationToken);
+}
+
+sealed class ChunkedLargeContent(int totalBytes) : HttpContent
+{
+    protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context)
+    {
+        var chunk = new byte[8192];
+        var remaining = totalBytes;
+        while (remaining > 0)
+        {
+            var count = Math.Min(chunk.Length, remaining);
+            await stream.WriteAsync(chunk.AsMemory(0, count)).ConfigureAwait(false);
+            remaining -= count;
+        }
+    }
+
+    protected override bool TryComputeLength(out long length)
+    {
+        length = 0;
+        return false;
+    }
+}
+
+static class NativeResourceGuard
+{
+    private const uint GrGdiObjects = 0u;
+    private const uint GrUserObjects = 1u;
+    internal const uint GwChild = 5u;
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    internal struct NativeRect
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+
+        public Rectangle ToRectangle() => Rectangle.FromLTRB(Left, Top, Right, Bottom);
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern uint GetGuiResources(IntPtr hProcess, uint uiFlags);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    internal static extern bool GetWindowRect(IntPtr hWnd, out NativeRect lpRect);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    internal static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
+    internal static (uint Gdi, uint User) CaptureGuiResourceCounts()
+    {
+        var process = GetCurrentProcess();
+        return (
+            GetGuiResources(process, GrGdiObjects),
+            GetGuiResources(process, GrUserObjects));
+    }
 }

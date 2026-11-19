@@ -1,40 +1,90 @@
+using System.Buffers;
 using System.Collections.Concurrent;
+using System.Net;
 using System.Net.Http;
 using System.Text.Json;
 
 namespace MishaWeb;
 
 /// <summary>
-/// Fetches real-time search query completions from the default search engine (Google Suggest).
-/// Includes in-memory caching, debouncing, and cooperative token cancellation.
+/// Fetches real-time search query completions from the configured search provider.
+/// Includes in-memory caching, in-flight deduplication, bounded response parsing,
+/// and offline circuit-breaker backoff.
 /// </summary>
 internal sealed class SearchSuggestionService
 {
-    private static readonly HttpClient HttpClient = new(new SocketsHttpHandler
+    internal const int MaximumResponseBytes = 64 * 1024;
+    internal const int MaximumCacheEntries = 150;
+    private static readonly TimeSpan CacheDuration = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan[] BackoffDurations =
+    [
+        TimeSpan.FromSeconds(15),
+        TimeSpan.FromSeconds(60),
+        TimeSpan.FromSeconds(180)
+    ];
+
+    private static readonly SocketsHttpHandler SharedHandler = new()
     {
+        AutomaticDecompression = DecompressionMethods.All,
         PooledConnectionLifetime = TimeSpan.FromMinutes(5),
         ConnectTimeout = TimeSpan.FromMilliseconds(1000)
-    })
-    {
-        Timeout = TimeSpan.FromMilliseconds(1200)
     };
 
-    private static readonly TimeSpan CacheDuration = TimeSpan.FromMinutes(10);
+    private readonly HttpClient httpClient;
+    private readonly TimeProvider timeProvider;
+    private readonly object stateSync = new();
     private readonly ConcurrentDictionary<string, (DateTimeOffset FetchedAt, string[] Suggestions)> cache =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, Task<IReadOnlyList<string>>> inFlightRequests =
+        new(StringComparer.OrdinalIgnoreCase);
+    private DateTimeOffset backoffUntilUtc = DateTimeOffset.MinValue;
+    private int consecutiveFailures;
 
     public static SearchSuggestionService Instance { get; } = new();
 
+    public SearchSuggestionService()
+        : this(SharedHandler, disposeHandler: false, TimeProvider.System)
+    {
+    }
+
+    internal SearchSuggestionService(
+        HttpMessageHandler handler,
+        TimeProvider? timeProvider = null,
+        TimeSpan? requestTimeout = null)
+        : this(handler, disposeHandler: false, timeProvider ?? TimeProvider.System, requestTimeout)
+    {
+    }
+
+    private SearchSuggestionService(
+        HttpMessageHandler handler,
+        bool disposeHandler,
+        TimeProvider timeProvider,
+        TimeSpan? requestTimeout = null)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+        this.timeProvider = timeProvider ?? TimeProvider.System;
+        httpClient = new HttpClient(handler, disposeHandler)
+        {
+            Timeout = requestTimeout ?? TimeSpan.FromMilliseconds(1200)
+        };
+    }
+
     public bool TryGetCachedSuggestions(string? query, out IReadOnlyList<string> suggestions)
+        => TryGetCachedSuggestions(query, BrowserPolicy.DefaultSearchProviderId, out suggestions);
+
+    public bool TryGetCachedSuggestions(
+        string? query,
+        string? providerId,
+        out IReadOnlyList<string> suggestions)
     {
         suggestions = Array.Empty<string>();
-        if (string.IsNullOrWhiteSpace(query)) return false;
+        var normalizedQuery = NormalizeQuery(query);
+        if (normalizedQuery.Length == 0) return false;
 
-        var trimmed = TextSafety.RemoveUnpairedSurrogates(query.Trim());
-        if (trimmed.Length == 0 || trimmed.Length > 100) return false;
-
-        if (cache.TryGetValue(trimmed, out var cached)
-            && DateTimeOffset.UtcNow - cached.FetchedAt < CacheDuration)
+        var cacheKey = BuildCacheKey(providerId, normalizedQuery);
+        var now = timeProvider.GetUtcNow();
+        if (cache.TryGetValue(cacheKey, out var cached)
+            && now - cached.FetchedAt < CacheDuration)
         {
             suggestions = cached.Suggestions;
             return true;
@@ -43,95 +93,290 @@ internal sealed class SearchSuggestionService
         return false;
     }
 
-    public async Task<IReadOnlyList<string>> GetSearchSuggestionsAsync(
+    public Task<IReadOnlyList<string>> GetSearchSuggestionsAsync(
         string query,
         CancellationToken cancellationToken = default)
-    {
-        if (string.IsNullOrWhiteSpace(query)) return Array.Empty<string>();
-        var trimmed = TextSafety.RemoveUnpairedSurrogates(query.Trim());
-        if (trimmed.Length == 0 || trimmed.Length > 100) return Array.Empty<string>();
+        => GetSearchSuggestionsAsync(query, BrowserPolicy.DefaultSearchProviderId, cancellationToken);
 
-        if (cache.TryGetValue(trimmed, out var cached)
-            && DateTimeOffset.UtcNow - cached.FetchedAt < CacheDuration)
+    public async Task<IReadOnlyList<string>> GetSearchSuggestionsAsync(
+        string query,
+        string? providerId,
+        CancellationToken cancellationToken = default)
+    {
+        var normalizedQuery = NormalizeQuery(query);
+        if (normalizedQuery.Length == 0 || cancellationToken.IsCancellationRequested)
+        {
+            return Array.Empty<string>();
+        }
+
+        var normalizedProviderId = BrowserPolicy.NormalizeSearchProviderId(providerId);
+        var cacheKey = BuildCacheKey(normalizedProviderId, normalizedQuery);
+        var now = timeProvider.GetUtcNow();
+        if (cache.TryGetValue(cacheKey, out var cached)
+            && now - cached.FetchedAt < CacheDuration)
         {
             return cached.Suggestions;
         }
 
+        lock (stateSync)
+        {
+            if (now < backoffUntilUtc)
+            {
+                return Array.Empty<string>();
+            }
+        }
+
+        // Coalesce concurrent identical lookups without coupling caller cancellation
+        // tokens to the shared network request.
+        var sharedTask = inFlightRequests.GetOrAdd(
+            cacheKey,
+            static (key, state) => state.Service.FetchAndCacheAsync(
+                key,
+                state.ProviderId,
+                state.Query),
+            (Service: this, ProviderId: normalizedProviderId, Query: normalizedQuery));
+
         try
         {
-            var url = "https://suggestqueries.google.com/complete/search?client=firefox&q=" + Uri.EscapeDataString(trimmed);
+            return await sharedTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return Array.Empty<string>();
+        }
+    }
+
+    private async Task<IReadOnlyList<string>> FetchAndCacheAsync(
+        string cacheKey,
+        string providerId,
+        string normalizedQuery)
+    {
+        try
+        {
+            var url = BuildEndpointUrl(providerId, normalizedQuery);
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
             request.Headers.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
 
-            using var response = await HttpClient.SendAsync(
+            using var response = await httpClient.SendAsync(
                 request,
-                HttpCompletionOption.ResponseHeadersRead,
-                cancellationToken).ConfigureAwait(false);
+                HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
 
-            if (!response.IsSuccessStatusCode) return Array.Empty<string>();
-
-            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-            using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
-
-            if (doc.RootElement.ValueKind == JsonValueKind.Array && doc.RootElement.GetArrayLength() >= 2)
+            if (!response.IsSuccessStatusCode)
             {
-                var itemsElement = doc.RootElement[1];
-                if (itemsElement.ValueKind == JsonValueKind.Array)
+                if (response.StatusCode == HttpStatusCode.TooManyRequests
+                    || (int)response.StatusCode >= 500)
                 {
-                    var list = new List<string>(8);
-                    foreach (var elem in itemsElement.EnumerateArray())
-                    {
-                        var text = elem.GetString();
-                        if (!string.IsNullOrWhiteSpace(text)
-                            && !list.Contains(text, StringComparer.OrdinalIgnoreCase))
-                        {
-                            list.Add(text);
-                            if (list.Count >= 6) break;
-                        }
-                    }
-
-                    var results = list.ToArray();
-                    var now = DateTimeOffset.UtcNow;
-                    if (cache.Count >= 150)
-                    {
-                        var cutoff = now - CacheDuration;
-                        var expiredKeys = new List<string>();
-                        foreach (var entry in cache)
-                        {
-                            if (entry.Value.FetchedAt < cutoff) expiredKeys.Add(entry.Key);
-                        }
-                        foreach (var key in expiredKeys) cache.TryRemove(key, out _);
-
-                        while (cache.Count >= 150)
-                        {
-                            string? oldestKey = null;
-                            var oldestTime = DateTimeOffset.MaxValue;
-                            foreach (var entry in cache)
-                            {
-                                if (entry.Value.FetchedAt < oldestTime)
-                                {
-                                    oldestTime = entry.Value.FetchedAt;
-                                    oldestKey = entry.Key;
-                                }
-                            }
-                            if (oldestKey is null) break;
-                            cache.TryRemove(oldestKey, out _);
-                        }
-                    }
-                    cache[trimmed] = (now, results);
-                    return results;
+                    RecordFailure();
                 }
+                return Array.Empty<string>();
+            }
+
+            if (response.Content.Headers.ContentLength is { } contentLength
+                && contentLength > MaximumResponseBytes)
+            {
+                RecordFailure();
+                return Array.Empty<string>();
+            }
+
+            await using var rawStream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false);
+            var (pooledBuffer, byteCount) = await ReadBoundedPooledBytesAsync(rawStream, MaximumResponseBytes).ConfigureAwait(false);
+            if (pooledBuffer is null)
+            {
+                RecordFailure();
+                return Array.Empty<string>();
+            }
+
+            try
+            {
+                using var doc = JsonDocument.Parse(pooledBuffer.AsMemory(0, byteCount));
+                var results = ParseSuggestions(doc.RootElement);
+                var now = timeProvider.GetUtcNow();
+                StoreInCache(cacheKey, now, results);
+                ResetBackoff();
+                return results;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(pooledBuffer);
             }
         }
-        catch (OperationCanceledException)
+        catch (TaskCanceledException)
         {
-            // Query was superseded by subsequent user typing
+            // HttpClient.Timeout fires TaskCanceledException on the shared un-canceled task.
+            RecordFailure();
+            return Array.Empty<string>();
+        }
+        catch (HttpRequestException)
+        {
+            RecordFailure();
+            return Array.Empty<string>();
+        }
+        catch (JsonException)
+        {
+            return Array.Empty<string>();
         }
         catch
         {
-            // Network failure or timeout: gracefully fallback to local results
+            RecordFailure();
+            return Array.Empty<string>();
+        }
+        finally
+        {
+            inFlightRequests.TryRemove(cacheKey, out _);
+        }
+    }
+
+    private static string NormalizeQuery(string? query)
+    {
+        if (string.IsNullOrWhiteSpace(query)) return string.Empty;
+        var trimmed = TextSafety.RemoveUnpairedSurrogates(query.Trim());
+        return trimmed.Length == 0 || trimmed.Length > 100 ? string.Empty : trimmed;
+    }
+
+    private static string BuildCacheKey(string? providerId, string normalizedQuery)
+    {
+        return $"{BrowserPolicy.NormalizeSearchProviderId(providerId)}|{normalizedQuery}";
+    }
+
+    private static string BuildEndpointUrl(string providerId, string normalizedQuery)
+    {
+        // Currently Google is the sole supported provider in BrowserPolicy.
+        _ = providerId;
+        return "https://suggestqueries.google.com/complete/search?client=firefox&q="
+            + Uri.EscapeDataString(normalizedQuery);
+    }
+
+    private static async Task<(byte[]? Buffer, int Length)> ReadBoundedPooledBytesAsync(Stream stream, int maxBytes)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(Math.Min(4096, maxBytes));
+        var totalRead = 0;
+        try
+        {
+            while (true)
+            {
+                if (totalRead == buffer.Length)
+                {
+                    if (totalRead >= maxBytes)
+                    {
+                        var overflowProbe = new byte[1];
+                        var extra = await stream.ReadAsync(overflowProbe.AsMemory(0, 1)).ConfigureAwait(false);
+                        if (extra > 0)
+                        {
+                            ArrayPool<byte>.Shared.Return(buffer);
+                            return (null, 0);
+                        }
+                        return (buffer, totalRead);
+                    }
+                    var nextCapacity = Math.Min(maxBytes, buffer.Length * 2);
+                    var grown = ArrayPool<byte>.Shared.Rent(nextCapacity);
+                    Buffer.BlockCopy(buffer, 0, grown, 0, totalRead);
+                    ArrayPool<byte>.Shared.Return(buffer);
+                    buffer = grown;
+                }
+
+                var maxStep = Math.Min(buffer.Length - totalRead, maxBytes - totalRead);
+                var read = await stream.ReadAsync(buffer.AsMemory(totalRead, maxStep)).ConfigureAwait(false);
+                if (read == 0) return (buffer, totalRead);
+                totalRead += read;
+
+                if (totalRead == maxBytes)
+                {
+                    var overflowProbe = new byte[1];
+                    var extra = await stream.ReadAsync(overflowProbe.AsMemory(0, 1)).ConfigureAwait(false);
+                    if (extra > 0)
+                    {
+                        ArrayPool<byte>.Shared.Return(buffer);
+                        return (null, 0);
+                    }
+                    return (buffer, totalRead);
+                }
+            }
+        }
+        catch
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+            throw;
+        }
+    }
+
+    private static string[] ParseSuggestions(JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Array || root.GetArrayLength() < 2)
+        {
+            return Array.Empty<string>();
         }
 
-        return Array.Empty<string>();
+        var itemsElement = root[1];
+        if (itemsElement.ValueKind != JsonValueKind.Array)
+        {
+            return Array.Empty<string>();
+        }
+
+        var list = new List<string>(8);
+        foreach (var elem in itemsElement.EnumerateArray())
+        {
+            if (elem.ValueKind != JsonValueKind.String) continue;
+            var sanitized = TextSafety.SanitizeSingleLine(elem.GetString(), 100);
+            if (sanitized.Length == 0 || list.Contains(sanitized, StringComparer.OrdinalIgnoreCase)) continue;
+            list.Add(sanitized);
+            if (list.Count >= 6) break;
+        }
+        return list.Count == 0 ? Array.Empty<string>() : list.ToArray();
+    }
+
+    private void StoreInCache(string cacheKey, DateTimeOffset now, string[] results)
+    {
+        lock (stateSync)
+        {
+            if (cache.Count >= MaximumCacheEntries)
+            {
+                var cutoff = now - CacheDuration;
+                foreach (var entry in cache)
+                {
+                    if (entry.Value.FetchedAt < cutoff)
+                    {
+                        cache.TryRemove(entry.Key, out _);
+                    }
+                }
+
+                while (cache.Count >= MaximumCacheEntries)
+                {
+                    string? oldestKey = null;
+                    var oldestTime = DateTimeOffset.MaxValue;
+                    foreach (var entry in cache)
+                    {
+                        if (entry.Value.FetchedAt < oldestTime)
+                        {
+                            oldestTime = entry.Value.FetchedAt;
+                            oldestKey = entry.Key;
+                        }
+                    }
+                    if (oldestKey is null) break;
+                    cache.TryRemove(oldestKey, out _);
+                }
+            }
+
+            cache[cacheKey] = (now, results);
+        }
+    }
+
+    private void RecordFailure()
+    {
+        var now = timeProvider.GetUtcNow();
+        lock (stateSync)
+        {
+            var index = Math.Clamp(consecutiveFailures, 0, BackoffDurations.Length - 1);
+            consecutiveFailures = Math.Min(consecutiveFailures + 1, BackoffDurations.Length);
+            backoffUntilUtc = now + BackoffDurations[index];
+        }
+    }
+
+    private void ResetBackoff()
+    {
+        lock (stateSync)
+        {
+            consecutiveFailures = 0;
+            backoffUntilUtc = DateTimeOffset.MinValue;
+        }
     }
 }

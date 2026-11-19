@@ -5,6 +5,7 @@ export const PACKAGED_BROWSER_IMAGE_NAME = 'MishaWeb.exe';
 export const PRIVATE_PROBE_ARGUMENT = '--private-probe';
 export const PRIVATE_CHURN_PROBE_ARGUMENT = '--private-churn-probe';
 export const NORMAL_PROFILE_ARGUMENT = '--normal-profile';
+export const MULTI_VIEW_ARGUMENT = '--multi-view';
 
 const CHURN_BOUNDS = Object.freeze({
   minimumCycles: 3,
@@ -103,7 +104,8 @@ export function createProbeLaunchContract({
   startupUrl,
   normalProfile = false,
   allowPackagedNormal = true,
-  churn = null
+  churn = null,
+  multiView = null
 }) {
   const resolvedExecutablePath = path.resolve(requireNonEmptyString(executablePath, 'executablePath'));
   const normalizedStartupUrl = requireNonEmptyString(startupUrl, 'startupUrl');
@@ -112,12 +114,18 @@ export function createProbeLaunchContract({
   const isIsolatedLauncher = normalizedImageName === ISOLATED_PROBE_IMAGE_NAME.toLowerCase();
   const isPackagedBrowser = normalizedImageName === PACKAGED_BROWSER_IMAGE_NAME.toLowerCase();
   const privateChurn = validatePrivateChurn(normalizedStartupUrl, churn);
+  const validatedMultiView = multiView === null || multiView === undefined
+    ? null
+    : requireBoundedInteger(multiView, 'multiView', 2, 4);
 
   if (normalProfile && privateChurn) {
     throw new Error('Private churn cannot run against the normal profile');
   }
   if (privateChurn && !isIsolatedLauncher) {
     throw new Error(`Private churn requires ${ISOLATED_PROBE_IMAGE_NAME}`);
+  }
+  if (validatedMultiView !== null && !isIsolatedLauncher) {
+    throw new Error(`Multi-view probe requires ${ISOLATED_PROBE_IMAGE_NAME}`);
   }
 
   if (!normalProfile && !isIsolatedLauncher) {
@@ -131,7 +139,7 @@ export function createProbeLaunchContract({
       + (allowPackagedNormal ? ` or ${PACKAGED_BROWSER_IMAGE_NAME}` : ''));
   }
 
-  const childArguments = privateChurn
+  const baseArguments = privateChurn
     ? [
         PRIVATE_CHURN_PROBE_ARGUMENT,
         normalizedStartupUrl,
@@ -144,6 +152,12 @@ export function createProbeLaunchContract({
       ? [NORMAL_PROFILE_ARGUMENT, normalizedStartupUrl]
       : [normalizedStartupUrl]
     : [PRIVATE_PROBE_ARGUMENT, normalizedStartupUrl];
+  const childArguments = validatedMultiView === null
+    ? baseArguments
+    : [...baseArguments, MULTI_VIEW_ARGUMENT, String(validatedMultiView)];
+  const workload = validatedMultiView !== null
+    ? (privateChurn ? 'multi-view-bounded-tab-churn' : `multi-view-${validatedMultiView}`)
+    : (privateChurn ? 'bounded-tab-churn' : 'single-tab');
 
   return Object.freeze({
     executablePath: resolvedExecutablePath,
@@ -151,7 +165,8 @@ export function createProbeLaunchContract({
     executableKind: isIsolatedLauncher ? 'isolated-probe-launcher' : 'packaged-browser',
     browserMode: normalProfile ? 'normal' : 'private',
     profileMode: normalProfile ? 'normal-opt-in' : 'private-disposable',
-    workload: privateChurn ? 'bounded-tab-churn' : 'single-tab',
+    workload,
+    multiView: validatedMultiView,
     churn: privateChurn,
     usesDisposableUserDataFolder: !normalProfile,
     childArguments: Object.freeze(childArguments)

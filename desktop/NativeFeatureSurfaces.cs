@@ -64,7 +64,6 @@ internal sealed class CommandPaletteForm : Form
     private readonly ListBox resultList = new();
     private readonly System.Windows.Forms.Timer queryTimer = new() { Interval = 35 };
     private readonly Func<string, IReadOnlyList<RankedCommand>> rowProvider;
-    private readonly Action<CommandCandidate> activate;
     private IReadOnlyList<RankedCommand> rows = [];
 
     public CommandPaletteForm(
@@ -72,7 +71,7 @@ internal sealed class CommandPaletteForm : Form
         Action<CommandCandidate> activate)
     {
         this.rowProvider = rowProvider ?? throw new ArgumentNullException(nameof(rowProvider));
-        this.activate = activate ?? throw new ArgumentNullException(nameof(activate));
+        ArgumentNullException.ThrowIfNull(activate);
         NativeDialogLayout.EnableDpiScaling(this);
 
         Text = "Command palette";
@@ -836,12 +835,20 @@ internal sealed class PermissionManagerForm : Form
     public void SetRows(IReadOnlyList<PermissionSettingRow> entries)
     {
         rows = entries ?? [];
-        settingList.Items.Clear();
-        foreach (var row in rows)
+        settingList.BeginUpdate();
+        try
         {
-            settingList.Items.Add($"{row.Origin} \u2014 {row.Permission} \u2014 {row.State}");
+            settingList.Items.Clear();
+            foreach (var row in rows)
+            {
+                settingList.Items.Add($"{row.Origin} \u2014 {row.Permission} \u2014 {row.State}");
+            }
+            if (settingList.Items.Count > 0) settingList.SelectedIndex = 0;
         }
-        if (settingList.Items.Count > 0) settingList.SelectedIndex = 0;
+        finally
+        {
+            settingList.EndUpdate();
+        }
         UpdateButtons();
     }
 
@@ -1148,10 +1155,10 @@ internal sealed class DownloadNotificationForm : Form
     private const int CompletionAutoHideMs = 5_000;
     private const int HoverRecheckMs = 1_200;
 
-    private static readonly Font HeaderFont = new("Segoe UI Semibold", 9f);
-    private static readonly Font FileNameFont = new("Segoe UI Semibold", 9.5f);
-    private static readonly Font DetailFont = new("Segoe UI", 8.25f);
-    private static readonly Font DismissFont = new("Segoe UI", 9.5f);
+    private static readonly Font HeaderFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 9f);
+    private static readonly Font FileNameFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 9.5f);
+    private static readonly Font DetailFont = NativeUiTheme.GetSharedFont("Segoe UI", 8.25f);
+    private static readonly Font DismissFont = NativeUiTheme.GetSharedFont("Segoe UI", 9.5f);
 
     private readonly Action<DownloadPopupAction, object> action;
     private readonly Action openDownloadsList;
@@ -1241,9 +1248,13 @@ internal sealed class DownloadNotificationForm : Form
 
         progressTrack.Dock = DockStyle.Fill;
         progressTrack.Margin = new Padding(0, 3, 0, 3);
+        NativeUiTheme.EnableDoubleBuffering(progressTrack);
         progressTrack.Paint += OnProgressTrackPaint;
 
         var actions = NativeDialogLayout.CreateActionBar(wrap: false);
+        NativeUiTheme.EnableDoubleBuffering(root);
+        NativeUiTheme.EnableDoubleBuffering(headerRow);
+        NativeUiTheme.EnableDoubleBuffering(actions);
         ConfigureCompactButton(openButton, "Open", "Open the downloaded file");
         ConfigureCompactButton(folderButton, "Show in folder", "Show the downloaded file in its folder");
         ConfigureCompactButton(cancelButton, "Cancel", "Cancel the download");
@@ -1346,6 +1357,7 @@ internal sealed class DownloadNotificationForm : Form
     public void Dismiss()
     {
         autoHideTimer.Stop();
+        currentState = null;
         if (Visible) Hide();
     }
 

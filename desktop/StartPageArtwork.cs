@@ -20,24 +20,26 @@ internal static class StartPageArtwork
     private static readonly Color Orchid = NativeUiTheme.Lavender;
     private static readonly Color Glyph = NativeUiTheme.Text;
     // Loaded inside BackdropFrameSync while backdropFrameLeases > 0 (released
-    // together with backdropFrame when the last start-page tab closes/hides).
+    // together with cached frames when the last start-page tab closes/hides, or
+    // after a short cooldown on low-spec machines).
     private static Bitmap? backdropSource;
     private static bool backdropSourceAttempted;
+    private static long backdropSourceLastUsedTick;
 
-    // One process-wide frame is enough because only the visible native start page
-    // paints. It is intentionally capped to the embedded artwork dimensions: a 4K
-    // window therefore cannot turn each open start-page tab into a 32 MB bitmap.
-    // The artwork is opaque, so a 24-bit frame avoids an unused alpha byte per
-    // pixel. The backing bitmap grows in small buckets and is reused while resizing.
+    // Bounding cache entries to 4 slots keeps Multi-View Quad panes with mixed
+    // sizes hot simultaneously without blowing memory on resize. Total pixel bytes
+    // remain capped (12 MiB normal / 4 MiB low-spec), and Format24bppRgb avoids
+    // wasting an alpha channel on the opaque artwork.
     private const int FrameGrowthQuantum = 128;
     private const int FallbackFrameWidth = 1600;
     private const int FallbackFrameHeight = 900;
+    private const int MaximumCachedFrames = 4;
+    private const long NormalCacheByteBudget = 12L * 1024 * 1024;
+    private const long LowSpecCacheByteBudget = 4L * 1024 * 1024;
+    private const long LowSpecSourceCooldownMs = 3_000;
     private static readonly object BackdropFrameSync = new();
-    private static Bitmap? backdropFrame;
-    private static Size backdropFrameCapacity;
-    private static Size renderedFrameSize;
-    private static BackdropFrameKey renderedFrameKey;
-    private static bool hasRenderedFrame;
+    private static readonly List<BackdropCacheEntry> BackdropCache = new(MaximumCachedFrames);
+    private static long backdropCacheBytes;
     private static int backdropFrameLeases;
 
     public static void DrawBackdrop(Graphics graphics, Rectangle destination)
@@ -90,13 +92,14 @@ internal static class StartPageArtwork
                 return;
             }
 
-            EnsureBackdropFrame(viewportSize, graphics.DpiX, graphics.DpiY);
-            if (backdropFrame is null || renderedFrameSize.Width <= 0 || renderedFrameSize.Height <= 0)
+            var entry = EnsureBackdropFrame(viewportSize, graphics.DpiX, graphics.DpiY);
+            if (entry is null || entry.RenderedSize.Width <= 0 || entry.RenderedSize.Height <= 0)
             {
                 DrawBackdropDirect(graphics, destination);
                 return;
             }
 
+            var renderedFrameSize = entry.RenderedSize;
             var sourceScaleX = renderedFrameSize.Width / (float)viewportSize.Width;
             var sourceScaleY = renderedFrameSize.Height / (float)viewportSize.Height;
             var source = new RectangleF(
@@ -105,17 +108,7 @@ internal static class StartPageArtwork
                 clippedSlice.Width * sourceScaleX,
                 clippedSlice.Height * sourceScaleY);
 
-            var adjustedDestination = destination;
-            if (clippedSlice != viewportSlice)
-            {
-                var destinationScaleX = destination.Width / (float)viewportSlice.Width;
-                var destinationScaleY = destination.Height / (float)viewportSlice.Height;
-                adjustedDestination = Rectangle.Round(new RectangleF(
-                    destination.X + ((clippedSlice.X - viewportSlice.X) * destinationScaleX),
-                    destination.Y + ((clippedSlice.Y - viewportSlice.Y) * destinationScaleY),
-                    clippedSlice.Width * destinationScaleX,
-                    clippedSlice.Height * destinationScaleY));
-            }
+            var destRect = adjustedDestination(viewportSize, viewportSlice, clippedSlice, destination);
 
             var previousCompositingMode = graphics.CompositingMode;
             var previousCompositing = graphics.CompositingQuality;
@@ -124,8 +117,8 @@ internal static class StartPageArtwork
             try
             {
                 var isUnscaledOneToOneCopy = renderedFrameSize == viewportSize
-                    && adjustedDestination.Width == clippedSlice.Width
-                    && adjustedDestination.Height == clippedSlice.Height
+                    && destRect.Width == clippedSlice.Width
+                    && destRect.Height == clippedSlice.Height
                     && Math.Abs(source.X - clippedSlice.X) < 0.01f
                     && Math.Abs(source.Y - clippedSlice.Y) < 0.01f;
                 // backdropFrame is 100% opaque 24bpp RGB, so SourceCopy avoids alpha
@@ -139,8 +132,8 @@ internal static class StartPageArtwork
                     ? PixelOffsetMode.None
                     : PixelOffsetMode.HighQuality;
                 graphics.DrawImage(
-                    backdropFrame,
-                    adjustedDestination,
+                    entry.Frame,
+                    destRect,
                     source.X,
                     source.Y,
                     source.Width,
@@ -157,11 +150,27 @@ internal static class StartPageArtwork
         }
     }
 
+    private static Rectangle adjustedDestination(
+        Size viewportSize,
+        Rectangle viewportSlice,
+        Rectangle clippedSlice,
+        Rectangle destination)
+    {
+        if (clippedSlice == viewportSlice || viewportSize.IsEmpty) return destination;
+        var destinationScaleX = destination.Width / (float)viewportSlice.Width;
+        var destinationScaleY = destination.Height / (float)viewportSlice.Height;
+        return Rectangle.Round(new RectangleF(
+            destination.X + ((clippedSlice.X - viewportSlice.X) * destinationScaleX),
+            destination.Y + ((clippedSlice.Y - viewportSlice.Y) * destinationScaleY),
+            clippedSlice.Width * destinationScaleX,
+            clippedSlice.Height * destinationScaleY));
+    }
+
     public static void InvalidateBackdropFrame()
     {
         lock (BackdropFrameSync)
         {
-            hasRenderedFrame = false;
+            ClearBackdropCacheLocked();
         }
     }
 
@@ -180,15 +189,11 @@ internal static class StartPageArtwork
             if (backdropFrameLeases > 0) backdropFrameLeases--;
             if (backdropFrameLeases != 0) return;
 
-            backdropFrame?.Dispose();
-            backdropFrame = null;
-            backdropFrameCapacity = Size.Empty;
-            renderedFrameSize = Size.Empty;
-            renderedFrameKey = default;
-            hasRenderedFrame = false;
+            ClearBackdropCacheLocked();
             backdropSource?.Dispose();
             backdropSource = null;
             backdropSourceAttempted = false;
+            backdropSourceLastUsedTick = 0;
         }
     }
 
@@ -197,69 +202,133 @@ internal static class StartPageArtwork
     {
         lock (BackdropFrameSync)
         {
-            return (backdropFrameLeases, backdropFrame is not null, backdropFrame?.PixelFormat);
+            var allocated = BackdropCache.Count > 0;
+            return (backdropFrameLeases, allocated, allocated ? BackdropCache[^1].Frame.PixelFormat : null);
         }
     }
 
-    private static void EnsureBackdropFrame(Size viewportSize, float dpiX, float dpiY)
+    internal static int GetCachedFrameCountForTesting()
     {
+        lock (BackdropFrameSync)
+        {
+            return BackdropCache.Count;
+        }
+    }
+
+    private static BackdropCacheEntry? EnsureBackdropFrame(Size viewportSize, float dpiX, float dpiY)
+    {
+        var memory = SystemResourceInfo.CaptureMemory();
+        var isLowSpec = memory.IsLowSpecMachine;
+        var clampedDpiX = Math.Clamp((int)Math.Round(dpiX), 48, 768);
+        var clampedDpiY = Math.Clamp((int)Math.Round(dpiY), 48, 768);
+
+        for (var i = BackdropCache.Count - 1; i >= 0; i--)
+        {
+            var candidate = BackdropCache[i];
+            if (candidate.Key.ViewportSize == viewportSize
+                && candidate.Key.DpiX == clampedDpiX
+                && candidate.Key.DpiY == clampedDpiY)
+            {
+                if (i < BackdropCache.Count - 1)
+                {
+                    BackdropCache.RemoveAt(i);
+                    BackdropCache.Add(candidate);
+                }
+                if (isLowSpec
+                    && backdropSource is not null
+                    && Environment.TickCount64 - backdropSourceLastUsedTick >= LowSpecSourceCooldownMs)
+                {
+                    backdropSource.Dispose();
+                    backdropSource = null;
+                    backdropSourceAttempted = false;
+                }
+                return candidate;
+            }
+        }
+
         var frameSize = CalculateFrameSize(viewportSize);
         var key = new BackdropFrameKey(
             viewportSize,
             frameSize,
-            Math.Clamp((int)Math.Round(dpiX), 48, 768),
-            Math.Clamp((int)Math.Round(dpiY), 48, 768));
-        if (hasRenderedFrame && renderedFrameKey == key) return;
+            clampedDpiX,
+            clampedDpiY);
+
+        var capacity = new Size(
+            Math.Min(GetFrameLimit().Width, RoundUp(frameSize.Width, FrameGrowthQuantum)),
+            Math.Min(GetFrameLimit().Height, RoundUp(frameSize.Height, FrameGrowthQuantum)));
+        capacity = new Size(Math.Max(1, capacity.Width), Math.Max(1, capacity.Height));
+        var byteBudget = isLowSpec ? LowSpecCacheByteBudget : NormalCacheByteBudget;
+        var entryBytes = (long)capacity.Width * capacity.Height * 3L;
+
+        // Reuse an LRU slot's Bitmap if capacity already fits when evicting.
+        Bitmap? recycledBitmap = null;
+        Size recycledCapacity = Size.Empty;
+        long recycledBytes = 0;
+
+        while (BackdropCache.Count >= MaximumCachedFrames
+               || (BackdropCache.Count > 0 && backdropCacheBytes + entryBytes > byteBudget))
+        {
+            var evicted = BackdropCache[0];
+            BackdropCache.RemoveAt(0);
+            backdropCacheBytes -= evicted.ByteEstimate;
+            if (recycledBitmap is null
+                && evicted.Capacity.Width >= frameSize.Width
+                && evicted.Capacity.Height >= frameSize.Height
+                && evicted.ByteEstimate <= Math.Max(entryBytes, byteBudget))
+            {
+                recycledBitmap = evicted.Frame;
+                recycledCapacity = evicted.Capacity;
+                recycledBytes = evicted.ByteEstimate;
+            }
+            else
+            {
+                evicted.Frame.Dispose();
+            }
+        }
 
         // When an unusually large viewport is downsampled into the bounded frame,
         // scale its bitmap DPI by the same ratio. The vector fallback therefore
         // retains its original on-screen size after the frame is enlarged again.
         var frameDpiX = Math.Max(1f, key.DpiX * (frameSize.Width / (float)viewportSize.Width));
         var frameDpiY = Math.Max(1f, key.DpiY * (frameSize.Height / (float)viewportSize.Height));
-        EnsureBackdropFrameCapacity(frameSize, frameDpiX, frameDpiY);
-        if (backdropFrame is null) return;
 
-        using (var frameGraphics = Graphics.FromImage(backdropFrame))
+        Bitmap targetBitmap;
+        Size targetCapacity;
+        long targetBytes;
+        if (recycledBitmap is not null)
+        {
+            targetBitmap = recycledBitmap;
+            targetCapacity = recycledCapacity;
+            targetBytes = recycledBytes;
+        }
+        else
+        {
+            targetBitmap = new Bitmap(capacity.Width, capacity.Height, PixelFormat.Format24bppRgb);
+            targetCapacity = capacity;
+            targetBytes = entryBytes;
+        }
+
+        targetBitmap.SetResolution(frameDpiX, frameDpiY);
+        using (var frameGraphics = Graphics.FromImage(targetBitmap))
         {
             DrawBackdropDirect(frameGraphics, new Rectangle(Point.Empty, frameSize));
         }
 
-        renderedFrameSize = frameSize;
-        renderedFrameKey = key;
-        hasRenderedFrame = true;
-
-        if (SystemResourceInfo.CaptureMemory().IsLowSpecMachine && backdropSource is not null)
-        {
-            backdropSource.Dispose();
-            backdropSource = null;
-            backdropSourceAttempted = false;
-        }
+        backdropSourceLastUsedTick = Environment.TickCount64;
+        var created = new BackdropCacheEntry(key, frameSize, targetCapacity, targetBitmap, targetBytes);
+        BackdropCache.Add(created);
+        backdropCacheBytes += targetBytes;
+        return created;
     }
 
-    private static void EnsureBackdropFrameCapacity(Size requiredSize, float dpiX, float dpiY)
+    private static void ClearBackdropCacheLocked()
     {
-        if (backdropFrame is not null
-            && backdropFrameCapacity.Width >= requiredSize.Width
-            && backdropFrameCapacity.Height >= requiredSize.Height)
+        for (var i = 0; i < BackdropCache.Count; i++)
         {
-            backdropFrame.SetResolution(dpiX, dpiY);
-            return;
+            BackdropCache[i].Frame.Dispose();
         }
-
-        var limit = GetFrameLimit();
-        var capacity = new Size(
-            Math.Min(limit.Width, RoundUp(requiredSize.Width, FrameGrowthQuantum)),
-            Math.Min(limit.Height, RoundUp(requiredSize.Height, FrameGrowthQuantum)));
-        var nextFrame = new Bitmap(
-            Math.Max(1, capacity.Width),
-            Math.Max(1, capacity.Height),
-            PixelFormat.Format24bppRgb);
-        nextFrame.SetResolution(dpiX, dpiY);
-
-        var previousFrame = backdropFrame;
-        backdropFrame = nextFrame;
-        backdropFrameCapacity = capacity;
-        previousFrame?.Dispose();
+        BackdropCache.Clear();
+        backdropCacheBytes = 0;
     }
 
     private static Size CalculateFrameSize(Size viewportSize)
@@ -290,6 +359,7 @@ internal static class StartPageArtwork
             backdropSourceAttempted = true;
             backdropSource = LoadBackdropImage();
         }
+        backdropSourceLastUsedTick = Environment.TickCount64;
         return backdropSource;
     }
 
@@ -388,6 +458,20 @@ internal static class StartPageArtwork
         Size FrameSize,
         int DpiX,
         int DpiY);
+
+    private sealed class BackdropCacheEntry(
+        BackdropFrameKey key,
+        Size renderedSize,
+        Size capacity,
+        Bitmap frame,
+        long byteEstimate)
+    {
+        public BackdropFrameKey Key { get; } = key;
+        public Size RenderedSize { get; } = renderedSize;
+        public Size Capacity { get; } = capacity;
+        public Bitmap Frame { get; } = frame;
+        public long ByteEstimate { get; } = byteEstimate;
+    }
 
     private static Bitmap? LoadBackdropImage()
     {

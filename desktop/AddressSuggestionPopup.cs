@@ -10,9 +10,9 @@ internal sealed class AddressSuggestionPopup : Control
     private static readonly Color PrimaryTextColor = NativeUiTheme.Text;
     private static readonly Color SecondaryTextColor = NativeUiTheme.Muted;
     private static readonly Color AccentColor = NativeUiTheme.Accent;
-    private static readonly Font PrimaryFont = new("Segoe UI Semibold", 9.5f);
-    private static readonly Font SecondaryFont = new("Segoe UI", 8.25f);
-    private static readonly Font PillFont = new("Segoe UI Semibold", 8f);
+    private static readonly Font PrimaryFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 9.5f);
+    private static readonly Font SecondaryFont = NativeUiTheme.GetSharedFont("Segoe UI", 8.25f);
+    private static readonly Font PillFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 8f);
 
     private IReadOnlyList<AddressSuggestion> allSuggestions = Array.Empty<AddressSuggestion>();
     private IReadOnlyList<AddressSuggestion> suggestions = Array.Empty<AddressSuggestion>();
@@ -49,9 +49,11 @@ internal sealed class AddressSuggestionPopup : Control
         {
             var next = suggestions.Count == 0 ? -1 : Math.Clamp(value, -1, suggestions.Count - 1);
             if (selectedIndex == next) return;
+            var previous = selectedIndex;
             selectedIndex = next;
             AccessibilityNotifyClients(AccessibleEvents.Selection, selectedIndex);
-            Invalidate();
+            InvalidateRow(previous);
+            InvalidateRow(selectedIndex);
         }
     }
 
@@ -61,11 +63,14 @@ internal sealed class AddressSuggestionPopup : Control
 
     private int ScaledRowHeight => Math.Max(44, (int)Math.Round(48 * DeviceDpi / 96f));
 
-    public void SetSuggestions(IReadOnlyList<AddressSuggestion> items)
+    public void SetSuggestions(IReadOnlyList<AddressSuggestion> items, bool preserveSelection = false)
     {
+        var previousSelected = preserveSelection && selectedIndex >= 0 && selectedIndex < suggestions.Count
+            ? suggestions[selectedIndex]
+            : (AddressSuggestion?)null;
         allSuggestions = items ?? Array.Empty<AddressSuggestion>();
         suggestions = allSuggestions;
-        selectedIndex = -1;
+        selectedIndex = preserveSelection ? FindSuggestionIndex(previousSelected) : -1;
         hoverIndex = -1;
         removeHoverIndex = -1;
         pressedIndex = -1;
@@ -218,8 +223,10 @@ internal sealed class AddressSuggestionPopup : Control
         var nextHover = index >= 0 && index < suggestions.Count ? index : -1;
         if (hoverIndex != nextHover)
         {
+            var previousHover = hoverIndex;
             hoverIndex = nextHover;
-            Invalidate();
+            InvalidateRow(previousHover);
+            InvalidateRow(nextHover);
         }
         var nextRemoveHover = index >= 0
             && index < suggestions.Count
@@ -229,21 +236,28 @@ internal sealed class AddressSuggestionPopup : Control
                 : -1;
         if (removeHoverIndex != nextRemoveHover)
         {
+            var previousRemoveHover = removeHoverIndex;
             removeHoverIndex = nextRemoveHover;
             Cursor = removeHoverIndex >= 0 ? Cursors.Hand : Cursors.Default;
-            Invalidate();
+            InvalidateRow(previousRemoveHover);
+            InvalidateRow(nextRemoveHover);
         }
     }
 
     protected override void OnMouseLeave(EventArgs e)
     {
         base.OnMouseLeave(e);
+        var previousHover = hoverIndex;
+        var previousRemoveHover = removeHoverIndex;
+        var previousPressed = pressedIndex;
         hoverIndex = -1;
         removeHoverIndex = -1;
         pressedIndex = -1;
         pressedRemove = false;
         Cursor = Cursors.Default;
-        Invalidate();
+        InvalidateRow(previousHover);
+        InvalidateRow(previousRemoveHover);
+        InvalidateRow(previousPressed);
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
@@ -255,7 +269,7 @@ internal sealed class AddressSuggestionPopup : Control
         SelectedIndex = index;
         pressedIndex = index;
         pressedRemove = CanRemoveSuggestion(suggestions[index]) && GetRemoveButtonBounds(index).Contains(e.Location);
-        Invalidate();
+        InvalidateRow(index);
     }
 
     protected override void OnMouseUp(MouseEventArgs e)
@@ -275,9 +289,16 @@ internal sealed class AddressSuggestionPopup : Control
             if (remove) SuggestionRemoved?.Invoke(suggestions[index]);
             else SuggestionAccepted?.Invoke(suggestions[index]);
         }
+        var previousPressed = pressedIndex;
         pressedIndex = -1;
         pressedRemove = false;
-        Invalidate();
+        InvalidateRow(previousPressed);
+    }
+
+    private void InvalidateRow(int index)
+    {
+        if (index < 0 || index >= suggestions.Count || IsDisposed || Width <= 2) return;
+        Invalidate(new Rectangle(1, 1 + (index * ScaledRowHeight), Width - 2, ScaledRowHeight));
     }
 
     protected override void OnPaint(PaintEventArgs e)

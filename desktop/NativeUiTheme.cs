@@ -1,4 +1,5 @@
 using System.Drawing.Drawing2D;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -45,12 +46,18 @@ internal static class NativeUiTheme
     internal static readonly Color Positive = Color.FromArgb(132, 230, 191);
     internal static readonly Color Negative = Color.FromArgb(255, 157, 170);
 
-    private static readonly Font ToolTipFont = new("Segoe UI", 9f);
-    private static readonly Font RowTitleFont = new("Segoe UI Semibold", 9.5f);
-    private static readonly Font RowDetailFont = new("Segoe UI", 8.5f);
-    private static readonly Font RowBadgeFont = new("Segoe UI Semibold", 9f);
-    private static readonly Font RowPillFont = new("Segoe UI Semibold", 8f);
+    private static readonly object SharedFontSync = new();
+    private static readonly Dictionary<(string Family, int QuarterPointSize, FontStyle Style), Font> SharedFonts = new();
+    private static readonly PropertyInfo? DoubleBufferedProperty =
+        typeof(Control).GetProperty("DoubleBuffered", BindingFlags.Instance | BindingFlags.NonPublic);
 
+    private static readonly Font ToolTipFont = GetSharedFont("Segoe UI", 9f);
+    private static readonly Font RowTitleFont = GetSharedFont("Segoe UI Semibold", 9.5f);
+    private static readonly Font RowDetailFont = GetSharedFont("Segoe UI", 8.5f);
+    private static readonly Font RowBadgeFont = GetSharedFont("Segoe UI Semibold", 9f);
+    private static readonly Font RowPillFont = GetSharedFont("Segoe UI Semibold", 8f);
+
+    private static readonly ConditionalWeakTable<Form, AppliedFormThemeState> AppliedForms = new();
     private static readonly ConditionalWeakTable<Form, object> FramedForms = new();
     private static readonly ConditionalWeakTable<Control, object> DarkScrollbarControls = new();
     private static readonly ConditionalWeakTable<ToolStripDropDown, object> FramedMenus = new();
@@ -62,21 +69,58 @@ internal static class NativeUiTheme
         ? SystemColors.GrayText
         : Muted;
 
+    internal static Font GetSharedFont(string familyName, float emSize, FontStyle style = FontStyle.Regular)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(familyName);
+        var quarterPoints = Math.Max(4, (int)MathF.Round(emSize * 4f));
+        var normalizedSize = quarterPoints / 4f;
+        var key = (familyName, quarterPoints, style);
+        lock (SharedFontSync)
+        {
+            if (SharedFonts.TryGetValue(key, out var existing)) return existing;
+            var created = new Font(familyName, normalizedSize, style);
+            SharedFonts[key] = created;
+            return created;
+        }
+    }
+
+    internal static void EnableDoubleBuffering(Control control)
+    {
+        ArgumentNullException.ThrowIfNull(control);
+        try
+        {
+            DoubleBufferedProperty?.SetValue(control, true);
+        }
+        catch
+        {
+            // Some specialized native wrappers ignore reflection-based double buffering.
+        }
+    }
+
     public static void Apply(Form form, params Button[] accentButtons)
     {
         ArgumentNullException.ThrowIfNull(form);
         accentButtons ??= [];
         ApplyWindowFrame(form);
-        ApplyPalette();
-        form.SystemColorsChanged += (_, _) => ApplyPalette();
 
-        void ApplyPalette()
+        var appliedState = AppliedForms.GetOrCreateValue(form);
+        appliedState.AccentButtons = accentButtons;
+        ApplyFormPalette(form, appliedState);
+
+        if (appliedState.EventsWired) return;
+        appliedState.EventsWired = true;
+        form.SystemColorsChanged += (_, _) =>
         {
-            ApplyTree(form);
-            foreach (var button in accentButtons)
-            {
-                if (button is not null && !button.IsDisposed) ApplyAccentButton(button);
-            }
+            if (!form.IsDisposed) ApplyFormPalette(form, appliedState);
+        };
+    }
+
+    private static void ApplyFormPalette(Form form, AppliedFormThemeState appliedState)
+    {
+        ApplyTree(form);
+        foreach (var button in appliedState.AccentButtons)
+        {
+            if (button is not null && !button.IsDisposed) ApplyAccentButton(button);
         }
     }
 
@@ -168,6 +212,7 @@ internal static class NativeUiTheme
         listBox.DrawMode = DrawMode.OwnerDrawFixed;
         listBox.IntegralHeight = false;
         listBox.HorizontalScrollbar = false;
+        EnableDoubleBuffering(listBox);
         ApplyDarkScrollbars(listBox);
 
         var state = StyledListBoxes.GetOrCreateValue(listBox);
@@ -978,6 +1023,12 @@ internal static class NativeUiTheme
     }
 
     private static int ToColorRef(Color color) => color.R | (color.G << 8) | (color.B << 16);
+
+    private sealed class AppliedFormThemeState
+    {
+        public bool EventsWired { get; set; }
+        public Button[] AccentButtons { get; set; } = [];
+    }
 
     private sealed class ButtonVisualState
     {

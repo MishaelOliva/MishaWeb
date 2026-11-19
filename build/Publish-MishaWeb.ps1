@@ -714,13 +714,6 @@ try {
     New-Item -ItemType Directory -Path $stagingPath | Out-Null
 
     $selfContainedText = $definition.SelfContained.ToString().ToLowerInvariant()
-    Invoke-DotNet -Arguments @(
-        'restore', $projectPath,
-        '--runtime', 'win-x64',
-        '--locked-mode',
-        "-p:SelfContained=$selfContainedText",
-        "-p:PublishSelfContained=$selfContainedText"
-    )
 
     if (-not $SkipChecks) {
         Invoke-DotNet -Arguments @('restore', $testProjectPath, '--locked-mode')
@@ -745,6 +738,15 @@ try {
     }
 
     Invoke-DotNet -Arguments @(
+        'restore', $projectPath,
+        '--runtime', 'win-x64',
+        '--locked-mode',
+        "-p:SelfContained=$selfContainedText",
+        "-p:PublishSelfContained=$selfContainedText",
+        '-p:PublishReadyToRun=true'
+    )
+
+    Invoke-DotNet -Arguments @(
         'publish', $projectPath,
         '--configuration', 'Release',
         '--runtime', 'win-x64',
@@ -755,7 +757,8 @@ try {
         '-p:PublishSingleFile=true',
         "-p:PublishSelfContained=$selfContainedText",
         '-p:IncludeNativeLibrariesForSelfExtract=true',
-        '-p:PublishReadyToRun=false',
+        '-p:PublishReadyToRun=true',
+        '-p:TieredPGO=true',
         '-p:PublishTrimmed=false',
         '-p:DebugType=None',
         '-p:DebugSymbols=false',

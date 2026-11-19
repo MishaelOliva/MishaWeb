@@ -1,8 +1,10 @@
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Runtime;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -65,29 +67,46 @@ internal sealed class AdBlockEngine
         Unbreak = 5
     }
 
-    private static readonly FilterListSource[] FilterListSources =
-    [
-        new("list-0.txt", new("https://easylist.to/easylist/easylist.txt"), FilterSourceCategory.Ad),
-        new("list-1.txt", new("https://easylist.to/easylist/easyprivacy.txt"), FilterSourceCategory.Privacy),
-        new("list-2.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt"), FilterSourceCategory.Ad),
-        new("list-3.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-general.txt"), FilterSourceCategory.Ad),
-        new("list-4.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2026.txt"), FilterSourceCategory.Ad),
-        new("list-5.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/quick-fixes.txt"), FilterSourceCategory.Ad),
-        new("list-6.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/privacy.txt"), FilterSourceCategory.Privacy),
-        new("list-7.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/unbreak.txt"), FilterSourceCategory.Unbreak),
-        new("list-8.txt", new("https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/brave-specific.txt"), FilterSourceCategory.Ad),
-        new("list-9.txt", new("https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/brave-firstparty.txt"), FilterSourceCategory.Ad),
-        new("list-10.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2020.txt"), FilterSourceCategory.Ad),
-        new("list-11.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2021.txt"), FilterSourceCategory.Ad),
-        new("list-12.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2022.txt"), FilterSourceCategory.Ad),
-        new("list-13.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2023.txt"), FilterSourceCategory.Ad),
-        new("list-14.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2024.txt"), FilterSourceCategory.Ad),
-        new("list-15.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2025.txt"), FilterSourceCategory.Ad),
-        new("list-16.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/ubo-link-shorteners.txt"), FilterSourceCategory.Privacy),
-        new("list-17.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/resource-abuse.txt"), FilterSourceCategory.ScriptAbuse),
-        new("list-18.txt", new("https://raw.githubusercontent.com/brave/adblock-lists/master/brave-unbreak.txt"), FilterSourceCategory.Unbreak),
-        new("list-19.txt", new("https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/brave-firstparty-regional.txt"), FilterSourceCategory.Ad)
-    ];
+    private static readonly FilterListSource[] FilterListSources = BuildFilterListSources();
+
+    private static FilterListSource[] BuildFilterListSources()
+    {
+        var sources = new List<FilterListSource>(24)
+        {
+            new("list-0.txt", new("https://easylist.to/easylist/easylist.txt"), FilterSourceCategory.Ad),
+            new("list-1.txt", new("https://easylist.to/easylist/easyprivacy.txt"), FilterSourceCategory.Privacy),
+            new("list-2.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt"), FilterSourceCategory.Ad),
+            new("list-3.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-general.txt"), FilterSourceCategory.Ad),
+            new("list-4.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2026.txt"), FilterSourceCategory.Ad),
+            new("list-5.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/quick-fixes.txt"), FilterSourceCategory.Ad),
+            new("list-6.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/privacy.txt"), FilterSourceCategory.Privacy),
+            new("list-7.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/unbreak.txt"), FilterSourceCategory.Unbreak),
+            new("list-8.txt", new("https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/brave-specific.txt"), FilterSourceCategory.Ad),
+            new("list-9.txt", new("https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/brave-firstparty.txt"), FilterSourceCategory.Ad),
+            new("list-10.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2020.txt"), FilterSourceCategory.Ad),
+            new("list-11.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2021.txt"), FilterSourceCategory.Ad),
+            new("list-12.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2022.txt"), FilterSourceCategory.Ad),
+            new("list-13.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2023.txt"), FilterSourceCategory.Ad),
+            new("list-14.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2024.txt"), FilterSourceCategory.Ad),
+            new("list-15.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-2025.txt"), FilterSourceCategory.Ad),
+            new("list-16.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/ubo-link-shorteners.txt"), FilterSourceCategory.Privacy),
+            new("list-17.txt", new("https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/resource-abuse.txt"), FilterSourceCategory.ScriptAbuse),
+            new("list-18.txt", new("https://raw.githubusercontent.com/brave/adblock-lists/master/brave-unbreak.txt"), FilterSourceCategory.Unbreak),
+            new("list-19.txt", new("https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/brave-firstparty-regional.txt"), FilterSourceCategory.Ad)
+        };
+
+        var currentYear = DateTime.UtcNow.Year;
+        for (var year = 2027; year <= currentYear && year <= 2035; year++)
+        {
+            var nextIndex = sources.Count;
+            sources.Add(new(
+                $"list-{nextIndex}.txt",
+                new($"https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters-{year}.txt"),
+                FilterSourceCategory.Ad));
+        }
+
+        return sources.ToArray();
+    }
 
     private static readonly HttpClient HttpClient = CreateHttpClient();
     // WebView2 can report the same request and source strings through several
@@ -269,6 +288,15 @@ internal sealed class AdBlockEngine
             "__MISHA_ADBLOCK_CONTROL_CHANNEL__",
             controlChannel,
             StringComparison.Ordinal);
+
+    internal static string CreateUniversalBootstrapScript(string controlChannel) =>
+        AdBlockDocumentScript.UniversalBootstrapSource.Replace(
+            "__MISHA_ADBLOCK_CONTROL_CHANNEL__",
+            controlChannel,
+            StringComparison.Ordinal);
+
+    internal static string CreateYouTubeDocumentScript() =>
+        AdBlockDocumentScript.YouTubeRuntimeSource;
 
     private volatile bool isReady;
 
@@ -484,8 +512,17 @@ internal sealed class AdBlockEngine
         return ruleSet.GetCosmeticCss(pageUri, cacheEvaluation);
     }
 
-    internal Task<string> GetCosmeticCssAsync(string pageUrl, bool cacheEvaluation = true) =>
-        Task.Run(() => GetCosmeticCss(pageUrl, cacheEvaluation));
+    internal Task<string> GetCosmeticCssAsync(string pageUrl, bool cacheEvaluation = true)
+    {
+        if (cacheEvaluation
+            && TryGetCachedRequestUri(pageUrl, out var cachedPageUri)
+            && cachedPageUri is not null
+            && ruleSet.TryGetCachedCosmeticCss(cachedPageUri, out var cachedCss))
+        {
+            return Task.FromResult(cachedCss);
+        }
+        return Task.Run(() => GetCosmeticCss(pageUrl, cacheEvaluation));
+    }
 
     public bool ShouldBlockNavigation(
         string targetUrl,
@@ -550,13 +587,13 @@ internal sealed class AdBlockEngine
         };
     }
 
-    private static readonly string[] TrackerUrlSignals =
+    private static readonly SearchValues<string> TrackerSignalValues = SearchValues.Create(
     [
         "analytics", "telemetry", "beacon", "tracker", "tracking",
         "pixel", "metrics", "scorecardresearch", "quantserve"
-    ];
+    ], StringComparison.OrdinalIgnoreCase);
 
-    private static readonly string[] AdUrlSignals =
+    private static readonly SearchValues<string> AdSignalValues = SearchValues.Create(
     [
         "doubleclick", "googlesyndication", "googleadservices", "pagead",
         "adservice", "adsystem", "adsense", "adserver", "adroll", "criteo",
@@ -564,7 +601,7 @@ internal sealed class AdBlockEngine
         "adform", "pubmatic", "rubiconproject", "openx", "moatads",
         "banner", "popup", "popunder", "advert", "adunit", "://ads.",
         ".ads.", "/ads/", "/ads.", "/ads?", "/ad/", "&ads="
-    ];
+    ], StringComparison.OrdinalIgnoreCase);
 
     private static AdBlockResourceType ParseResourceType(string? resourceType)
     {
@@ -622,37 +659,32 @@ internal sealed class AdBlockEngine
     }
 
     private static bool HasTrackerSignal(Uri requestUri) =>
-        ContainsAnySignal(requestUri.AbsoluteUri, TrackerUrlSignals);
+        requestUri.AbsoluteUri.AsSpan().ContainsAny(TrackerSignalValues);
 
     private static bool HasAdSignal(Uri requestUri) =>
-        ContainsAnySignal(requestUri.AbsoluteUri, AdUrlSignals);
-
-    private static bool ContainsAnySignal(string value, string[] signals)
-    {
-        foreach (var signal in signals)
-        {
-            if (value.Contains(signal, StringComparison.OrdinalIgnoreCase)) return true;
-        }
-        return false;
-    }
+        requestUri.AbsoluteUri.AsSpan().ContainsAny(AdSignalValues);
 
     private async Task LoadListsAsync(
         int generation,
         CancellationTokenSource generationCancellation)
     {
         var cancellationToken = generationCancellation.Token;
+        var compiledCleanly = false;
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
             var cachedSources = GetCachedListSources();
+            var compiledFromCache = false;
             if (cachedSources.Count > 0)
             {
                 PublishRuleSetIfCurrent(
                     generation,
                     await CompileRuleSetAsync(cachedSources, cancellationToken).ConfigureAwait(false));
+                compiledFromCache = true;
             }
 
             cancellationToken.ThrowIfCancellationRequested();
+            var didRemoteUpdate = false;
             if (updateRemoteLists)
             {
                 var staleSources = GetSourcesNeedingRefresh();
@@ -667,13 +699,18 @@ internal sealed class AdBlockEngine
                         PublishRuleSetIfCurrent(
                             generation,
                             await CompileRuleSetAsync(refreshedSources, cancellationToken).ConfigureAwait(false));
+                        didRemoteUpdate = true;
                     }
                 }
             }
+            compiledCleanly = compiledFromCache || didRemoteUpdate || !updateRemoteLists || cachedSources.Count == 0;
         }
-        catch
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            // The fallback set remains active when a list update is unavailable.
+        }
+        catch (Exception error)
+        {
+            Debug.WriteLine($"MishaWeb AdBlock list load failed: {error}");
         }
         finally
         {
@@ -681,7 +718,7 @@ internal sealed class AdBlockEngine
             {
                 if (generation == loadGeneration)
                 {
-                    isReady = !cancellationToken.IsCancellationRequested;
+                    isReady = compiledCleanly && !cancellationToken.IsCancellationRequested;
                     if (ReferenceEquals(loadCancellation, generationCancellation))
                     {
                         loadCancellation = null;
@@ -698,9 +735,20 @@ internal sealed class AdBlockEngine
 
     private void PublishRuleSetIfCurrent(int generation, CompiledRuleSet compiled)
     {
+        CompiledRuleSet? superseded = null;
         lock (loadSync)
         {
-            if (generation == loadGeneration) ruleSet = compiled;
+            if (generation == loadGeneration)
+            {
+                superseded = ruleSet;
+                ruleSet = compiled;
+            }
+        }
+        if (superseded is not null
+            && !ReferenceEquals(superseded, baselineRuleSet)
+            && !ReferenceEquals(superseded, compiled))
+        {
+            GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
         }
     }
 
@@ -760,14 +808,205 @@ internal sealed class AdBlockEngine
     internal IReadOnlyList<string> GetCachedFilterFilesForTesting() =>
         GetCachedListFiles().Select(Path.GetFileName).OfType<string>().ToArray();
 
+    private const string CompiledSnapshotFileName = "compiled-rules-v1.bin";
+    private const uint CompiledSnapshotMagic = 0x4241574Du; // "MWAB"
+    private const int CompiledSnapshotVersion = 1;
+
     private Task<CompiledRuleSet> CompileRuleSetAsync(
         IReadOnlyCollection<(string Path, FilterSourceCategory Category)> sources,
         CancellationToken cancellationToken) =>
-        Task.Run(() => CompiledRuleSet.FromTaggedLines(
+        Task.Run(() => CompileRuleSetWithSnapshotCache(sources, cancellationToken), cancellationToken);
+
+    private CompiledRuleSet CompileRuleSetWithSnapshotCache(
+        IReadOnlyCollection<(string Path, FilterSourceCategory Category)> sources,
+        CancellationToken cancellationToken)
+    {
+        var fingerprint = ComputeSourcesFingerprint(sources);
+        if (fingerprint != 0
+            && TryLoadCompiledSnapshot(fingerprint, cancellationToken, out var cachedRuleSet)
+            && cachedRuleSet is not null)
+        {
+            return cachedRuleSet;
+        }
+
+        var compiled = CompiledRuleSet.FromTaggedLines(
             BuiltInFallbackRules
                 .Select(static line => (line, FilterSourceCategory.Fallback))
                 .Concat(ReadFilterLines(sources, cancellationToken)),
-            cancellationToken), cancellationToken);
+            out var snapshotEntries,
+            out var materializedCount,
+            out var disabledRuleCount,
+            cancellationToken,
+            captureSnapshotEntries: fingerprint != 0);
+
+        if (fingerprint != 0 && snapshotEntries is not null && !cancellationToken.IsCancellationRequested)
+        {
+            TryWriteCompiledSnapshot(fingerprint, materializedCount, disabledRuleCount, snapshotEntries);
+        }
+
+        return compiled;
+    }
+
+    private static ulong ComputeSourcesFingerprint(
+        IReadOnlyCollection<(string Path, FilterSourceCategory Category)> sources)
+    {
+        if (sources.Count == 0) return 0;
+
+        var hash = 14695981039346656037UL;
+        MixUInt64(ref hash, (ulong)BuiltInFallbackRules.Length);
+        MixUInt64(ref hash, (ulong)sources.Count);
+        foreach (var source in sources)
+        {
+            try
+            {
+                var info = new FileInfo(source.Path);
+                if (!info.Exists || info.Length <= 0) return 0;
+                foreach (var ch in info.Name)
+                {
+                    MixUInt64(ref hash, char.ToLowerInvariant(ch));
+                }
+                MixUInt64(ref hash, (ulong)source.Category);
+                MixUInt64(ref hash, (ulong)info.Length);
+                MixUInt64(ref hash, (ulong)info.LastWriteTimeUtc.Ticks);
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+        return hash == 0 ? 1UL : hash;
+
+        static void MixUInt64(ref ulong state, ulong value)
+        {
+            state ^= value;
+            state *= 1099511628211UL;
+        }
+    }
+
+    private bool TryLoadCompiledSnapshot(
+        ulong expectedFingerprint,
+        CancellationToken cancellationToken,
+        out CompiledRuleSet? compiled)
+    {
+        compiled = null;
+        try
+        {
+            var snapshotPath = Path.Combine(cacheFolder, CompiledSnapshotFileName);
+            var info = new FileInfo(snapshotPath);
+            if (!info.Exists || info.Length <= 28 || info.Length > MaximumAggregateFilterBytes)
+            {
+                return false;
+            }
+
+            using var stream = new FileStream(
+                snapshotPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read | FileShare.Delete,
+                bufferSize: 64 * 1024);
+            using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: false);
+            if (reader.ReadUInt32() != CompiledSnapshotMagic
+                || reader.ReadInt32() != CompiledSnapshotVersion
+                || reader.ReadUInt64() != expectedFingerprint)
+            {
+                return false;
+            }
+
+            var materializedCount = reader.ReadInt32();
+            var disabledRuleCount = reader.ReadInt32();
+            var entryCount = reader.ReadInt32();
+            if (materializedCount < 0
+                || materializedCount > MaximumInputFilterLines
+                || disabledRuleCount < 0
+                || disabledRuleCount > materializedCount
+                || entryCount < 0
+                || entryCount > materializedCount)
+            {
+                return false;
+            }
+
+            var entries = new (string Line, FilterSourceCategory Category)[entryCount];
+            for (var i = 0; i < entryCount; i++)
+            {
+                if ((i & 2047) == 0) cancellationToken.ThrowIfCancellationRequested();
+                var categoryByte = reader.ReadByte();
+                var line = reader.ReadString();
+                if (line.Length == 0 || line.Length > MaximumFilterLineCharacters)
+                {
+                    return false;
+                }
+                entries[i] = (line, (FilterSourceCategory)categoryByte);
+            }
+
+            compiled = CompiledRuleSet.BuildFromActiveOrderedEntries(
+                entries,
+                materializedCount,
+                disabledRuleCount,
+                cancellationToken);
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void TryWriteCompiledSnapshot(
+        ulong fingerprint,
+        int materializedCount,
+        int disabledRuleCount,
+        IReadOnlyList<(string Line, FilterSourceCategory Category)> entries)
+    {
+        try
+        {
+            Directory.CreateDirectory(cacheFolder);
+            var snapshotPath = Path.Combine(cacheFolder, CompiledSnapshotFileName);
+            var tempPath = snapshotPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                using (var stream = new FileStream(
+                    tempPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    bufferSize: 64 * 1024))
+                using (var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: false))
+                {
+                    writer.Write(CompiledSnapshotMagic);
+                    writer.Write(CompiledSnapshotVersion);
+                    writer.Write(fingerprint);
+                    writer.Write(materializedCount);
+                    writer.Write(disabledRuleCount);
+                    writer.Write(entries.Count);
+                    for (var i = 0; i < entries.Count; i++)
+                    {
+                        var entry = entries[i];
+                        writer.Write((byte)entry.Category);
+                        writer.Write(entry.Line);
+                    }
+                    writer.Flush();
+                }
+
+                lock (cacheWriteSync)
+                {
+                    File.Move(tempPath, snapshotPath, overwrite: true);
+                }
+            }
+            finally
+            {
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); }
+                catch { }
+            }
+        }
+        catch
+        {
+            // Snapshot persistence is an opportunistic cold-start accelerator.
+        }
+    }
 
     private static IEnumerable<(string Line, FilterSourceCategory Category)> ReadFilterLines(
         IEnumerable<(string Path, FilterSourceCategory Category)> sources,
@@ -817,8 +1056,14 @@ internal sealed class AdBlockEngine
         StreamReader? reader;
         try
         {
-            reader = new StreamReader(
+            var stream = new FileStream(
                 file,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read | FileShare.Delete,
+                bufferSize: 64 * 1024);
+            reader = new StreamReader(
+                stream,
                 Encoding.UTF8,
                 detectEncodingFromByteOrderMarks: true,
                 bufferSize: 64 * 1024);
@@ -1038,7 +1283,7 @@ internal sealed class AdBlockEngine
         }
     }
 
-    private bool CanCommitFilterFile(string targetPath, string candidatePath)
+    internal bool CanCommitFilterFile(string targetPath, string candidatePath)
     {
         try
         {
@@ -1054,8 +1299,7 @@ internal sealed class AdBlockEngine
                 var configuredPath = Path.Combine(cacheFolder, configuredSource.FileName);
                 if (configuredPath.Equals(targetPath, StringComparison.OrdinalIgnoreCase)) continue;
                 var cached = new FileInfo(configuredPath);
-                if (!cached.Exists) continue;
-                if (cached.Length is <= 0 or > MaximumFilterListBytes) return false;
+                if (!cached.Exists || cached.Length is <= 0 or > MaximumFilterListBytes) continue;
                 aggregateBytes += cached.Length;
                 if (aggregateBytes > MaximumAggregateFilterBytes) return false;
             }
@@ -1243,15 +1487,32 @@ internal sealed class AdBlockEngine
         return nonEmptyLines >= 5 && hasFilterSyntax;
     }
 
-    private static long PackIndexKey(string value, int offset) =>
-        ((long)char.ToLowerInvariant(value[offset]) << 32)
-        | ((long)char.ToLowerInvariant(value[offset + 1]) << 16)
-        | char.ToLowerInvariant(value[offset + 2]);
+    private static uint PackIndexKey4(ReadOnlySpan<char> value, int offset) =>
+        ((uint)ToLowerAsciiByte(value[offset]) << 24)
+        | ((uint)ToLowerAsciiByte(value[offset + 1]) << 16)
+        | ((uint)ToLowerAsciiByte(value[offset + 2]) << 8)
+        | ToLowerAsciiByte(value[offset + 3]);
+
+    private static uint PackIndexKey3(ReadOnlySpan<char> value, int offset) =>
+        ((uint)ToLowerAsciiByte(value[offset]) << 16)
+        | ((uint)ToLowerAsciiByte(value[offset + 1]) << 8)
+        | ToLowerAsciiByte(value[offset + 2]);
+
+    private static byte ToLowerAsciiByte(char value) =>
+        value is >= 'A' and <= 'Z' ? (byte)(value + ('a' - 'A')) : (byte)value;
 
     private static HttpClient CreateHttpClient()
     {
-        var client = new HttpClient { Timeout = TimeSpan.FromSeconds(12) };
-        client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("MishaWeb", "2.4.1"));
+        var handler = new SocketsHttpHandler
+        {
+            AutomaticDecompression = DecompressionMethods.All,
+            PooledConnectionLifetime = TimeSpan.FromMinutes(10)
+        };
+        var client = new HttpClient(handler, disposeHandler: true)
+        {
+            Timeout = TimeSpan.FromSeconds(12)
+        };
+        client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("MishaWeb", "2.5.0"));
         return client;
     }
 
@@ -1444,22 +1705,26 @@ internal sealed class AdBlockEngine
         private const int MaximumUnindexedSourceScopedRegexBlockRules = 256;
         private const int MaximumUnindexedSourceScopedRegexExceptionRules = 256;
         private const int MaximumRegexPatternCharacters = 2_048;
+        [ThreadStatic] private static (CompiledRuleSet? Owner, Dictionary<string, bool>? Cache) genericBlockCache;
         private readonly RuleIndex blocks;
+        private readonly RuleIndex importantBlocks;
         private readonly RuleIndex exceptions;
         private readonly CosmeticRuleSet cosmetics;
-        private readonly List<HideDisableRule> genericBlockExceptions;
+        private readonly RuleIndex genericBlockIndex;
 
         private CompiledRuleSet(
             RuleIndex blocks,
+            RuleIndex importantBlocks,
             RuleIndex exceptions,
             CosmeticRuleSet cosmetics,
-            List<HideDisableRule> genericBlockExceptions,
+            RuleIndex genericBlockIndex,
             AdBlockCompileDiagnostics diagnostics)
         {
             this.blocks = blocks;
+            this.importantBlocks = importantBlocks;
             this.exceptions = exceptions;
             this.cosmetics = cosmetics;
-            this.genericBlockExceptions = genericBlockExceptions;
+            this.genericBlockIndex = genericBlockIndex;
             Diagnostics = diagnostics;
         }
 
@@ -1481,7 +1746,22 @@ internal sealed class AdBlockEngine
 
         public static CompiledRuleSet FromTaggedLines(
             IEnumerable<(string Line, FilterSourceCategory Category)> lines,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default) =>
+            FromTaggedLines(
+                lines,
+                out _,
+                out _,
+                out _,
+                cancellationToken,
+                captureSnapshotEntries: false);
+
+        public static CompiledRuleSet FromTaggedLines(
+            IEnumerable<(string Line, FilterSourceCategory Category)> lines,
+            out List<(string Line, FilterSourceCategory Category)>? snapshotEntries,
+            out int materializedCount,
+            out int disabledRuleCount,
+            CancellationToken cancellationToken = default,
+            bool captureSnapshotEntries = false)
         {
             var materialized = new Dictionary<string, FilterSourceCategory>(StringComparer.Ordinal);
             var processedLineCount = 0;
@@ -1507,6 +1787,7 @@ internal sealed class AdBlockEngine
             }
 
             var disabledRules = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var disabledRawPatterns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             processedLineCount = 0;
             foreach (var line in materialized.Keys)
             {
@@ -1515,26 +1796,15 @@ internal sealed class AdBlockEngine
                     cancellationToken.ThrowIfCancellationRequested();
                 }
                 var disabled = GetBadFilterTarget(line);
-                if (disabled is not null) disabledRules.Add(GetRuleIdentity(disabled));
+                if (disabled is not null)
+                {
+                    disabledRules.Add(GetRuleIdentity(disabled));
+                    disabledRawPatterns.Add(GetRawPatternPrefix(disabled));
+                }
             }
-            var blocks = new RuleIndex();
-            var exceptions = new RuleIndex();
-            var cosmetics = new CosmeticRuleSet();
-            var genericBlockExceptions = new List<HideDisableRule>();
-            var networkRuleCount = 0;
-            var cosmeticRuleCount = 0;
-            var hideDisableRuleCount = 0;
-            var disabledRuleCount = 0;
-            var unsupportedRuleCandidateCount = 0;
-            var capacityDroppedNetworkRuleCount = 0;
-            var regexRuleCount = 0;
-            var indexedRegexRuleCount = 0;
-            var unindexedGenericRegexBlockRuleCount = 0;
-            var unindexedGenericRegexExceptionRuleCount = 0;
-            var unindexedSourceScopedRegexBlockRuleCount = 0;
-            var unindexedSourceScopedRegexExceptionRuleCount = 0;
-            var droppedRegexRuleCount = 0;
 
+            disabledRuleCount = 0;
+            var activeOrdered = new List<(string Line, FilterSourceCategory Category)>(materialized.Count);
             processedLineCount = 0;
             foreach (var entry in EnumerateRulesWithRegexExceptionsFirst(materialized))
             {
@@ -1545,21 +1815,60 @@ internal sealed class AdBlockEngine
                 }
 
                 // $badfilter has to be resolved before the cosmetic and
-                // hide-disable parsers run. Those parsers treat everything after
-                // "##" as a selector, so "example.com##.ad$badfilter" used to be
-                // installed as a live rule hiding ".ad$badfilter" while the real
-                // "example.com##.ad" rule stayed active.
-                //
-                // Building the identity key allocates a split array, a LINQ chain
-                // and a StringBuilder. Most lists contain no badfilter at all, and
-                // the full input is ~200k rules, so skip the whole thing when
-                // there is nothing to match against.
+                // hide-disable parsers run. Pre-filtering by raw pattern skips
+                // option splitting and sorting for rules that cannot match.
                 if (disabledRules.Count > 0
+                    && disabledRawPatterns.Contains(GetRawPatternPrefix(line))
                     && (GetBadFilterTarget(line) is not null
                         || disabledRules.Contains(GetRuleIdentity(line))))
                 {
                     disabledRuleCount++;
                     continue;
+                }
+
+                activeOrdered.Add((line, entry.Value));
+            }
+
+            materializedCount = materialized.Count;
+            snapshotEntries = captureSnapshotEntries ? activeOrdered : null;
+            return BuildFromActiveOrderedEntries(
+                activeOrdered,
+                materializedCount,
+                disabledRuleCount,
+                cancellationToken);
+        }
+
+        internal static CompiledRuleSet BuildFromActiveOrderedEntries(
+            IReadOnlyList<(string Line, FilterSourceCategory Category)> activeOrderedEntries,
+            int materializedCount,
+            int disabledRuleCount,
+            CancellationToken cancellationToken = default)
+        {
+            var blocks = new RuleIndex();
+            var importantBlocks = new RuleIndex();
+            var exceptions = new RuleIndex();
+            var cosmetics = new CosmeticRuleSet();
+            var genericBlockIndex = new RuleIndex();
+            var networkRuleCount = 0;
+            var cosmeticRuleCount = 0;
+            var hideDisableRuleCount = 0;
+            var unsupportedRuleCandidateCount = 0;
+            var capacityDroppedNetworkRuleCount = 0;
+            var regexRuleCount = 0;
+            var indexedRegexRuleCount = 0;
+            var unindexedGenericRegexBlockRuleCount = 0;
+            var unindexedGenericRegexExceptionRuleCount = 0;
+            var unindexedSourceScopedRegexBlockRuleCount = 0;
+            var unindexedSourceScopedRegexExceptionRuleCount = 0;
+            var droppedRegexRuleCount = 0;
+
+            for (var index = 0; index < activeOrderedEntries.Count; index++)
+            {
+                var entry = activeOrderedEntries[index];
+                var line = entry.Line;
+                if ((index & 2047) == 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
                 }
 
                 var hideDisable = HideDisableRule.Parse(line);
@@ -1574,7 +1883,10 @@ internal sealed class AdBlockEngine
                     cosmetics.AddDisable(hideDisable);
                     if (hideDisable.DisableGenericBlocking)
                     {
-                        genericBlockExceptions.Add(hideDisable);
+                        var genericMatcher = hideDisable.DisableGenericHiding || hideDisable.DisableSpecificHiding
+                            ? hideDisable.CreateSeparateMatcher(line) ?? hideDisable.Matcher
+                            : hideDisable.Matcher;
+                        genericBlockIndex.Add(genericMatcher);
                     }
                     continue;
                 }
@@ -1600,7 +1912,7 @@ internal sealed class AdBlockEngine
                     droppedRegexRuleCount++;
                     continue;
                 }
-                var rule = FilterRule.Parse(line, entry.Value);
+                var rule = FilterRule.Parse(line, entry.Category);
                 if (rule is null)
                 {
                     if (line.Length > 0 && line[0] is not '!' and not '[')
@@ -1646,7 +1958,10 @@ internal sealed class AdBlockEngine
                         else unindexedGenericRegexBlockRuleCount++;
                     }
                 }
-                if ((rule.Exception ? exceptions : blocks).Add(rule))
+                var targetIndex = rule.Exception
+                    ? exceptions
+                    : (rule.Important ? importantBlocks : blocks);
+                if (targetIndex.Add(rule))
                 {
                     networkRuleCount++;
                 }
@@ -1657,17 +1972,19 @@ internal sealed class AdBlockEngine
             }
 
             blocks.Seal();
+            importantBlocks.Seal();
             exceptions.Seal();
             cosmetics.Seal();
-            genericBlockExceptions.TrimExcess();
+            genericBlockIndex.Seal();
 
             return new CompiledRuleSet(
                 blocks,
+                importantBlocks,
                 exceptions,
                 cosmetics,
-                genericBlockExceptions,
+                genericBlockIndex,
                 new AdBlockCompileDiagnostics(
-                    materialized.Count,
+                    materializedCount,
                     networkRuleCount,
                     cosmeticRuleCount,
                     hideDisableRuleCount,
@@ -1681,6 +1998,12 @@ internal sealed class AdBlockEngine
                     unindexedGenericRegexBlockRuleCount
                         + unindexedGenericRegexExceptionRuleCount,
                     droppedRegexRuleCount));
+        }
+
+        private static string GetRawPatternPrefix(string line)
+        {
+            var optionIndex = FindOptionIndex(line);
+            return optionIndex < 0 ? line.Trim() : line[..optionIndex].Trim();
         }
 
         private static IEnumerable<KeyValuePair<string, FilterSourceCategory>> EnumerateRulesWithRegexExceptionsFirst(
@@ -1818,59 +2141,98 @@ internal sealed class AdBlockEngine
         {
             matchedRule = null;
             matchedException = false;
-            var suppressGenericBlocking = false;
-            if (sourceUri is not null)
+            var suppressGenericBlocking = IsGenericBlockingSuppressed(sourceUri);
+            var thirdPartyState = -1;
+
+            var matchedImportantBlock = false;
+            if (!importantBlocks.IsEmpty)
             {
-                foreach (var rule in genericBlockExceptions)
+                foreach (var rule in importantBlocks.GetCandidates(requestUri))
                 {
-                    if (!rule.Matches(sourceUri)) continue;
-                    suppressGenericBlocking = true;
+                    if ((suppressGenericBlocking && rule.IsGeneric)
+                        || !rule.Matches(requestUri, sourceUri, resourceType, ref thirdPartyState))
+                    {
+                        continue;
+                    }
+
+                    matchedRule = rule;
+                    matchedImportantBlock = true;
                     break;
                 }
             }
 
-            var thirdParty = sourceUri is null
-                || !AreSameSite(requestUri.Host, sourceUri.Host);
-            var matchedImportantBlock = false;
-            foreach (var rule in blocks.GetCandidates(requestUri))
+            if (matchedRule is null && !blocks.IsEmpty)
             {
-                if ((suppressGenericBlocking && rule.IsGeneric)
-                    || !rule.Matches(requestUri, sourceUri, resourceType, thirdParty))
+                foreach (var rule in blocks.GetCandidates(requestUri))
                 {
-                    continue;
-                }
+                    if ((suppressGenericBlocking && rule.IsGeneric)
+                        || !rule.Matches(requestUri, sourceUri, resourceType, ref thirdPartyState))
+                    {
+                        continue;
+                    }
 
-                matchedRule ??= rule;
-                if (!rule.Important) continue;
-                matchedRule = rule;
-                matchedImportantBlock = true;
-                break;
+                    matchedRule = rule;
+                    break;
+                }
             }
             if (matchedRule is null) return false;
 
-            foreach (var rule in exceptions.GetCandidates(requestUri))
+            if (!exceptions.IsEmpty)
             {
-                if (matchedImportantBlock && !rule.Important) continue;
-                if (rule.Matches(requestUri, sourceUri, resourceType, thirdParty))
+                foreach (var rule in exceptions.GetCandidates(requestUri))
                 {
-                    matchedRule = rule;
-                    matchedException = true;
-                    return false;
+                    if (matchedImportantBlock && !rule.Important) continue;
+                    if (rule.Matches(requestUri, sourceUri, resourceType, ref thirdPartyState))
+                    {
+                        matchedRule = rule;
+                        matchedException = true;
+                        return false;
+                    }
                 }
             }
             return true;
         }
 
+        private bool IsGenericBlockingSuppressed(Uri? sourceUri)
+        {
+            if (sourceUri is null || genericBlockIndex.IsEmpty) return false;
+            var entry = genericBlockCache;
+            if (!ReferenceEquals(entry.Owner, this) || entry.Cache is null)
+            {
+                entry = (this, new Dictionary<string, bool>(MaximumCachedSourceUrisPerThread, StringComparer.Ordinal));
+                genericBlockCache = entry;
+            }
+            var sourceKey = sourceUri.AbsoluteUri;
+            if (entry.Cache.TryGetValue(sourceKey, out var cached)) return cached;
+
+            var suppressed = false;
+            var pageThirdPartyState = 0;
+            foreach (var matcher in genericBlockIndex.GetCandidates(sourceUri))
+            {
+                if (matcher.Matches(sourceUri, sourceUri, AdBlockResourceType.Document, ref pageThirdPartyState))
+                {
+                    suppressed = true;
+                    break;
+                }
+            }
+            TrimCache(entry.Cache, MaximumCachedSourceUrisPerThread);
+            entry.Cache[sourceKey] = suppressed;
+            return suppressed;
+        }
+
         public string GetCosmeticCss(Uri pageUri, bool cacheEvaluation) =>
             cosmetics.GetCss(pageUri, cacheEvaluation);
+
+        public bool TryGetCachedCosmeticCss(Uri pageUri, out string css) =>
+            cosmetics.TryGetCachedCss(pageUri, out css);
 
         /// <summary>
         /// Builds a comparison key for a filter line: the pattern plus its
         /// options in a canonical, order-insensitive form. Filter lists routinely
         /// reorder options between a rule and its $badfilter counterpart
         /// (<c>||x^$domain=a.com,script</c> vs <c>@@||x^$script,domain=a.com</c>).
-        /// Comparing raw text silently failed to disable the block in that case,
-        /// so both sides are normalized here.
+        /// Lowercasing every option before sorting ensures case variations sort
+        /// consistently too.
         /// </summary>
         internal static string GetRuleIdentity(string line)
         {
@@ -1878,22 +2240,21 @@ internal sealed class AdBlockEngine
             if (optionIndex < 0) return line.Trim();
             var pattern = line.AsSpan(0, optionIndex).Trim();
 
-            // Callers skip this entirely when no badfilter is present, so the cost
-            // here is only paid by lists that actually need identity comparison. A
-            // hand-rolled span sort was tried here and removed: it was measurably
-            // faster but its growth path was wrong, and it silently aborted the
-            // whole compile on the real 20-list catalog. Correctness wins.
             var options = line[(optionIndex + 1)..]
                 .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             if (options.Length == 0) return pattern.ToString();
             if (options.Length == 1) return string.Concat(pattern, "|", options[0].ToLowerInvariant());
 
+            for (var index = 0; index < options.Length; index++)
+            {
+                options[index] = options[index].ToLowerInvariant();
+            }
             Array.Sort(options, StringComparer.Ordinal);
             var builder = new StringBuilder(pattern.Length + (options.Length * 12) + 8);
             builder.Append(pattern);
             foreach (var option in options)
             {
-                builder.Append('|').Append(option.ToLowerInvariant());
+                builder.Append('|').Append(option);
             }
             return builder.ToString();
         }
@@ -1953,72 +2314,102 @@ internal sealed class AdBlockEngine
         private const int MaximumUnindexedRules = 4_000;
         private const int MaximumIndexedRules = 100_000;
         private const int MaximumRetainedIndexKeys = 4_096;
-        [ThreadStatic] private static HashSet<long>? reusableIndexKeys;
+        [ThreadStatic] private static HashSet<uint>? reusableIndexKeys;
         [ThreadStatic] private static bool reusableIndexKeysInUse;
-        private readonly Dictionary<string, FilterRule> singleHostRules = new(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<string, List<FilterRule>> multipleHostRules = new(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<long, FilterRule> singleIndexedRules = [];
-        private readonly Dictionary<long, List<FilterRule>> multipleIndexedRules = [];
+        private readonly Dictionary<string, object> hostRules = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<uint, object> indexed4Rules = [];
+        private readonly Dictionary<uint, object> indexed3Rules = [];
         private readonly List<FilterRule> unindexedRules = [];
+        private FilterRule[] sealedUnindexedRules = Array.Empty<FilterRule>();
         private int indexedRuleCount;
+        private bool isEmpty = true;
+
+        public bool IsEmpty => isEmpty;
 
         public bool Add(FilterRule rule)
         {
             if (rule.IndexHost is { } indexHost)
             {
-                if (singleHostRules.Remove(indexHost, out var firstRule))
-                {
-                    multipleHostRules[indexHost] = [firstRule, rule];
-                }
-                else if (multipleHostRules.TryGetValue(indexHost, out var rules))
-                {
-                    rules.Add(rule);
-                }
-                else
-                {
-                    singleHostRules[indexHost] = rule;
-                }
+                AddToBucket(hostRules, indexHost, rule);
                 // The dictionary key is now the canonical retained host. Every lookup
                 // reaches this list only while walking a matching request-host suffix,
                 // so individual rules do not need a duplicate host string or a second
                 // suffix comparison for each request.
                 rule.ReleaseIndexHost();
+                isEmpty = false;
                 return true;
             }
 
             if (rule.IndexKey is { } indexKey && indexedRuleCount < MaximumIndexedRules)
             {
-                if (singleIndexedRules.Remove(indexKey, out var firstRule))
-                {
-                    multipleIndexedRules[indexKey] = [firstRule, rule];
-                }
-                else if (multipleIndexedRules.TryGetValue(indexKey, out var rules))
-                {
-                    rules.Add(rule);
-                }
-                else
-                {
-                    singleIndexedRules[indexKey] = rule;
-                }
+                var table = rule.IsFourByteIndex ? indexed4Rules : indexed3Rules;
+                AddToBucket(table, indexKey, rule);
                 indexedRuleCount++;
+                isEmpty = false;
                 return true;
             }
             else if (unindexedRules.Count < MaximumUnindexedRules)
             {
                 unindexedRules.Add(rule);
+                isEmpty = false;
                 return true;
             }
             return false;
         }
 
+        private static void AddToBucket<TKey>(Dictionary<TKey, object> table, TKey key, FilterRule rule)
+            where TKey : notnull
+        {
+            if (!table.TryGetValue(key, out var existing))
+            {
+                table[key] = rule;
+                return;
+            }
+
+            if (existing is List<FilterRule> list)
+            {
+                list.Add(rule);
+                return;
+            }
+
+            table[key] = new List<FilterRule>(4) { (FilterRule)existing, rule };
+        }
+
         public void Seal()
         {
+            FreezeBuckets(hostRules);
+            FreezeBuckets(indexed4Rules);
+            FreezeBuckets(indexed3Rules);
+            sealedUnindexedRules = unindexedRules.Count == 0
+                ? Array.Empty<FilterRule>()
+                : unindexedRules.ToArray();
+            unindexedRules.Clear();
             unindexedRules.TrimExcess();
         }
 
+        private static void FreezeBuckets<TKey>(Dictionary<TKey, object> table)
+            where TKey : notnull
+        {
+            if (table.Count == 0) return;
+            List<KeyValuePair<TKey, FilterRule[]>>? updates = null;
+            foreach (var pair in table)
+            {
+                if (pair.Value is List<FilterRule> list)
+                {
+                    updates ??= new List<KeyValuePair<TKey, FilterRule[]>>();
+                    updates.Add(new KeyValuePair<TKey, FilterRule[]>(pair.Key, list.ToArray()));
+                }
+            }
+            if (updates is null) return;
+            foreach (var update in updates)
+            {
+                table[update.Key] = update.Value;
+            }
+        }
+
         // A pattern-based struct enumerator keeps the per-request rule walk off
-        // the managed heap. The candidate order is identical to the former
-        // iterator: host rules, indexed rules, then bounded unindexed rules.
+        // the managed heap. The candidate order is host rules, 4-byte indexed
+        // rules, optional 3-byte indexed rules, then bounded unindexed rules.
         public CandidateEnumerable GetCandidates(Uri uri) => new(this, uri);
 
         internal readonly struct CandidateEnumerable
@@ -2040,9 +2431,9 @@ internal sealed class AdBlockEngine
             private readonly RuleIndex owner;
             private readonly string[] hostSuffixes;
             private readonly string target;
-            private readonly HashSet<long> seenKeys;
+            private readonly HashSet<uint> seenKeys;
             private readonly bool borrowedReusableSet;
-            private List<FilterRule>? currentRules;
+            private FilterRule[]? currentRules;
             private int currentRuleIndex;
             private int hostIndex;
             private int targetIndex;
@@ -2057,15 +2448,15 @@ internal sealed class AdBlockEngine
                 target = uri.AbsoluteUri;
                 borrowedReusableSet = !reusableIndexKeysInUse;
                 seenKeys = borrowedReusableSet
-                    ? reusableIndexKeys ??= new HashSet<long>()
-                    : new HashSet<long>();
+                    ? reusableIndexKeys ??= new HashSet<uint>()
+                    : new HashSet<uint>();
                 if (borrowedReusableSet) reusableIndexKeysInUse = true;
                 currentRules = null;
                 currentRuleIndex = -1;
                 hostIndex = 0;
                 targetIndex = 0;
                 unindexedRuleIndex = 0;
-                phase = 0;
+                phase = owner.hostRules.Count > 0 ? 0 : 1;
                 disposed = false;
                 Current = null!;
             }
@@ -2077,7 +2468,7 @@ internal sealed class AdBlockEngine
                 while (true)
                 {
                     if (currentRules is not null
-                        && ++currentRuleIndex < currentRules.Count)
+                        && ++currentRuleIndex < currentRules.Length)
                     {
                         Current = currentRules[currentRuleIndex];
                         return true;
@@ -2089,55 +2480,97 @@ internal sealed class AdBlockEngine
                         while (hostIndex < hostSuffixes.Length)
                         {
                             var candidateHost = hostSuffixes[hostIndex++];
-                            if (owner.singleHostRules.TryGetValue(candidateHost, out var singleRule))
+                            if (!owner.hostRules.TryGetValue(candidateHost, out var entry)) continue;
+                            if (entry is FilterRule singleRule)
                             {
                                 Current = singleRule;
                                 return true;
                             }
-                            if (!owner.multipleHostRules.TryGetValue(candidateHost, out currentRules)
-                                || currentRules.Count == 0)
+                            if (entry is FilterRule[] ruleArray && ruleArray.Length > 0)
                             {
-                                currentRules = null;
-                                continue;
+                                currentRules = ruleArray;
+                                currentRuleIndex = 0;
+                                Current = ruleArray[0];
+                                return true;
                             }
-                            currentRuleIndex = -1;
-                            break;
                         }
-                        if (currentRules is not null) continue;
                         phase = 1;
                     }
 
                     if (phase == 1)
                     {
+                        if (owner.indexed4Rules.Count > 0)
+                        {
+                            while (targetIndex <= target.Length - 4)
+                            {
+                                var c0 = target[targetIndex];
+                                var c1 = target[targetIndex + 1];
+                                var c2 = target[targetIndex + 2];
+                                var c3 = target[targetIndex + 3];
+                                targetIndex++;
+                                if ((c0 | c1 | c2 | c3) > 0x7F) continue;
+                                var key = ((uint)ToLowerAsciiByte(c0) << 24)
+                                    | ((uint)ToLowerAsciiByte(c1) << 16)
+                                    | ((uint)ToLowerAsciiByte(c2) << 8)
+                                    | ToLowerAsciiByte(c3);
+                                if (!seenKeys.Add(key)) continue;
+                                if (!owner.indexed4Rules.TryGetValue(key, out var entry)) continue;
+                                if (entry is FilterRule singleRule)
+                                {
+                                    Current = singleRule;
+                                    return true;
+                                }
+                                if (entry is FilterRule[] ruleArray && ruleArray.Length > 0)
+                                {
+                                    currentRules = ruleArray;
+                                    currentRuleIndex = 0;
+                                    Current = ruleArray[0];
+                                    return true;
+                                }
+                            }
+                        }
+                        targetIndex = 0;
+                        phase = owner.indexed3Rules.Count > 0 ? 2 : 3;
+                    }
+
+                    if (phase == 2)
+                    {
                         while (targetIndex <= target.Length - 3)
                         {
-                            var key = PackIndexKey(target, targetIndex++);
+                            var c0 = target[targetIndex];
+                            var c1 = target[targetIndex + 1];
+                            var c2 = target[targetIndex + 2];
+                            targetIndex++;
+                            if ((c0 | c1 | c2) > 0x7F) continue;
+                            var key = ((uint)ToLowerAsciiByte(c0) << 16)
+                                | ((uint)ToLowerAsciiByte(c1) << 8)
+                                | ToLowerAsciiByte(c2);
                             if (!seenKeys.Add(key)) continue;
-                            if (owner.singleIndexedRules.TryGetValue(key, out var singleRule))
+                            if (!owner.indexed3Rules.TryGetValue(key, out var entry)) continue;
+                            if (entry is FilterRule singleRule)
                             {
                                 Current = singleRule;
                                 return true;
                             }
-                            if (!owner.multipleIndexedRules.TryGetValue(key, out currentRules)
-                                || currentRules.Count == 0)
+                            if (entry is FilterRule[] ruleArray && ruleArray.Length > 0)
                             {
-                                currentRules = null;
-                                continue;
+                                currentRules = ruleArray;
+                                currentRuleIndex = 0;
+                                Current = ruleArray[0];
+                                return true;
                             }
-                            currentRuleIndex = -1;
-                            break;
                         }
-                        if (currentRules is not null) continue;
-                        phase = 2;
+                        phase = 3;
                     }
 
-                    if (phase == 2 && unindexedRuleIndex < owner.unindexedRules.Count)
+                    var unindexed = owner.sealedUnindexedRules;
+                    if (phase == 3 && unindexedRuleIndex < unindexed.Length)
                     {
-                        Current = owner.unindexedRules[unindexedRuleIndex++];
+                        Current = unindexed[unindexedRuleIndex++];
                         return true;
                     }
 
-                    phase = 3;
+                    phase = 4;
                     return false;
                 }
             }
@@ -2165,17 +2598,28 @@ internal sealed class AdBlockEngine
         private const int MaximumSelectorsPerPage = 12_000;
         private const int MaximumCachedHosts = 64;
         private const long MaximumCachedStyleBytes = 4 * 1024 * 1024;
+        private const int SelectorBatchSize = 256;
+        private const string HideDeclarationSuffix =
+            "{display:none!important;visibility:hidden!important;min-height:0!important;}\n";
+
         private readonly record struct StyleCacheKey(string Host, bool DisableGeneric, bool DisableSpecific);
+        private readonly record struct GenericCssChunk(string Css, int SelectorCount);
+
         private readonly List<CosmeticRule> genericRules = [];
+        private readonly List<CosmeticRule> conditionalGenericRules = [];
         private readonly Dictionary<string, List<CosmeticRule>> domainRules = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> exceptedSelectors = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<StyleCacheKey, string> styleCache = new();
         private readonly ConcurrentQueue<StyleCacheKey> styleCacheOrder = new();
-        private readonly List<HideDisableRule> genericHideExceptions = [];
-        private readonly List<HideDisableRule> specificHideExceptions = [];
+        private readonly RuleIndex hideDisableIndex = new();
+        private GenericCssChunk[] precompiledGenericChunks = Array.Empty<GenericCssChunk>();
+        private string precompiledGenericCss = string.Empty;
+        private int precompiledGenericSelectorCount;
         private long styleCacheBytes;
 
         public void Add(CosmeticRule rule)
         {
+            if (rule.Exception) exceptedSelectors.Add(rule.Selector);
             if (rule.IncludedDomains.Length == 0)
             {
                 genericRules.Add(rule);
@@ -2195,37 +2639,106 @@ internal sealed class AdBlockEngine
 
         public void AddDisable(HideDisableRule rule)
         {
-            if (rule.DisableGenericHiding) genericHideExceptions.Add(rule);
-            if (rule.DisableSpecificHiding) specificHideExceptions.Add(rule);
+            if (!rule.DisableGenericHiding && !rule.DisableSpecificHiding) return;
+            rule.Matcher.HideDisableFlags = (byte)((rule.DisableGenericHiding ? 1 : 0)
+                | (rule.DisableSpecificHiding ? 2 : 0));
+            hideDisableIndex.Add(rule.Matcher);
         }
 
         public void Seal()
         {
+            foreach (var pair in domainRules) pair.Value.TrimExcess();
+            hideDisableIndex.Seal();
+
+            var seenGenericSelectors = new HashSet<string>(StringComparer.Ordinal);
+            var chunks = new List<GenericCssChunk>();
+            var allGenericBuilder = new StringBuilder();
+            var batch = new List<string>(SelectorBatchSize);
+            var batchTextLength = 0;
+            var totalSelectors = 0;
+
+            void FlushBatch()
+            {
+                if (batch.Count == 0) return;
+                var estimatedCssLength = batchTextLength + batch.Count + HideDeclarationSuffix.Length;
+                if (allGenericBuilder.Length + estimatedCssLength > MaximumStyleBytes)
+                {
+                    batch.Clear();
+                    batchTextLength = 0;
+                    return;
+                }
+
+                var chunkBuilder = new StringBuilder(estimatedCssLength);
+                for (var index = 0; index < batch.Count; index++)
+                {
+                    if (index > 0) chunkBuilder.Append(',');
+                    chunkBuilder.Append(batch[index]);
+                }
+                chunkBuilder.Append(HideDeclarationSuffix);
+                var chunkCss = chunkBuilder.ToString();
+                chunks.Add(new GenericCssChunk(chunkCss, batch.Count));
+                allGenericBuilder.Append(chunkCss);
+                totalSelectors += batch.Count;
+                batch.Clear();
+                batchTextLength = 0;
+            }
+
+            foreach (var rule in genericRules)
+            {
+                if (rule.Exception
+                    || rule.HasExcludedDomains
+                    || exceptedSelectors.Contains(rule.Selector))
+                {
+                    conditionalGenericRules.Add(rule);
+                    continue;
+                }
+                if (totalSelectors + batch.Count >= MaximumSelectorsPerPage) continue;
+                if (!seenGenericSelectors.Add(rule.Selector)) continue;
+
+                var projectedBatchBytes = batchTextLength + batch.Count + rule.Selector.Length + HideDeclarationSuffix.Length;
+                if (allGenericBuilder.Length + projectedBatchBytes > MaximumStyleBytes)
+                {
+                    FlushBatch();
+                    break;
+                }
+
+                batch.Add(rule.Selector);
+                batchTextLength += rule.Selector.Length;
+                if (batch.Count >= SelectorBatchSize) FlushBatch();
+            }
+
+            FlushBatch();
+            genericRules.Clear();
             genericRules.TrimExcess();
-            genericHideExceptions.TrimExcess();
-            specificHideExceptions.TrimExcess();
+            conditionalGenericRules.TrimExcess();
+            precompiledGenericChunks = chunks.ToArray();
+            precompiledGenericCss = allGenericBuilder.ToString();
+            precompiledGenericSelectorCount = totalSelectors;
+        }
+
+        public bool TryGetCachedCss(Uri pageUri, out string css)
+        {
+            ResolveHideDisableFlags(pageUri, out var disableGeneric, out var disableSpecific);
+            if (disableGeneric && disableSpecific)
+            {
+                css = string.Empty;
+                return true;
+            }
+
+            var cacheKey = new StyleCacheKey(pageUri.Host, disableGeneric, disableSpecific);
+            if (styleCache.TryGetValue(cacheKey, out var cached))
+            {
+                css = cached;
+                return true;
+            }
+
+            css = string.Empty;
+            return false;
         }
 
         public string GetCss(Uri pageUri, bool cacheEvaluation)
         {
-            var disableGeneric = false;
-            foreach (var rule in genericHideExceptions)
-            {
-                if (rule.Matches(pageUri))
-                {
-                    disableGeneric = true;
-                    break;
-                }
-            }
-            var disableSpecific = false;
-            foreach (var rule in specificHideExceptions)
-            {
-                if (rule.Matches(pageUri))
-                {
-                    disableSpecific = true;
-                    break;
-                }
-            }
+            ResolveHideDisableFlags(pageUri, out var disableGeneric, out var disableSpecific);
             if (disableGeneric && disableSpecific) return string.Empty;
 
             var host = pageUri.Host;
@@ -2233,6 +2746,7 @@ internal sealed class AdBlockEngine
 
             var cacheKey = new StyleCacheKey(host, disableGeneric, disableSpecific);
             if (styleCache.TryGetValue(cacheKey, out var cached)) return cached;
+
             var compiled = CompileCss(host, disableGeneric, disableSpecific);
             if (!styleCache.TryAdd(cacheKey, compiled))
             {
@@ -2253,13 +2767,35 @@ internal sealed class AdBlockEngine
             return compiled;
         }
 
-        private static long GetCacheEntryBytes(string host, string style) =>
-            2L * (host.Length + style.Length);
+        private void ResolveHideDisableFlags(Uri pageUri, out bool disableGeneric, out bool disableSpecific)
+        {
+            disableGeneric = false;
+            disableSpecific = false;
+            if (hideDisableIndex.IsEmpty) return;
+
+            var thirdPartyState = 0;
+            foreach (var matcher in hideDisableIndex.GetCandidates(pageUri))
+            {
+                if (!matcher.Matches(pageUri, pageUri, AdBlockResourceType.Document, ref thirdPartyState))
+                {
+                    continue;
+                }
+                var flags = matcher.HideDisableFlags;
+                if ((flags & 1) != 0) disableGeneric = true;
+                if ((flags & 2) != 0) disableSpecific = true;
+                if (disableGeneric && disableSpecific) return;
+            }
+        }
+
+        private long GetCacheEntryBytes(string host, string style) =>
+            ReferenceEquals(style, precompiledGenericCss)
+                ? 2L * host.Length
+                : 2L * (host.Length + style.Length);
 
         private string CompileCss(string host, bool disableGeneric, bool disableSpecific)
         {
             HashSet<string>? exceptions = null;
-            foreach (var rule in GetCandidates(host, disableGeneric, disableSpecific))
+            foreach (var rule in GetDynamicCandidates(host, disableGeneric, disableSpecific))
             {
                 if (rule.Exception && rule.Matches(host))
                 {
@@ -2268,10 +2804,32 @@ internal sealed class AdBlockEngine
                 }
             }
 
-            var css = new StringBuilder();
+            var dynamicCss = new StringBuilder();
             var seenSelectors = new HashSet<string>(StringComparer.Ordinal);
+            var batch = new List<string>(SelectorBatchSize);
             var count = 0;
-            foreach (var rule in GetCandidates(host, disableGeneric, disableSpecific))
+
+            void FlushDynamicBatch()
+            {
+                if (batch.Count == 0) return;
+                var separatorBytes = batch.Count - 1;
+                var rawSelectorBytes = 0;
+                foreach (var item in batch) rawSelectorBytes += item.Length;
+                if (dynamicCss.Length + rawSelectorBytes + separatorBytes + HideDeclarationSuffix.Length > MaximumStyleBytes)
+                {
+                    batch.Clear();
+                    return;
+                }
+                for (var index = 0; index < batch.Count; index++)
+                {
+                    if (index > 0) dynamicCss.Append(',');
+                    dynamicCss.Append(batch[index]);
+                }
+                dynamicCss.Append(HideDeclarationSuffix);
+                batch.Clear();
+            }
+
+            foreach (var rule in GetDynamicCandidates(host, disableGeneric, disableSpecific))
             {
                 if (rule.Exception
                     || !rule.Matches(host)
@@ -2280,20 +2838,54 @@ internal sealed class AdBlockEngine
                 {
                     continue;
                 }
-                if (count++ >= MaximumSelectorsPerPage) break;
-                var additionLength = rule.Selector.Length + 74;
-                if (css.Length + additionLength > MaximumStyleBytes) break;
-                css.Append(rule.Selector)
-                    .Append("{display:none!important;visibility:hidden!important;min-height:0!important;}\n");
+                if (count >= MaximumSelectorsPerPage) break;
+                count++;
+                batch.Add(rule.Selector);
+                if (batch.Count >= SelectorBatchSize)
+                {
+                    var prevLen = dynamicCss.Length;
+                    FlushDynamicBatch();
+                    if (dynamicCss.Length == prevLen) break;
+                }
             }
-            return css.ToString();
+            FlushDynamicBatch();
+
+            if (disableGeneric || precompiledGenericCss.Length == 0)
+            {
+                return dynamicCss.ToString();
+            }
+
+            if (dynamicCss.Length == 0
+                && precompiledGenericSelectorCount <= MaximumSelectorsPerPage
+                && precompiledGenericCss.Length <= MaximumStyleBytes)
+            {
+                return precompiledGenericCss;
+            }
+
+            if (count + precompiledGenericSelectorCount <= MaximumSelectorsPerPage
+                && dynamicCss.Length + precompiledGenericCss.Length <= MaximumStyleBytes)
+            {
+                dynamicCss.Append(precompiledGenericCss);
+                return dynamicCss.ToString();
+            }
+
+            // Combined host-specific + unconditional generic rules exceed one of
+            // the page caps; append as many full 256-selector batches as fit.
+            foreach (var chunk in precompiledGenericChunks)
+            {
+                if (count + chunk.SelectorCount > MaximumSelectorsPerPage) break;
+                if (dynamicCss.Length + chunk.Css.Length > MaximumStyleBytes) break;
+                dynamicCss.Append(chunk.Css);
+                count += chunk.SelectorCount;
+            }
+            return dynamicCss.ToString();
         }
 
-        private IEnumerable<CosmeticRule> GetCandidates(string host, bool disableGeneric, bool disableSpecific)
+        private IEnumerable<CosmeticRule> GetDynamicCandidates(string host, bool disableGeneric, bool disableSpecific)
         {
             // Specific selectors are more valuable than the generic tail and
             // must not be pushed past the per-page CSS safety budget.
-            if (!disableSpecific && !string.IsNullOrEmpty(host))
+            if (!disableSpecific && !string.IsNullOrEmpty(host) && domainRules.Count > 0)
             {
                 var suffixes = GetCachedHostSuffixes(host);
                 foreach (var domain in suffixes)
@@ -2304,7 +2896,7 @@ internal sealed class AdBlockEngine
             }
             if (!disableGeneric)
             {
-                foreach (var rule in genericRules) yield return rule;
+                foreach (var rule in conditionalGenericRules) yield return rule;
             }
         }
     }
@@ -2324,12 +2916,13 @@ internal sealed class AdBlockEngine
         }
 
         private readonly FilterRule matcher;
+        public FilterRule Matcher => matcher;
         public bool DisableGenericHiding { get; }
         public bool DisableSpecificHiding { get; }
         public bool DisableGenericBlocking { get; }
 
-        public bool Matches(Uri pageUri) =>
-            matcher.Matches(pageUri, pageUri, AdBlockResourceType.Document, thirdParty: false);
+        public FilterRule? CreateSeparateMatcher(string line) =>
+            Parse(line)?.Matcher;
 
         public static HideDisableRule? Parse(string line)
         {
@@ -2392,6 +2985,7 @@ internal sealed class AdBlockEngine
         public string Selector { get; }
         public bool Exception { get; }
         public string[] IncludedDomains { get; }
+        public bool HasExcludedDomains => excludedDomains.Length > 0;
         public bool IsGeneric => IncludedDomains.Length == 0;
 
         public static CosmeticRule? Parse(string line)
@@ -2452,7 +3046,7 @@ internal sealed class AdBlockEngine
 
     private sealed class FilterRule
     {
-        private static readonly TimeSpan RegexMatchTimeout = TimeSpan.FromMilliseconds(10);
+        private static readonly TimeSpan RegexMatchTimeout = TimeSpan.FromMilliseconds(25);
         private readonly Regex? regex;
         private readonly uint? includedTypes;
         private readonly uint excludedTypes;
@@ -2475,7 +3069,8 @@ internal sealed class AdBlockEngine
             bool exception,
             bool important,
             Regex? regex,
-            long? regexIndexKey,
+            uint? regexIndexKey,
+            bool regexIsFourByteIndex,
             uint? includedTypes,
             uint excludedTypes,
             string[] includedDomains,
@@ -2502,24 +3097,25 @@ internal sealed class AdBlockEngine
             FirstPartyOnly = firstPartyOnly;
             this.matchCase = matchCase;
             this.sourceCategory = sourceCategory;
-            IndexKey = regex is not null
-                ? regexIndexKey
-                : ExtractIndexKey(pattern);
+            if (regex is not null)
+            {
+                IndexKey = regexIndexKey;
+                IsFourByteIndex = regexIsFourByteIndex;
+                return;
+            }
 
-            if (regex is not null) return;
+            IndexKey = ExtractIndexKey(pattern, out var isFourByte);
+            IsFourByteIndex = isFourByte;
 
             // Normalize anchors and globs once while compiling a list. Rebuilding
-            // these short strings for every request was the largest allocation in
-            // literal-rule matching on ad-heavy pages.
+            // these short strings or lowercasing them per character on every request
+            // wastes hot-path cycles.
             var normalizedPattern = pattern;
             var hostAnchored = normalizedPattern.StartsWith("||", StringComparison.Ordinal);
             if (hostAnchored) normalizedPattern = normalizedPattern[2..];
 
             if (host is not null)
             {
-                // normalizedPattern is pattern with the leading "||" removed, so
-                // the host offset shifts by two. Slicing by host.Length instead
-                // was off by the number of dots ExtractHost trimmed.
                 var hostSpanEnd = Math.Min(patternHostEnd - 2, normalizedPattern.Length);
                 var remainder = hostSpanEnd < 0
                     ? string.Empty
@@ -2528,7 +3124,8 @@ internal sealed class AdBlockEngine
 
                 var endAnchored = remainder.EndsWith('|');
                 if (endAnchored) remainder = remainder[..^1];
-                hostPathPattern = endAnchored ? remainder : remainder + '*';
+                var compiledRemainder = endAnchored ? remainder : remainder + '*';
+                hostPathPattern = matchCase ? compiledRemainder : compiledRemainder.ToLowerInvariant();
                 return;
             }
 
@@ -2539,15 +3136,17 @@ internal sealed class AdBlockEngine
             if (endAnchor) normalizedPattern = normalizedPattern[..^1];
             if (!startAnchored) normalizedPattern = '*' + normalizedPattern;
             if (!endAnchor) normalizedPattern += '*';
-            networkPattern = normalizedPattern;
+            networkPattern = matchCase ? normalizedPattern : normalizedPattern.ToLowerInvariant();
         }
 
         public string? IndexHost { get; private set; }
-        public long? IndexKey { get; }
+        public uint? IndexKey { get; }
+        public bool IsFourByteIndex { get; }
         public bool Exception { get; }
         public bool Important { get; }
         public bool ThirdPartyOnly { get; }
         public bool FirstPartyOnly { get; }
+        public byte HideDisableFlags { get; set; }
         public bool IsGeneric => includedDomains.Length == 0 && excludedDomains.Length == 0;
         public bool IsRegex => regex is not null;
         public bool IsHostAnchored => hostAnchoredRule;
@@ -2723,19 +3322,40 @@ internal sealed class AdBlockEngine
             uint? includedTypes = includedTypeMask == 0 ? null : includedTypeMask;
             var host = ExtractHost(pattern, out var patternHostEnd);
             Regex? regex = null;
-            long? regexIndexKey = null;
+            uint? regexIndexKey = null;
+            var regexIsFourByte = false;
             if (pattern.Length > 2 && pattern[0] == '/' && pattern[^1] == '/')
             {
                 var regexPattern = pattern[1..^1];
                 if (TryExtractMandatoryRegexLiteral(regexPattern, out var literal))
                 {
-                    regexIndexKey = PackIndexKey(literal, 0);
+                    if (literal.Length >= 4)
+                    {
+                        var bestOffset = SelectBestFourCharOffset(literal.AsSpan());
+                        regexIndexKey = PackIndexKey4(literal.AsSpan(), bestOffset);
+                        regexIsFourByte = true;
+                    }
+                    else
+                    {
+                        regexIndexKey = PackIndexKey3(literal.AsSpan(), 0);
+                    }
                 }
+                var options = RegexOptions.CultureInvariant | RegexOptions.ExplicitCapture;
+                if (!matchCase) options |= RegexOptions.IgnoreCase;
                 try
                 {
-                    var options = RegexOptions.CultureInvariant | RegexOptions.ExplicitCapture;
-                    if (!matchCase) options |= RegexOptions.IgnoreCase;
-                    regex = new Regex(regexPattern, options, RegexMatchTimeout);
+                    regex = new Regex(regexPattern, options | RegexOptions.NonBacktracking, RegexMatchTimeout);
+                }
+                catch (NotSupportedException)
+                {
+                    try
+                    {
+                        regex = new Regex(regexPattern, options | RegexOptions.Compiled, RegexMatchTimeout);
+                    }
+                    catch
+                    {
+                        return null;
+                    }
                 }
                 catch
                 {
@@ -2751,6 +3371,7 @@ internal sealed class AdBlockEngine
                 important,
                 regex,
                 regexIndexKey,
+                regexIsFourByte,
                 includedTypes,
                 excludedTypeMask,
                 ToDomainArray(includedDomains),
@@ -2767,14 +3388,25 @@ internal sealed class AdBlockEngine
             Uri requestUri,
             Uri? sourceUri,
             AdBlockResourceType resourceType,
-            bool thirdParty)
+            ref int thirdPartyState)
         {
             var resourceMask = 1u << (int)resourceType;
             if (includedTypes is { } included && (included & resourceMask) == 0) return false;
             if ((excludedTypes & resourceMask) != 0) return false;
 
-            if (ThirdPartyOnly && !thirdParty) return false;
-            if (FirstPartyOnly && thirdParty) return false;
+            if (ThirdPartyOnly || FirstPartyOnly)
+            {
+                if (thirdPartyState < 0)
+                {
+                    thirdPartyState = sourceUri is null
+                        || !AreSameSite(requestUri.Host, sourceUri.Host)
+                        ? 1
+                        : 0;
+                }
+                var thirdParty = thirdPartyState == 1;
+                if (ThirdPartyOnly && !thirdParty) return false;
+                if (FirstPartyOnly && thirdParty) return false;
+            }
 
             if (includedDomains.Length > 0
                 && (sourceUri is null || !MatchesAnyHost(sourceUri.Host, includedDomains)))
@@ -2803,13 +3435,30 @@ internal sealed class AdBlockEngine
                     return false;
                 }
                 return hostPathPattern is null
-                    || GlobMatches(hostPathPattern, requestUri.PathAndQuery, matchCase);
+                    || GlobMatches(hostPathPattern.AsSpan(), requestUri.PathAndQuery.AsSpan(), matchCase);
             }
 
-            var target = useHostAndPathTarget
-                ? requestUri.Host + requestUri.AbsolutePath + requestUri.Query
-                : requestUri.AbsoluteUri;
-            return GlobMatches(networkPattern!, target, matchCase);
+            if (useHostAndPathTarget)
+            {
+                if (requestUri.IsDefaultPort && requestUri.UserInfo.Length == 0 && requestUri.Fragment.Length == 0)
+                {
+                    var absoluteUri = requestUri.AbsoluteUri;
+                    var schemeSeparator = absoluteUri.IndexOf("://", StringComparison.Ordinal);
+                    if (schemeSeparator >= 0)
+                    {
+                        return GlobMatches(
+                            networkPattern!.AsSpan(),
+                            absoluteUri.AsSpan(schemeSeparator + 3),
+                            matchCase);
+                    }
+                }
+                return GlobMatches(
+                    networkPattern!.AsSpan(),
+                    (requestUri.Host + requestUri.AbsolutePath + requestUri.Query).AsSpan(),
+                    matchCase);
+            }
+
+            return GlobMatches(networkPattern!.AsSpan(), requestUri.AbsoluteUri.AsSpan(), matchCase);
         }
 
         private static bool AddMappedTypes(string option, ref uint output)
@@ -3015,10 +3664,13 @@ internal sealed class AdBlockEngine
             return host;
         }
 
-        private static long? ExtractIndexKey(string pattern)
+        private static uint? ExtractIndexKey(string pattern, out bool isFourByte)
         {
             var longestStart = -1;
             var longestLength = 0;
+            var bestThreeStart = -1;
+            var bestFourStart = -1;
+            var bestFourScore = int.MinValue;
             var index = 0;
             var schemePrefixLength = 0;
             if (pattern.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
@@ -3045,19 +3697,86 @@ internal sealed class AdBlockEngine
                     continue;
                 }
                 var length = index - start;
+                if (length >= 4)
+                {
+                    var runSpan = pattern.AsSpan(start, length);
+                    var offset = SelectBestFourCharOffset(runSpan);
+                    var score = (length * 16) + ScoreFourCharToken(runSpan.Slice(offset, 4));
+                    if (score > bestFourScore)
+                    {
+                        bestFourScore = score;
+                        bestFourStart = start + offset;
+                    }
+                }
                 if (length >= 3 && length > longestLength)
                 {
                     longestStart = start;
                     longestLength = length;
+                    bestThreeStart = start;
                 }
             }
 
-            if (longestStart < 0 && schemePrefixLength >= 3)
+            if (bestFourStart >= 0)
             {
-                return PackIndexKey(pattern, 0);
+                isFourByte = true;
+                return PackIndexKey4(pattern.AsSpan(), bestFourStart);
             }
 
-            return longestStart < 0 ? null : PackIndexKey(pattern, longestStart);
+            if (bestThreeStart < 0 && schemePrefixLength >= 4)
+            {
+                isFourByte = true;
+                return PackIndexKey4(pattern.AsSpan(), 0);
+            }
+
+            isFourByte = false;
+            if (bestThreeStart < 0 && schemePrefixLength >= 3)
+            {
+                return PackIndexKey3(pattern.AsSpan(), 0);
+            }
+
+            return longestStart < 0 ? null : PackIndexKey3(pattern.AsSpan(), bestThreeStart);
+        }
+
+        private static int SelectBestFourCharOffset(ReadOnlySpan<char> literal)
+        {
+            if (literal.Length <= 4) return 0;
+            var bestOffset = 0;
+            var bestScore = int.MinValue;
+            for (var offset = 0; offset <= literal.Length - 4; offset++)
+            {
+                var score = ScoreFourCharToken(literal.Slice(offset, 4));
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestOffset = offset;
+                }
+            }
+            return bestOffset;
+        }
+
+        private static int ScoreFourCharToken(ReadOnlySpan<char> window)
+        {
+            var score = 0;
+            var alphaNumCount = 0;
+            foreach (var ch in window)
+            {
+                if (char.IsLetterOrDigit(ch)) alphaNumCount++;
+            }
+            score += alphaNumCount * 4;
+            if (window.Equals("www.", StringComparison.OrdinalIgnoreCase)
+                || window.Equals(".com", StringComparison.OrdinalIgnoreCase)
+                || window.Equals(".net", StringComparison.OrdinalIgnoreCase)
+                || window.Equals(".org", StringComparison.OrdinalIgnoreCase)
+                || window.Equals("http", StringComparison.OrdinalIgnoreCase)
+                || window.Equals("html", StringComparison.OrdinalIgnoreCase)
+                || window.Equals("ttps", StringComparison.OrdinalIgnoreCase)
+                || window.Equals(".php", StringComparison.OrdinalIgnoreCase)
+                || window.Equals("cdn.", StringComparison.OrdinalIgnoreCase)
+                || window.Equals("ads.", StringComparison.OrdinalIgnoreCase))
+            {
+                score -= 100;
+            }
+            return score;
         }
 
         internal static bool TryExtractMandatoryRegexLiteral(
@@ -3254,7 +3973,7 @@ internal sealed class AdBlockEngine
                 or >= '0' and <= '9'
                 or '_' or '%' or '.' or '-';
 
-        private static bool GlobMatches(string pattern, string text, bool matchCase)
+        private static bool GlobMatches(ReadOnlySpan<char> pattern, ReadOnlySpan<char> text, bool matchCase)
         {
             var patternIndex = 0;
             var textIndex = 0;
@@ -3301,8 +4020,17 @@ internal sealed class AdBlockEngine
             return patternIndex == pattern.Length;
         }
 
-        private static bool CharactersEqual(char left, char right, bool matchCase) =>
-            matchCase ? left == right : char.ToLowerInvariant(left) == char.ToLowerInvariant(right);
+        private static bool CharactersEqual(char compiledPatternChar, char textChar, bool matchCase) =>
+            matchCase
+                ? compiledPatternChar == textChar
+                : compiledPatternChar == ToLowerFast(textChar);
+
+        private static char ToLowerFast(char value) =>
+            value is >= 'A' and <= 'Z'
+                ? (char)(value + ('a' - 'A'))
+                : value < 128
+                    ? value
+                    : char.ToLowerInvariant(value);
 
         private static bool IsSeparator(char value) =>
             !char.IsLetterOrDigit(value) && value is not '_' and not '-' and not '.' and not '%';

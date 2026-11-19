@@ -1,7 +1,15 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace MishaWeb;
+
+[JsonSourceGenerationOptions(WriteIndented = false)]
+[JsonSerializable(typeof(BrowserState))]
+[JsonSerializable(typeof(string))]
+[JsonSerializable(typeof(string[]))]
+[JsonSerializable(typeof(IReadOnlyList<string>))]
+internal sealed partial class BrowserStateJsonContext : JsonSerializerContext;
 
 internal sealed class BrowserState
 {
@@ -12,6 +20,7 @@ internal sealed class BrowserState
     public int? ResourceModeDefaultsVersion { get; set; }
     public bool DarkModeEnabled { get; set; } = true;
     public bool AdBlockEnabled { get; set; } = true;
+    public bool EnableLiveSearchSuggestions { get; set; } = true;
     public List<string> OpenTabs { get; set; } = [];
     public int? ActiveTabIndex { get; set; }
     public int PinnedOpenTabCount { get; set; }
@@ -35,6 +44,7 @@ internal sealed class BrowserState
     public List<string> DarkModeExcludedHosts { get; set; } = [];
     public bool CleanShutdown { get; set; } = true;
     public SavedWindowPlacement? WindowPlacement { get; set; }
+    public SavedMultiViewLayout? MultiViewLayout { get; set; }
 
     // Compatibility aliases keep the in-memory model discoverable without
     // creating duplicate JSON fields in the additive settings schema.
@@ -120,6 +130,13 @@ internal sealed record SavedWindowPlacement(
     SavedWindowPresentation Presentation = SavedWindowPresentation.Normal,
     bool RestoreMaximizedAfterFullScreen = false);
 
+internal sealed record SavedMultiViewLayout(
+    string Preset,
+    int[] PaneTabIndices,
+    int FocusedPaneIndex,
+    float HorizontalRatio = 0.5f,
+    float VerticalRatio = 0.5f);
+
 internal sealed class BrowserStateStore : IDisposable
 {
     internal const int MaximumOpenTabs = 128;
@@ -150,7 +167,6 @@ internal sealed class BrowserStateStore : IDisposable
     private readonly string backupPath;
     private readonly string logPath;
     private readonly bool diagnosticsEnabled;
-    private readonly JsonSerializerOptions jsonOptions = new() { WriteIndented = false };
     private readonly object backgroundWriterSync = new();
     private readonly object synchronousSaveSync = new();
     private readonly object persistenceSync = new();
@@ -200,7 +216,7 @@ internal sealed class BrowserStateStore : IDisposable
             var primary = TryLoadFrom(settingsPath);
             if (primary is not null)
             {
-                RememberPersistedState(JsonSerializer.SerializeToUtf8Bytes(primary, jsonOptions));
+                RememberPersistedState(JsonSerializer.SerializeToUtf8Bytes(primary, BrowserStateJsonContext.Default.BrowserState));
                 return primary;
             }
 
@@ -234,6 +250,23 @@ internal sealed class BrowserStateStore : IDisposable
         }
 
         return SaveSynchronously(serializedState);
+    }
+
+    internal Task<bool> FlushAsync(BrowserState state, CancellationToken cancellationToken = default)
+    {
+        byte[] serializedState;
+        try
+        {
+            NormalizeForPersistence(state);
+            serializedState = SerializeWithinLimit(state);
+        }
+        catch (Exception error)
+        {
+            Log("Could not save settings", error);
+            return Task.FromResult(false);
+        }
+
+        return Task.Run(() => SaveSynchronously(serializedState), cancellationToken);
     }
 
     internal bool QueueSave(BrowserState state)
@@ -444,7 +477,7 @@ internal sealed class BrowserStateStore : IDisposable
             if (!file.Exists || file.Length > MaximumSettingsBytes) return null;
 
             using var settingsStream = File.OpenRead(path);
-            var state = JsonSerializer.Deserialize<BrowserState>(settingsStream);
+            var state = JsonSerializer.Deserialize(settingsStream, BrowserStateJsonContext.Default.BrowserState);
             if (state is null) return null;
 
             NormalizeForPersistence(state);
@@ -460,7 +493,7 @@ internal sealed class BrowserStateStore : IDisposable
     {
         try
         {
-            var serializedState = JsonSerializer.SerializeToUtf8Bytes(backupState, jsonOptions);
+            var serializedState = JsonSerializer.SerializeToUtf8Bytes(backupState, BrowserStateJsonContext.Default.BrowserState);
             WriteFileAtomically(settingsPath, serializedState);
             RememberPersistedState(serializedState);
         }
@@ -1102,11 +1135,55 @@ internal sealed class BrowserStateStore : IDisposable
         state.PinnedOpenTabCount = Math.Min(
             orderedTabs.TakeWhile(item => item.IsPinned).Count(),
             MaximumPinnedOpenTabs);
+        state.MultiViewLayout = NormalizeMultiViewLayout(state.MultiViewLayout, orderedTabs);
+    }
+
+    private static SavedMultiViewLayout? NormalizeMultiViewLayout(
+        SavedMultiViewLayout? layout,
+        List<(int OriginalIndex, string Url, bool IsPinned)> orderedTabs)
+    {
+        if (layout is null || layout.PaneTabIndices is null || layout.PaneTabIndices.Length < 2)
+        {
+            return null;
+        }
+
+        var remapped = new List<int>(4);
+        foreach (var rawIndex in layout.PaneTabIndices)
+        {
+            var mappedIndex = orderedTabs.FindIndex(item => item.OriginalIndex == rawIndex);
+            if (mappedIndex >= 0 && !remapped.Contains(mappedIndex))
+            {
+                remapped.Add(mappedIndex);
+                if (remapped.Count >= 4) break;
+            }
+        }
+
+        if (remapped.Count < 2) return null;
+
+        var presetName = remapped.Count switch
+        {
+            2 => "Split",
+            3 => "Tri",
+            _ => "Quad"
+        };
+        var focusedIndex = Math.Clamp(layout.FocusedPaneIndex, 0, remapped.Count - 1);
+        var hRatio = float.IsFinite(layout.HorizontalRatio)
+            ? Math.Clamp(layout.HorizontalRatio, 0.22f, 0.78f)
+            : 0.5f;
+        var vRatio = float.IsFinite(layout.VerticalRatio)
+            ? Math.Clamp(layout.VerticalRatio, 0.25f, 0.75f)
+            : 0.5f;
+        return new SavedMultiViewLayout(
+            presetName,
+            remapped.ToArray(),
+            focusedIndex,
+            hRatio,
+            vRatio);
     }
 
     private byte[] SerializeWithinLimit(BrowserState state)
     {
-        var serializedState = JsonSerializer.SerializeToUtf8Bytes(state, jsonOptions);
+        var serializedState = JsonSerializer.SerializeToUtf8Bytes(state, BrowserStateJsonContext.Default.BrowserState);
         while (serializedState.LongLength > MaximumSettingsBytes)
         {
             if (!RemoveOldestHalf(state.History)
@@ -1120,7 +1197,7 @@ internal sealed class BrowserStateStore : IDisposable
                 throw new InvalidOperationException("Normalized settings exceed the persistence limit.");
             }
 
-            serializedState = JsonSerializer.SerializeToUtf8Bytes(state, jsonOptions);
+            serializedState = JsonSerializer.SerializeToUtf8Bytes(state, BrowserStateJsonContext.Default.BrowserState);
         }
 
         return serializedState;

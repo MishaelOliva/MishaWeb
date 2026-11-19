@@ -102,40 +102,32 @@ internal static class BrowserPerformance
                 }
             } catch (_) {}
 
-            // 3. Font-Display Swap (Prevents Flash of Invisible Text)
-            const installFontSwap = () => {
-                try {
-                    const root = document.head || document.documentElement;
-                    if (!root || document.getElementById('__misha_font_swap')) return;
-                    const style = document.createElement('style');
-                    style.id = '__misha_font_swap';
-                    style.textContent = '@media screen { @font-face { font-display: swap !important; } }';
-                    root.appendChild(style);
-                } catch (_) {}
-            };
-            if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', installFontSwap, { once: true });
-            } else {
-                installFontSwap();
-            }
-
-            // 4. Bounded, Leak-Free Hover Intent Link Preconnect / DNS-Prefetch
+            // 3. Bounded, Leak-Free Hover Intent Link Preconnect / DNS-Prefetch
             try {
                 const preconnectedOrigins = new Set();
-                let activePreconnectLinks = [];
+                const activePreconnectLinks = [];
                 const maxPreconnectCount = 10;
                 let hoverTimer = null;
+                let currentAnchor = null;
 
-                const onPointer = (e) => {
-                    const target = e.target;
-                    const anchor = target && target.closest ? target.closest('a[href]') : null;
-                    if (!anchor) {
-                        if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
-                        return;
+                const clearHoverTimer = () => {
+                    if (hoverTimer !== null) {
+                        clearTimeout(hoverTimer);
+                        hoverTimer = null;
                     }
+                };
 
-                    if (hoverTimer) clearTimeout(hoverTimer);
+                document.addEventListener('mouseover', (e) => {
+                    const target = e.target;
+                    const anchor = target && typeof target.closest === 'function' ? target.closest('a[href]') : null;
+                    if (anchor === currentAnchor) return;
+                    currentAnchor = anchor;
+                    clearHoverTimer();
+                    if (!anchor) return;
+
                     hoverTimer = setTimeout(() => {
+                        hoverTimer = null;
+                        if (currentAnchor !== anchor) return;
                         try {
                             const href = anchor.href;
                             if (!href || (!href.startsWith('http://') && !href.startsWith('https://'))) return;
@@ -166,12 +158,15 @@ internal static class BrowserPerformance
                             activePreconnectLinks.push([dnsEl, preconnectEl]);
                         } catch (_) {}
                     }, 65);
-                };
+                }, { passive: true });
 
-                document.addEventListener('pointerenter', onPointer, { passive: true, capture: true });
-                document.addEventListener('pointerout', () => {
-                    if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
-                }, { passive: true, capture: true });
+                document.addEventListener('mouseout', (e) => {
+                    if (!currentAnchor) return;
+                    const related = e.relatedTarget;
+                    if (related && currentAnchor.contains(related)) return;
+                    currentAnchor = null;
+                    clearHoverTimer();
+                }, { passive: true });
             } catch (_) {}
         })();
         """;

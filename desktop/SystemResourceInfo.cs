@@ -78,11 +78,55 @@ internal static class SystemResourceInfo
         }
     }
 
+    /// <summary>
+    /// Applies or clears Windows EcoQoS (Efficiency Mode) power throttling on a target process
+    /// so background or minimized WebView2 renderers are scheduled onto efficiency cores.
+    /// </summary>
+    public static bool TrySetProcessEfficiencyMode(int processId, bool enable)
+    {
+        if (processId <= 0) return false;
+        try
+        {
+            var handle = OpenProcess(ProcessSetInformationAccess, false, processId);
+            if (handle == IntPtr.Zero) return false;
+            try
+            {
+                var state = new ProcessPowerThrottlingState
+                {
+                    Version = ProcessPowerThrottlingCurrentVersion,
+                    ControlMask = ProcessPowerThrottlingExecutionSpeed,
+                    StateMask = enable ? ProcessPowerThrottlingExecutionSpeed : 0u
+                };
+                var throttled = SetProcessInformation(
+                    handle,
+                    ProcessPowerThrottlingInformationClass,
+                    ref state,
+                    (uint)Marshal.SizeOf<ProcessPowerThrottlingState>());
+                _ = SetPriorityClass(handle, enable ? IdlePriorityClass : NormalPriorityClass);
+                return throttled;
+            }
+            finally
+            {
+                CloseHandle(handle);
+            }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private const uint ProcessQueryLimitedInformation = 0x1000;
     private const uint ProcessQueryInformation = 0x0400;
     private const uint ProcessSetQuota = 0x0100;
+    private const uint ProcessSetInformationAccess = 0x0200;
     private const uint ProcessQueryLimitedAndSetQuota = ProcessQueryLimitedInformation | ProcessSetQuota;
     private const uint ProcessQueryAndSetQuota = ProcessQueryInformation | ProcessSetQuota;
+    private const int ProcessPowerThrottlingInformationClass = 4;
+    private const uint ProcessPowerThrottlingCurrentVersion = 1;
+    private const uint ProcessPowerThrottlingExecutionSpeed = 0x1;
+    private const uint NormalPriorityClass = 0x00000020;
+    private const uint IdlePriorityClass = 0x00000040;
 
     [DllImport("kernel32.dll")]
     private static extern IntPtr GetCurrentProcess();
@@ -96,11 +140,31 @@ internal static class SystemResourceInfo
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetProcessInformation(
+        IntPtr hProcess,
+        int processInformationClass,
+        ref ProcessPowerThrottlingState processInformation,
+        uint processInformationSize);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetPriorityClass(IntPtr hProcess, uint dwPriorityClass);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CloseHandle(IntPtr hObject);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GlobalMemoryStatusEx(ref MemoryStatusEx buffer);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ProcessPowerThrottlingState
+    {
+        public uint Version;
+        public uint ControlMask;
+        public uint StateMask;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MemoryStatusEx

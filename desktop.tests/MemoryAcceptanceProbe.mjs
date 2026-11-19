@@ -63,7 +63,8 @@ const DEFAULTS = Object.freeze({
   maxChurnRetainedPrivateMiB: DEFAULT_CHURN_LIMITS.maxRetainedPrivateMiB,
   maxChurnRetainedWorkingSetMiB: DEFAULT_CHURN_LIMITS.maxRetainedWorkingSetMiB,
   maxChurnSlopePrivateMiB: DEFAULT_CHURN_LIMITS.maxCycleSlopePrivateMiB,
-  churnPlateauToleranceMiB: DEFAULT_CHURN_LIMITS.plateauToleranceMiB
+  churnPlateauToleranceMiB: DEFAULT_CHURN_LIMITS.plateauToleranceMiB,
+  multiView: null
 });
 
 function printUsage() {
@@ -71,7 +72,8 @@ function printUsage() {
   node desktop.tests/MemoryAcceptanceProbe.mjs \\
     --exe <path-to-MishaWeb.YouTubeProbe.exe> \\
     --out <output-folder> \\
-    [--url <http-or-https-url>] [--warmup-ms <milliseconds>] \\
+    [--url <http-or-https-url>] [--multi-view <2|3|4>] \\
+    [--warmup-ms <milliseconds>] \\
     [--max-warmup-ms <milliseconds>] [--duration-ms <milliseconds>] \\
     [--sample-ms <milliseconds>] [--steady-window <sample-count>] \\
     [--steady-tolerance-mib <MiB>] [--max-final-private-mib <MiB>] \\
@@ -175,6 +177,7 @@ function parseArgs(argv) {
     maxChurnRetainedWorkingSetMiB: DEFAULTS.maxChurnRetainedWorkingSetMiB,
     maxChurnSlopePrivateMiB: DEFAULTS.maxChurnSlopePrivateMiB,
     churnPlateauToleranceMiB: DEFAULTS.churnPlateauToleranceMiB,
+    multiView: DEFAULTS.multiView,
     observeOnly: false,
     keepProfile: false,
     normalProfile: false
@@ -209,7 +212,8 @@ function parseArgs(argv) {
     ['--max-churn-retained-private-mib', 'maxChurnRetainedPrivateMiB'],
     ['--max-churn-retained-working-set-mib', 'maxChurnRetainedWorkingSetMiB'],
     ['--max-churn-slope-private-mib', 'maxChurnSlopePrivateMiB'],
-    ['--churn-plateau-tolerance-mib', 'churnPlateauToleranceMiB']
+    ['--churn-plateau-tolerance-mib', 'churnPlateauToleranceMiB'],
+    ['--multi-view', 'multiView']
   ]);
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -336,6 +340,9 @@ function parseArgs(argv) {
     '--churn-plateau-tolerance-mib',
     4,
     512);
+  options.multiView = options.multiView === null
+    ? null
+    : parseInteger(options.multiView, '--multi-view', 2, 4);
   if (options.normalProfile && options.keepProfile) {
     throw new Error('--keep-profile is only valid for the default disposable-profile mode');
   }
@@ -922,6 +929,7 @@ async function writeResult(outputFolder, result) {
     probeId: result.probeId,
     profileMode: result.profileMode,
     workload: result.configuration?.workload || null,
+    multiView: result.configuration?.multiView ?? null,
     processId: result.processId || null,
     steadyStateReached: result.steadyState?.reached ?? null,
     finalWorkingSetMiB: result.measurement?.final?.total?.workingSetMiB ?? null,
@@ -1273,6 +1281,7 @@ async function main() {
       startupUrl,
       normalProfile: options.normalProfile,
       allowPackagedNormal: false,
+      multiView: options.multiView,
       churn: options.churnCycles > 0
         ? {
             cycles: options.churnCycles,
@@ -1422,7 +1431,8 @@ async function main() {
       startupUrl: options.url || 'deterministic-loopback-fixture',
       startedAtUtc,
       configuration: {
-        workload: options.churnCycles > 0 ? 'bounded-private-tab-churn' : 'single-tab',
+        workload: launchContract.workload,
+        multiView: launchContract.multiView,
         warmupMs: options.warmupMs,
         maxWarmupMs: options.maxWarmupMs,
         durationMs: options.durationMs,

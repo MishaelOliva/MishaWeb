@@ -47,6 +47,36 @@ jobs:
         shell: pwsh
         run: dotnet run --project desktop.tests/MishaWeb.SmokeTests.csproj --configuration Release --no-build --no-restore
 
+      - name: Node contract and script tests
+        shell: pwsh
+        run: |
+          $tests = @(
+            'desktop.tests/ProbeLaunchContract.test.mjs',
+            'desktop.tests/MemoryChurnAnalysis.test.mjs',
+            'desktop.tests/MemoryAcceptanceProbe.test.mjs',
+            'desktop.tests/ReaderModeScript.test.mjs',
+            'desktop.tests/AdBlockDocumentScript.test.mjs'
+          )
+          foreach ($test in $tests) {
+            node $test
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Publish and installer script checks
+        shell: powershell
+        run: |
+          & .\desktop.tests\PublishTransactionSmoke.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path '.\build\Install-MishaWeb.ps1').Path,
+            [ref]$tokens,
+            [ref]$errors)
+          if ($errors.Count -ne 0) {
+            throw ("Install-MishaWeb.ps1 has PowerShell syntax errors: " + ($errors -join '; '))
+          }
+
       - name: Publish clean framework-dependent release
         shell: powershell
         run: .\build\Publish-MishaWeb.ps1 -Mode FrameworkDependent -SkipChecks

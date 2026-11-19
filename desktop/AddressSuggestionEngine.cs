@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+
 namespace MishaWeb;
 
 internal enum AddressSuggestionSource
@@ -57,6 +59,8 @@ internal static class AddressSuggestionEngine
         new(0, BrowserPolicy.UrlComparer);
     [ThreadStatic]
     private static SuggestionIndexCache? threadIndexCache;
+    [ThreadStatic]
+    private static Candidate[]? threadCandidateBuffer;
 
     public static IReadOnlyList<AddressSuggestion> GetSuggestions(
         string? input,
@@ -92,7 +96,7 @@ internal static class AddressSuggestionEngine
         var localResultLimit = searchUrl is null ? limit : limit - 1;
         var topCandidates = localResultLimit == 0
             ? Array.Empty<Candidate>()
-            : new Candidate[localResultLimit];
+            : GetThreadCandidateBuffer();
         var topCandidateCount = 0;
         if (localResultLimit > 0)
         {
@@ -103,6 +107,7 @@ internal static class AddressSuggestionEngine
                     openTabs,
                     query,
                     topCandidates,
+                    localResultLimit,
                     ref topCandidateCount);
             }
 
@@ -117,21 +122,25 @@ internal static class AddressSuggestionEngine
                     indexedCandidate,
                     query,
                     topCandidates,
+                    localResultLimit,
                     ref topCandidateCount);
             }
         }
 
         var localCount = topCandidateCount;
+        var searchProviderName = searchUrl is not null
+            ? BrowserPolicy.GetSearchProviderName(state.SearchProviderId)
+            : string.Empty;
         var results = new AddressSuggestion[localCount + (searchUrl is null ? 0 : 1)];
         for (var index = 0; index < localCount; index++)
         {
             var candidate = topCandidates[index];
             var isTopMatch = index == 0 && (candidate.Match == AddressSuggestionMatch.Exact || candidate.Quality <= 1);
             var detailText = candidate.Source == AddressSuggestionSource.OpenTab
-                ? $"Switch to tab \u00B7 {TextSafety.FormatUrlForDisplay(candidate.Url, MaximumUrlCharactersToDisplay)}"
+                ? $"Switch to tab \u00B7 {candidate.FormattedUrl}"
                 : candidate.IsSearchQuery
                     ? candidate.SearchProviderName
-                    : TextSafety.FormatUrlForDisplay(candidate.Url, MaximumUrlCharactersToDisplay);
+                    : candidate.FormattedUrl;
             var acceptText = candidate.IsSearchQuery
                 ? candidate.Title
                 : candidate.Url;
@@ -148,6 +157,8 @@ internal static class AddressSuggestionEngine
                 candidate.IsSearchQuery);
         }
 
+        Array.Clear(topCandidates, 0, localCount);
+
         if (searchUrl is not null)
         {
             var searchIndex = results.Length - 1;
@@ -155,18 +166,24 @@ internal static class AddressSuggestionEngine
                 searchIndex,
                 AddressSuggestionSource.Search,
                 AddressSuggestionMatch.Search,
-                $"Search {BrowserPolicy.GetSearchProviderName(state.SearchProviderId)} for \u201c{CompactForDisplay(query)}\u201d",
-                $"{BrowserPolicy.GetSearchProviderName(state.SearchProviderId)} search",
+                $"Search {searchProviderName} for \u201c{CompactForDisplay(query)}\u201d",
+                $"{searchProviderName} search",
                 query,
                 searchUrl);
         }
         return results;
     }
 
+    private static Candidate[] GetThreadCandidateBuffer()
+    {
+        return threadCandidateBuffer ??= new Candidate[MaximumResultLimit];
+    }
+
     private static HashSet<string>? AddOpenTabCandidates(
         IReadOnlyList<OpenTabCandidate> openTabs,
         string query,
         Candidate[] topCandidates,
+        int topCandidateLimit,
         ref int topCandidateCount)
     {
         HashSet<string>? matchedUrls = null;
@@ -184,6 +201,7 @@ internal static class AddressSuggestionEngine
                 continue;
             }
 
+            var formattedUrl = TextSafety.FormatUrlForDisplay(tab.Url, MaximumUrlCharactersToDisplay);
             var title = string.IsNullOrWhiteSpace(tab.Title)
                 ? TextSafety.FormatUrlForDisplay(tab.Url, MaximumTitleCharactersToMatch)
                 : TextSafety.SanitizeSingleLine(tab.Title, MaximumTitleCharactersToMatch);
@@ -201,6 +219,7 @@ internal static class AddressSuggestionEngine
                 index,
                 title,
                 tab.Url,
+                formattedUrl,
                 GetUrlHash(parsedUrl),
                 AcceptedCount: 0,
                 LastAcceptedUtc: DateTimeOffset.UnixEpoch,
@@ -228,10 +247,11 @@ internal static class AddressSuggestionEngine
                 indexed.SourceIndex,
                 indexed.Title,
                 indexed.Url,
+                indexed.FormattedUrl,
                 indexed.AcceptedCount,
                 indexed.LastAcceptedUtc,
                 indexed.UrlHash);
-            AddTopCandidate(candidate, topCandidates, ref topCandidateCount);
+            AddTopCandidate(candidate, topCandidates, topCandidateLimit, ref topCandidateCount);
         }
 
         return matchedUrls;
@@ -241,6 +261,7 @@ internal static class AddressSuggestionEngine
         IndexedCandidate indexedCandidate,
         string query,
         Candidate[] topCandidates,
+        int topCandidateLimit,
         ref int topCandidateCount)
     {
         var match = Classify(
@@ -259,21 +280,23 @@ internal static class AddressSuggestionEngine
             indexedCandidate.SourceIndex,
             indexedCandidate.Title,
             indexedCandidate.Url,
+            indexedCandidate.FormattedUrl,
             indexedCandidate.AcceptedCount,
             indexedCandidate.LastAcceptedUtc,
             indexedCandidate.UrlHash,
             indexedCandidate.IsSearchQuery,
             indexedCandidate.SearchProviderName);
 
-        AddTopCandidate(candidate, topCandidates, ref topCandidateCount);
+        AddTopCandidate(candidate, topCandidates, topCandidateLimit, ref topCandidateCount);
     }
 
     private static void AddTopCandidate(
         Candidate candidate,
         Candidate[] topCandidates,
+        int topCandidateLimit,
         ref int topCandidateCount)
     {
-        if (topCandidateCount == topCandidates.Length
+        if (topCandidateCount == topCandidateLimit
             && CompareCandidates(candidate, topCandidates[topCandidateCount - 1]) >= 0)
         {
             return;
@@ -297,7 +320,7 @@ internal static class AddressSuggestionEngine
             }
             topCandidateCount--;
         }
-        else if (topCandidateCount == topCandidates.Length)
+        else if (topCandidateCount == topCandidateLimit)
         {
             topCandidateCount--;
         }
@@ -438,6 +461,7 @@ internal static class AddressSuggestionEngine
             sourceIndex,
             title,
             url,
+            TextSafety.FormatUrlForDisplay(url, MaximumUrlCharactersToDisplay),
             GetUrlHash(parsedUrl),
             usage.AcceptedCount,
             usage.LastAcceptedUtc,
@@ -578,7 +602,7 @@ internal static class AddressSuggestionEngine
         }
         else if (host.Equals("duckduckgo.com", StringComparison.OrdinalIgnoreCase))
         {
-            if (uri.AbsolutePath.Equals("/") || uri.AbsolutePath.Equals("/html", StringComparison.OrdinalIgnoreCase))
+            if (uri.AbsolutePath.Equals("/html", StringComparison.OrdinalIgnoreCase))
             {
                 if (TryGetQueryParam(uri.Query, "q", out queryText) && !string.IsNullOrWhiteSpace(queryText))
                 {
@@ -609,7 +633,14 @@ internal static class AddressSuggestionEngine
             if (key.Equals(paramName.AsSpan(), StringComparison.OrdinalIgnoreCase))
             {
                 var encodedVal = pair[(eqIndex + 1)..].ToString().Replace('+', ' ');
-                value = Uri.UnescapeDataString(encodedVal).Trim();
+                try
+                {
+                    value = Uri.UnescapeDataString(encodedVal).Trim();
+                }
+                catch (UriFormatException)
+                {
+                    value = encodedVal.Trim();
+                }
                 return value.Length > 0;
             }
         }
@@ -652,41 +683,60 @@ internal static class AddressSuggestionEngine
         BrowserState state,
         int maximumResults = MaximumResultLimit)
     {
-        if (liveQueries is null || liveQueries.Count == 0)
+        localSuggestions ??= Array.Empty<AddressSuggestion>();
+        var normalizedQuery = TextSafety.SanitizeSingleLine(query, MaximumQueryCharactersToMatch);
+        if (liveQueries is null || liveQueries.Count == 0 || normalizedQuery.Length == 0)
+        {
+            return localSuggestions;
+        }
+
+        var searchProviderId = state?.SearchProviderId;
+        var baseSearchUrl = BrowserPolicy.CreateSearchUrl(normalizedQuery, searchProviderId);
+        if (baseSearchUrl.Length > BrowserPolicy.MaximumUrlLength)
         {
             return localSuggestions;
         }
 
         var limit = Math.Clamp(maximumResults, 1, MaximumResultLimit);
-        var searchProvider = BrowserPolicy.GetSearchProviderName(state?.SearchProviderId);
-        var baseSearchUrl = BrowserPolicy.CreateSearchUrl(query, state?.SearchProviderId);
+        var searchProvider = BrowserPolicy.GetSearchProviderName(searchProviderId);
 
         var merged = new List<AddressSuggestion>(limit);
         var seenTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var seenUrls = new HashSet<string>(BrowserPolicy.UrlComparer);
 
-        // 1. If localSuggestions has a TopMatch or Exact match, preserve it at position 0
+        // 1. If localSuggestions[0] is a strong match (TopMatch, Exact, Prefix, or OpenTab),
+        // preserve it at position 0; weak fuzzy matches yield to higher-relevance live queries.
         var localIndex = 0;
         if (localSuggestions.Count > 0 && !localSuggestions[0].IsSearch)
         {
             var first = localSuggestions[0];
-            merged.Add(first with { KeyboardIndex = 0 });
-            seenTargets.Add(first.AcceptText);
-            seenTargets.Add(first.Title);
-            localIndex = 1;
+            var isStrongMatch = first.IsTopMatch
+                || first.Source == AddressSuggestionSource.OpenTab
+                || first.Match is AddressSuggestionMatch.Exact or AddressSuggestionMatch.Prefix;
+            if (isStrongMatch)
+            {
+                if (!string.IsNullOrEmpty(first.NavigationTarget))
+                {
+                    seenUrls.Add(first.NavigationTarget);
+                }
+                seenTargets.Add(first.AcceptText);
+                seenTargets.Add(first.Title);
+                merged.Add(first with { KeyboardIndex = 0 });
+                localIndex = 1;
+            }
         }
 
         // 2. Add high-quality live search suggestions
         var searchIndex = 0;
         while (merged.Count < limit - 1 && searchIndex < liveQueries.Count)
         {
-            var liveQuery = liveQueries[searchIndex++];
-            if (string.IsNullOrWhiteSpace(liveQuery)) continue;
-            var trimmedLive = liveQuery.Trim();
-            if (seenTargets.Contains(trimmedLive)) continue;
-            if (trimmedLive.Equals(query, StringComparison.OrdinalIgnoreCase)) continue;
+            var trimmedLive = TextSafety.SanitizeSingleLine(liveQueries[searchIndex++], MaximumQueryCharactersToMatch);
+            if (trimmedLive.Length == 0) continue;
+            if (trimmedLive.Equals(normalizedQuery, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!seenTargets.Add(trimmedLive)) continue;
 
-            seenTargets.Add(trimmedLive);
-            var liveSearchUrl = BrowserPolicy.CreateSearchUrl(trimmedLive, state?.SearchProviderId);
+            var liveSearchUrl = BrowserPolicy.CreateSearchUrl(trimmedLive, searchProviderId);
+            if (liveSearchUrl.Length > BrowserPolicy.MaximumUrlLength || !seenUrls.Add(liveSearchUrl)) continue;
             merged.Add(new AddressSuggestion(
                 merged.Count,
                 AddressSuggestionSource.Search,
@@ -702,6 +752,7 @@ internal static class AddressSuggestionEngine
         {
             var local = localSuggestions[localIndex++];
             if (local.IsSearch) continue;
+            if (!string.IsNullOrEmpty(local.NavigationTarget) && !seenUrls.Add(local.NavigationTarget)) continue;
             if (seenTargets.Contains(local.AcceptText) || seenTargets.Contains(local.Title)) continue;
 
             seenTargets.Add(local.AcceptText);
@@ -714,9 +765,9 @@ internal static class AddressSuggestionEngine
             finalIndex,
             AddressSuggestionSource.Search,
             AddressSuggestionMatch.Search,
-            $"Search {searchProvider} for \u201c{CompactForDisplay(query)}\u201d",
+            $"Search {searchProvider} for \u201c{CompactForDisplay(normalizedQuery)}\u201d",
             $"{searchProvider} search",
-            query,
+            normalizedQuery,
             baseSearchUrl));
 
         return merged;
@@ -922,17 +973,18 @@ internal static class AddressSuggestionEngine
         }
 
         private static bool SequenceReferencesMatch<T>(
-            IReadOnlyList<T> current,
+            List<T> current,
             T[] snapshot,
             int maximumCount)
             where T : class
         {
-            var count = Math.Min(current.Count, maximumCount);
+            var span = CollectionsMarshal.AsSpan(current);
+            var count = Math.Min(span.Length, maximumCount);
             if (count != snapshot.Length) return false;
 
             for (var index = 0; index < count; index++)
             {
-                if (!ReferenceEquals(current[index], snapshot[index])) return false;
+                if (!ReferenceEquals(span[index], snapshot[index])) return false;
             }
 
             return true;
@@ -944,6 +996,7 @@ internal static class AddressSuggestionEngine
         int SourceIndex,
         string Title,
         string Url,
+        string FormattedUrl,
         int UrlHash,
         int AcceptedCount,
         DateTimeOffset LastAcceptedUtc,
@@ -959,6 +1012,7 @@ internal static class AddressSuggestionEngine
         int SourceIndex,
         string Title,
         string Url,
+        string FormattedUrl,
         int AcceptedCount,
         DateTimeOffset LastAcceptedUtc,
         int UrlHash,

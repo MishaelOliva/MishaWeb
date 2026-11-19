@@ -1,11 +1,29 @@
+using System.Buffers;
 using System.Buffers.Binary;
+using System.Collections.ObjectModel;
 using System.IO.Compression;
 using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 
 namespace MishaWeb;
+
+internal sealed record ManagedPackageMarker(
+    int FormatVersion,
+    string State,
+    string? RuntimeId,
+    string? StoreId,
+    DateTime StateChangedUtc);
+
+[JsonSourceGenerationOptions(
+    PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
+    WriteIndented = true)]
+[JsonSerializable(typeof(List<ManagedBrowserExtension?>))]
+[JsonSerializable(typeof(ManagedBrowserExtension[]))]
+[JsonSerializable(typeof(ManagedPackageMarker))]
+internal sealed partial class BrowserExtensionsJsonContext : JsonSerializerContext;
 
 internal sealed record PreparedBrowserExtension(
     string FolderPath,
@@ -78,21 +96,21 @@ internal sealed class BrowserExtensions
     private const string InstalledMarkerState = "installed";
     private const string RegistryFileName = "managed-extensions.json";
     private static readonly HttpClient ChromeStoreClient = CreateChromeStoreClient();
-    private static readonly JsonSerializerOptions RegistryJsonOptions = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        WriteIndented = true
-    };
 
     private readonly string folderPath;
     private readonly string managedFolderPath;
     private readonly string registryPath;
     private static readonly object RegistrySync = new();
+    private readonly object scriptCacheSync = new();
     private long cachedRegistryLength = -1;
     private long cachedRegistryLastWriteTicks = -1;
-    private Dictionary<string, ManagedBrowserExtension>? cachedRegistryRecords;
+    private ReadOnlyDictionary<string, ManagedBrowserExtension>? cachedRegistryRecords;
     private readonly SemaphoreSlim updateCheckGate = new(1, 1);
     private readonly Dictionary<string, CachedScript> scriptCache = new(StringComparer.OrdinalIgnoreCase);
+    private CachedScript[] cachedLoadedScripts = Array.Empty<CachedScript>();
+    private string[] cachedScriptContents = Array.Empty<string>();
+    private DateTime lastScriptDirectoryWriteUtc = DateTime.MinValue;
+    private long lastScriptScanTick = long.MinValue;
 
     public BrowserExtensions(string? folderPath = null)
     {
@@ -109,54 +127,135 @@ internal sealed class BrowserExtensions
 
     public IReadOnlyList<string> LoadScripts()
     {
-        Directory.CreateDirectory(folderPath);
-        var paths = Directory.EnumerateFiles(folderPath, "*.js")
-            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        var livePaths = paths.ToHashSet(StringComparer.OrdinalIgnoreCase);
-        foreach (var stalePath in scriptCache.Keys.Where(path => !livePaths.Contains(path)).ToArray())
-        {
-            scriptCache.Remove(stalePath);
-        }
-
-        var scripts = new List<string>(paths.Length);
-        long loadedScriptBytes = 0;
-        foreach (var path in paths)
-        {
-            try
-            {
-                var file = new FileInfo(path);
-                if (file.Length > MaximumScriptBytes
-                    || scripts.Count >= MaximumUserScripts
-                    || loadedScriptBytes + file.Length > MaximumUserScriptBytes)
-                {
-                    continue;
-                }
-                if (scriptCache.TryGetValue(path, out var cached)
-                    && cached.Length == file.Length
-                    && cached.LastWriteUtc == file.LastWriteTimeUtc)
-                {
-                    scripts.Add(cached.Content);
-                    loadedScriptBytes += file.Length;
-                    continue;
-                }
-
-                var content = File.ReadAllText(path, Encoding.UTF8);
-                if (string.IsNullOrWhiteSpace(content)) continue;
-                var scopedContent = CreateScopedUserScript(content);
-                if (scopedContent is null) continue;
-                scriptCache[path] = new CachedScript(file.Length, file.LastWriteTimeUtc, scopedContent);
-                scripts.Add(scopedContent);
-                loadedScriptBytes += file.Length;
-            }
-            catch (IOException) { }
-            catch (UnauthorizedAccessException) { }
-        }
-
-        return scripts;
+        EnsureScriptsLoaded();
+        lock (scriptCacheSync) return cachedScriptContents;
     }
 
-    private static string? CreateScopedUserScript(string content)
+    internal IReadOnlyList<(string Key, string Script)> GetScriptsForUrl(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url)
+            || !Uri.TryCreate(url, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            return Array.Empty<(string, string)>();
+        }
+
+        var entries = EnsureScriptsLoaded();
+        if (entries.Length == 0) return Array.Empty<(string, string)>();
+
+        List<(string Key, string Script)>? matched = null;
+        foreach (var entry in entries)
+        {
+            if (!MatchesUserScriptUrl(entry, uri)) continue;
+            matched ??= new List<(string, string)>(entries.Length);
+            matched.Add((entry.ScriptKey, entry.Content));
+        }
+        return matched ?? (IReadOnlyList<(string, string)>)Array.Empty<(string, string)>();
+    }
+
+    internal bool HasUninstalledScriptsForUrl(string? url, IReadOnlySet<string> installedKeys)
+    {
+        if (string.IsNullOrWhiteSpace(url)
+            || !Uri.TryCreate(url, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            return false;
+        }
+
+        var entries = EnsureScriptsLoaded();
+        if (entries.Length == 0) return false;
+        foreach (var entry in entries)
+        {
+            if (!installedKeys.Contains(entry.ScriptKey) && MatchesUserScriptUrl(entry, uri))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private CachedScript[] EnsureScriptsLoaded()
+    {
+        lock (scriptCacheSync)
+        {
+            if (!Directory.Exists(folderPath))
+            {
+                Directory.CreateDirectory(folderPath);
+                cachedLoadedScripts = Array.Empty<CachedScript>();
+                cachedScriptContents = Array.Empty<string>();
+                lastScriptDirectoryWriteUtc = Directory.GetLastWriteTimeUtc(folderPath);
+                lastScriptScanTick = Environment.TickCount64;
+                return cachedLoadedScripts;
+            }
+
+            var dirWriteUtc = Directory.GetLastWriteTimeUtc(folderPath);
+            var nowTick = Environment.TickCount64;
+            if (lastScriptScanTick != long.MinValue
+                && dirWriteUtc == lastScriptDirectoryWriteUtc
+                && (nowTick - lastScriptScanTick) < 10_000)
+            {
+                return cachedLoadedScripts;
+            }
+
+            var paths = Directory.EnumerateFiles(folderPath, "*.js")
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var livePaths = paths.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var stalePath in scriptCache.Keys.Where(path => !livePaths.Contains(path)).ToArray())
+            {
+                scriptCache.Remove(stalePath);
+            }
+
+            var entries = new List<CachedScript>(paths.Length);
+            var contents = new List<string>(paths.Length);
+            long loadedScriptBytes = 0;
+            foreach (var path in paths)
+            {
+                try
+                {
+                    var file = new FileInfo(path);
+                    if (file.Length > MaximumScriptBytes
+                        || entries.Count >= MaximumUserScripts
+                        || loadedScriptBytes + file.Length > MaximumUserScriptBytes)
+                    {
+                        continue;
+                    }
+                    if (scriptCache.TryGetValue(path, out var cached)
+                        && cached.Length == file.Length
+                        && cached.LastWriteUtc == file.LastWriteTimeUtc)
+                    {
+                        entries.Add(cached);
+                        contents.Add(cached.Content);
+                        loadedScriptBytes += file.Length;
+                        continue;
+                    }
+
+                    var content = File.ReadAllText(path, Encoding.UTF8);
+                    if (string.IsNullOrWhiteSpace(content)) continue;
+                    var scoped = CreateScopedUserScript(path, file.Length, file.LastWriteTimeUtc, content);
+                    if (scoped is null) continue;
+                    scriptCache[path] = scoped;
+                    entries.Add(scoped);
+                    contents.Add(scoped.Content);
+                    loadedScriptBytes += file.Length;
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+
+            cachedLoadedScripts = entries.ToArray();
+            cachedScriptContents = contents.ToArray();
+            lastScriptDirectoryWriteUtc = dirWriteUtc;
+            lastScriptScanTick = Environment.TickCount64;
+            return cachedLoadedScripts;
+        }
+    }
+
+    private static CachedScript? CreateScopedUserScript(
+        string path,
+        long length,
+        DateTime lastWriteUtc,
+        string content)
     {
         if (!TryReadUserScriptPatterns(content, "@match", out var matches)
             || matches.Count == 0
@@ -164,13 +263,13 @@ internal sealed class BrowserExtensions
         {
             return null;
         }
-        var matchJson = JsonSerializer.Serialize(matches);
-        var excludeJson = JsonSerializer.Serialize(excludes);
+        var matchJson = JsonSerializer.Serialize(matches, BrowserStateJsonContext.Default.IReadOnlyListString);
+        var excludeJson = JsonSerializer.Serialize(excludes, BrowserStateJsonContext.Default.IReadOnlyListString);
 
         // Legacy scripts are local code, but they must still declare where they
         // run. The wrapper default-denies file/extension pages and the Web Store,
         // then evaluates familiar userscript match patterns before executing.
-        return "(() => { 'use strict';"
+        var wrapped = "(() => { 'use strict';"
             + "const u=new URL(location.href);"
             + "if(u.protocol!=='http:'&&u.protocol!=='https:')return;"
             + "const h=u.hostname.toLowerCase();"
@@ -188,6 +287,120 @@ internal sealed class BrowserExtensions
             + "if(!m.some(test)||x.some(test))return;(function(){\n"
             + content
             + "\n}).call(globalThis);})();";
+
+        return new CachedScript(
+            length,
+            lastWriteUtc,
+            $"{path}|{lastWriteUtc.Ticks}|{length}",
+            wrapped,
+            matches,
+            excludes);
+    }
+
+    private static bool MatchesUserScriptUrl(CachedScript script, Uri uri)
+    {
+        var host = uri.IdnHost.ToLowerInvariant();
+        if (host is "chromewebstore.google.com" or "chrome.google.com"
+            || host.EndsWith(".chrome.google.com", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var pathWithQueryAndFragment = uri.AbsolutePath + uri.Query + uri.Fragment;
+        var matched = false;
+        foreach (var pattern in script.Matches)
+        {
+            if (MatchesUserScriptPattern(pattern, uri.Scheme, host, pathWithQueryAndFragment))
+            {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) return false;
+
+        foreach (var pattern in script.Excludes)
+        {
+            if (MatchesUserScriptPattern(pattern, uri.Scheme, host, pathWithQueryAndFragment))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool MatchesUserScriptPattern(
+        string pattern,
+        string scheme,
+        string host,
+        string pathWithQueryAndFragment)
+    {
+        if (pattern.Equals("<all_urls>", StringComparison.OrdinalIgnoreCase)) return true;
+        var delimiter = pattern.IndexOf("://", StringComparison.Ordinal);
+        if (delimiter < 1) return false;
+        var patternScheme = pattern.AsSpan(0, delimiter);
+        var rest = pattern.AsSpan(delimiter + 3);
+        var slashIndex = rest.IndexOf('/');
+        if (slashIndex < 0) return false;
+
+        var patternHost = rest[..slashIndex];
+        var patternPath = rest[slashIndex..];
+        if (!patternScheme.Equals("*", StringComparison.Ordinal))
+        {
+            if (!patternScheme.Equals(scheme.AsSpan(), StringComparison.OrdinalIgnoreCase)) return false;
+        }
+        else if (!scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+            && !scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!patternHost.Equals("*", StringComparison.Ordinal))
+        {
+            if (patternHost.StartsWith("*.", StringComparison.Ordinal))
+            {
+                var baseHost = patternHost[2..];
+                if (!host.AsSpan().Equals(baseHost, StringComparison.OrdinalIgnoreCase)
+                    && !(host.Length > baseHost.Length + 1
+                        && host[host.Length - baseHost.Length - 1] == '.'
+                        && host.AsSpan(host.Length - baseHost.Length).Equals(baseHost, StringComparison.OrdinalIgnoreCase)))
+                {
+                    return false;
+                }
+            }
+            else if (!host.AsSpan().Equals(patternHost, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        return WildcardPathMatches(patternPath, pathWithQueryAndFragment.AsSpan());
+    }
+
+    private static bool WildcardPathMatches(ReadOnlySpan<char> pattern, ReadOnlySpan<char> value)
+    {
+        var searchStart = 0;
+        var segmentStart = 0;
+        var firstSegment = true;
+        while (segmentStart <= pattern.Length)
+        {
+            var starOffset = pattern[segmentStart..].IndexOf('*');
+            var segment = starOffset < 0
+                ? pattern[segmentStart..]
+                : pattern.Slice(segmentStart, starOffset);
+            if (!segment.IsEmpty)
+            {
+                var matchIndex = value[searchStart..].IndexOf(segment, StringComparison.Ordinal);
+                if (matchIndex < 0 || (firstSegment && !pattern.StartsWith('*') && matchIndex != 0))
+                {
+                    return false;
+                }
+                searchStart += matchIndex + segment.Length;
+            }
+            firstSegment = false;
+            if (starOffset < 0) break;
+            segmentStart += starOffset + 1;
+        }
+        return pattern.EndsWith('*') || searchStart == value.Length;
     }
 
     private static bool TryReadUserScriptPatterns(
@@ -196,13 +409,20 @@ internal sealed class BrowserExtensions
         out IReadOnlyList<string> result)
     {
         var patterns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var rawLine in content.Split('\n').Take(256))
+        var span = content.AsSpan();
+        var lineCount = 0;
+        while (!span.IsEmpty && lineCount < 256)
         {
+            var newlineIndex = span.IndexOf('\n');
+            var rawLine = newlineIndex < 0 ? span : span[..newlineIndex];
+            span = newlineIndex < 0 ? ReadOnlySpan<char>.Empty : span[(newlineIndex + 1)..];
+            lineCount++;
+
             var line = rawLine.Trim().TrimEnd('\r');
             if (!line.StartsWith("//", StringComparison.Ordinal)) continue;
             line = line[2..].TrimStart();
-            if (!line.StartsWith(directive, StringComparison.OrdinalIgnoreCase)) continue;
-            var pattern = line[directive.Length..].Trim();
+            if (!line.StartsWith(directive.AsSpan(), StringComparison.OrdinalIgnoreCase)) continue;
+            var pattern = line[directive.Length..].Trim().ToString();
             if (!IsSafeUserScriptPattern(pattern))
             {
                 result = Array.Empty<string>();
@@ -309,7 +529,7 @@ internal sealed class BrowserExtensions
             ManagedBrowserExtension current;
             lock (RegistrySync)
             {
-                current = LoadManagedRecords(failClosedOnInvalid: true).GetValueOrDefault(runtimeId)
+                current = LoadManagedRecordsReadOnly(failClosedOnInvalid: true).GetValueOrDefault(runtimeId)
                     ?? throw new InvalidOperationException(
                         "Only MishaWeb-managed Chrome Web Store extensions can be updated.");
             }
@@ -507,12 +727,12 @@ internal sealed class BrowserExtensions
 
     public ManagedBrowserExtension? GetManagedExtension(string runtimeId)
     {
-        lock (RegistrySync) return LoadManagedRecords().GetValueOrDefault(runtimeId);
+        lock (RegistrySync) return LoadManagedRecordsReadOnly().GetValueOrDefault(runtimeId);
     }
 
     public IReadOnlyDictionary<string, ManagedBrowserExtension> GetManagedExtensions()
     {
-        lock (RegistrySync) return LoadManagedRecords();
+        lock (RegistrySync) return LoadManagedRecordsReadOnly();
     }
 
     public void ForgetInstalled(string runtimeId)
@@ -760,7 +980,7 @@ internal sealed class BrowserExtensions
         {
             throw new ArgumentException("A bounded Web Store install channel is required.", nameof(channel));
         }
-        var encodedChannel = JsonSerializer.Serialize(channel);
+        var encodedChannel = JsonSerializer.Serialize(channel, BrowserStateJsonContext.Default.String);
         return "(() => {"
             + $"const channel={encodedChannel};"
             + "if(window.top!==window||window.__mishaChromeStoreInstallBridge)return;"
@@ -780,7 +1000,7 @@ internal sealed class BrowserExtensions
             + "button.style.cssText='position:fixed;right:20px;top:116px;z-index:2147483647;padding:11px 18px;border:0;border-radius:22px;background:#d63384;color:white;font:600 14px Arial,sans-serif;box-shadow:0 3px 12px #0005;cursor:pointer';"
             + "document.documentElement.appendChild(button);};"
             + "let syncPending=false;const scheduleSync=()=>{if(syncPending)return;syncPending=true;setTimeout(()=>{syncPending=false;syncFallback();},50);};"
-            + "const start=()=>{syncFallback();new MutationObserver(scheduleSync).observe(document,{childList:true,subtree:true});};"
+            + "const start=()=>{syncFallback();if(window.navigation&&typeof window.navigation.addEventListener==='function'){window.navigation.addEventListener('navigatesuccess',scheduleSync);}};"
             + "addEventListener('popstate',scheduleSync);addEventListener('hashchange',scheduleSync);"
             + "if(document.readyState==='loading')addEventListener('DOMContentLoaded',start,{once:true});else start();"
             + "addEventListener('click',event=>{"
@@ -1164,12 +1384,19 @@ internal sealed class BrowserExtensions
             using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(algorithm);
             foreach (var prefix in prefixes) hash.AppendData(prefix);
             package.Position = payloadOffset;
-            var buffer = new byte[64 * 1024];
-            while (true)
+            var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+            try
             {
-                var read = package.Read(buffer, 0, buffer.Length);
-                if (read == 0) break;
-                hash.AppendData(buffer, 0, read);
+                while (true)
+                {
+                    var read = package.Read(buffer, 0, buffer.Length);
+                    if (read == 0) break;
+                    hash.AppendData(buffer, 0, read);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
             }
             return hash.GetHashAndReset();
         }
@@ -1632,35 +1859,38 @@ internal sealed class BrowserExtensions
         catch { return null; }
     }
 
-    private static string? ReadBestIconPath(string extensionRoot, JsonObject manifest)
+    private static string? TryGetJsonString(JsonNode? node) =>
+        node is JsonValue value && value.TryGetValue<string>(out var text) ? text : null;
+
+    internal static string? ReadBestIconPath(string extensionRoot, JsonObject manifest)
     {
         var candidates = new List<string?>();
         if (manifest["icons"] is JsonObject icons)
         {
-            candidates.Add(icons["48"]?.GetValue<string>());
-            candidates.Add(icons["128"]?.GetValue<string>());
-            candidates.Add(icons["32"]?.GetValue<string>());
-            candidates.Add(icons["64"]?.GetValue<string>());
-            candidates.Add(icons["16"]?.GetValue<string>());
+            candidates.Add(TryGetJsonString(icons["48"]));
+            candidates.Add(TryGetJsonString(icons["128"]));
+            candidates.Add(TryGetJsonString(icons["32"]));
+            candidates.Add(TryGetJsonString(icons["64"]));
+            candidates.Add(TryGetJsonString(icons["16"]));
             foreach (var kvp in icons)
             {
-                try { candidates.Add(kvp.Value?.GetValue<string>()); } catch { }
+                candidates.Add(TryGetJsonString(kvp.Value));
             }
         }
         var actionIcon = manifest["action"]?["default_icon"] ?? manifest["browser_action"]?["default_icon"];
         if (actionIcon is JsonObject actionIcons)
         {
-            candidates.Add(actionIcons["48"]?.GetValue<string>());
-            candidates.Add(actionIcons["32"]?.GetValue<string>());
-            candidates.Add(actionIcons["16"]?.GetValue<string>());
+            candidates.Add(TryGetJsonString(actionIcons["48"]));
+            candidates.Add(TryGetJsonString(actionIcons["32"]));
+            candidates.Add(TryGetJsonString(actionIcons["16"]));
             foreach (var kvp in actionIcons)
             {
-                try { candidates.Add(kvp.Value?.GetValue<string>()); } catch { }
+                candidates.Add(TryGetJsonString(kvp.Value));
             }
         }
         else if (actionIcon is JsonValue)
         {
-            try { candidates.Add(actionIcon.GetValue<string>()); } catch { }
+            candidates.Add(TryGetJsonString(actionIcon));
         }
 
         foreach (var candidate in candidates)
@@ -1862,6 +2092,15 @@ internal sealed class BrowserExtensions
     private Dictionary<string, ManagedBrowserExtension> LoadManagedRecords(
         bool failClosedOnInvalid = false)
     {
+        var readOnly = LoadManagedRecordsReadOnly(failClosedOnInvalid);
+        return new Dictionary<string, ManagedBrowserExtension>(
+            readOnly,
+            StringComparer.OrdinalIgnoreCase);
+    }
+
+    private IReadOnlyDictionary<string, ManagedBrowserExtension> LoadManagedRecordsReadOnly(
+        bool failClosedOnInvalid = false)
+    {
         try
         {
             if (!File.Exists(registryPath))
@@ -1869,16 +2108,14 @@ internal sealed class BrowserExtensions
                 cachedRegistryRecords = null;
                 cachedRegistryLength = -1;
                 cachedRegistryLastWriteTicks = -1;
-                return new Dictionary<string, ManagedBrowserExtension>(StringComparer.OrdinalIgnoreCase);
+                return ReadOnlyDictionary<string, ManagedBrowserExtension>.Empty;
             }
             var registryInfo = new FileInfo(registryPath);
             if (cachedRegistryRecords is not null
                 && registryInfo.Length == cachedRegistryLength
                 && registryInfo.LastWriteTimeUtc.Ticks == cachedRegistryLastWriteTicks)
             {
-                return new Dictionary<string, ManagedBrowserExtension>(
-                    cachedRegistryRecords,
-                    StringComparer.OrdinalIgnoreCase);
+                return cachedRegistryRecords;
             }
             byte[] bytes;
             using (var stream = new FileStream(
@@ -1900,9 +2137,9 @@ internal sealed class BrowserExtensions
                     throw new InvalidDataException("The extension registry changed while it was being read.");
                 }
             }
-            var records = JsonSerializer.Deserialize<List<ManagedBrowserExtension?>>(
+            var records = JsonSerializer.Deserialize(
                 bytes,
-                RegistryJsonOptions) ?? [];
+                BrowserExtensionsJsonContext.Default.ListManagedBrowserExtension) ?? [];
             var validRecords = new Dictionary<string, ManagedBrowserExtension>(
                 StringComparer.OrdinalIgnoreCase);
             foreach (var record in records)
@@ -1931,10 +2168,8 @@ internal sealed class BrowserExtensions
             }
             cachedRegistryLength = registryInfo.Length;
             cachedRegistryLastWriteTicks = registryInfo.LastWriteTimeUtc.Ticks;
-            cachedRegistryRecords = validRecords;
-            return new Dictionary<string, ManagedBrowserExtension>(
-                validRecords,
-                StringComparer.OrdinalIgnoreCase);
+            cachedRegistryRecords = new ReadOnlyDictionary<string, ManagedBrowserExtension>(validRecords);
+            return cachedRegistryRecords;
         }
         catch (Exception error) when (error is IOException
             or UnauthorizedAccessException
@@ -1949,7 +2184,7 @@ internal sealed class BrowserExtensions
                     error);
             }
         }
-        return new Dictionary<string, ManagedBrowserExtension>(StringComparer.OrdinalIgnoreCase);
+        return ReadOnlyDictionary<string, ManagedBrowserExtension>.Empty;
     }
 
     private void SaveManagedRecords(IEnumerable<ManagedBrowserExtension> records)
@@ -1960,7 +2195,7 @@ internal sealed class BrowserExtensions
         foreach (var record in orderedRecords) ValidateManagedRecord(record);
         var bytes = JsonSerializer.SerializeToUtf8Bytes(
             orderedRecords,
-            RegistryJsonOptions);
+            BrowserExtensionsJsonContext.Default.ManagedBrowserExtensionArray);
         if (bytes.Length > MaximumRegistryBytes)
         {
             throw new InvalidDataException(
@@ -1970,7 +2205,17 @@ internal sealed class BrowserExtensions
         var temporaryPath = registryPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
-            File.WriteAllBytes(temporaryPath, bytes);
+            using (var stream = new FileStream(
+                temporaryPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                16 * 1024,
+                FileOptions.WriteThrough))
+            {
+                stream.Write(bytes);
+                stream.Flush(flushToDisk: true);
+            }
             File.Move(temporaryPath, registryPath, overwrite: true);
             cachedRegistryRecords = null;
             cachedRegistryLength = -1;
@@ -2114,7 +2359,7 @@ internal sealed class BrowserExtensions
                     StoreId: null,
                     StateChangedUtc: markerFile.LastWriteTimeUtc);
             }
-            var marker = JsonSerializer.Deserialize<ManagedPackageMarker>(bytes, RegistryJsonOptions);
+            var marker = JsonSerializer.Deserialize(bytes, BrowserExtensionsJsonContext.Default.ManagedPackageMarker);
             if (marker is null
                 || marker.FormatVersion != 1
                 || marker.State is not (PreparedMarkerState or InstallingMarkerState or InstalledMarkerState)
@@ -2146,7 +2391,7 @@ internal sealed class BrowserExtensions
             throw new InvalidDataException("The extension ownership metadata is invalid.");
         }
         var markerPath = GetManagedMarkerPath(fullPath);
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(marker, RegistryJsonOptions);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(marker, BrowserExtensionsJsonContext.Default.ManagedPackageMarker);
         if (bytes.Length > 16 * 1024)
         {
             throw new InvalidDataException("The extension ownership metadata is too large.");
@@ -2154,7 +2399,17 @@ internal sealed class BrowserExtensions
         var temporaryPath = markerPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
-            File.WriteAllBytes(temporaryPath, bytes);
+            using (var stream = new FileStream(
+                temporaryPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                16 * 1024,
+                FileOptions.WriteThrough))
+            {
+                stream.Write(bytes);
+                stream.Flush(flushToDisk: true);
+            }
             File.Move(temporaryPath, markerPath, overwrite: true);
         }
         finally
@@ -2248,15 +2503,22 @@ internal sealed class BrowserExtensions
         long maximumBytes,
         CancellationToken cancellationToken)
     {
-        var buffer = new byte[64 * 1024];
+        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
         long total = 0;
-        while (true)
+        try
         {
-            var read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-            if (read == 0) break;
-            total = checked(total + read);
-            if (total > maximumBytes) throw new InvalidDataException("The extension package is too large.");
-            await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+            while (true)
+            {
+                var read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken).ConfigureAwait(false);
+                if (read == 0) break;
+                total = checked(total + read);
+                if (total > maximumBytes) throw new InvalidDataException("The extension package is too large.");
+                await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
@@ -2266,18 +2528,25 @@ internal sealed class BrowserExtensions
         long maximumBytes,
         CancellationToken cancellationToken)
     {
-        var buffer = new byte[64 * 1024];
+        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
         long total = 0;
-        while (true)
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var read = source.Read(buffer, 0, buffer.Length);
-            if (read == 0) break;
-            total = checked(total + read);
-            if (total > maximumBytes) throw new InvalidDataException("An extracted extension file is too large.");
-            destination.Write(buffer, 0, read);
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var read = source.Read(buffer, 0, buffer.Length);
+                if (read == 0) break;
+                total = checked(total + read);
+                if (total > maximumBytes) throw new InvalidDataException("An extracted extension file is too large.");
+                destination.Write(buffer, 0, read);
+            }
+            return total;
         }
-        return total;
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
     }
 
     private static string GetManagedMarkerPath(string packageFolderPath) =>
@@ -2424,24 +2693,25 @@ internal sealed class BrowserExtensions
 
     private static HttpClient CreateChromeStoreClient()
     {
-        var handler = new HttpClientHandler
+        var handler = new SocketsHttpHandler
         {
             AllowAutoRedirect = true,
             AutomaticDecompression = DecompressionMethods.All,
-            MaxAutomaticRedirections = 8
+            MaxAutomaticRedirections = 8,
+            PooledConnectionLifetime = TimeSpan.FromMinutes(10)
         };
-        var client = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(3) };
+        var client = new HttpClient(handler, disposeHandler: true) { Timeout = TimeSpan.FromMinutes(3) };
         client.DefaultRequestHeaders.UserAgent.ParseAdd("MishaWeb/2.2");
         return client;
     }
 
-    private sealed record CachedScript(long Length, DateTime LastWriteUtc, string Content);
-    private sealed record ManagedPackageMarker(
-        int FormatVersion,
-        string State,
-        string? RuntimeId,
-        string? StoreId,
-        DateTime StateChangedUtc);
+    private sealed record CachedScript(
+        long Length,
+        DateTime LastWriteUtc,
+        string ScriptKey,
+        string Content,
+        IReadOnlyList<string> Matches,
+        IReadOnlyList<string> Excludes);
     private sealed record ManagedPackageMarkerInfo(
         string PackageFolderPath,
         ManagedPackageMarker Marker,

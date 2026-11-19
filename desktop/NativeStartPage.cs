@@ -168,7 +168,7 @@ internal sealed class NativeStartPage : UserControl
         featureHost.TabStop = false;
         featureHost.AccessibleName = "Browser features";
         featureHost.AccessibleRole = AccessibleRole.Grouping;
-        featureHost.Resize += (_, _) => ArrangeFeatureChips();
+        featureHost.Resize += (_, _) => { if (!arranging) ArrangeFeatureChips(); };
 
         featureChips =
         [
@@ -191,7 +191,7 @@ internal sealed class NativeStartPage : UserControl
         quickLinksHeader.TabStop = false;
         quickLinksHeader.AccessibleName = "Quick links header";
         quickLinksHeader.AccessibleRole = AccessibleRole.Grouping;
-        quickLinksHeader.Resize += (_, _) => ArrangeQuickLinksHeader();
+        quickLinksHeader.Resize += (_, _) => { if (!arranging) ArrangeQuickLinksHeader(); };
 
         quickLinksTitle.Dock = DockStyle.None;
         quickLinksTitle.Margin = Padding.Empty;
@@ -214,7 +214,7 @@ internal sealed class NativeStartPage : UserControl
         quickLinksHost.TabStop = false;
         quickLinksHost.AccessibleName = "Quick links";
         quickLinksHost.AccessibleRole = AccessibleRole.Grouping;
-        quickLinksHost.Resize += (_, _) => ArrangeQuickLinks();
+        quickLinksHost.Resize += (_, _) => { if (!arranging) ArrangeQuickLinks(); };
 
         contentLayout.Controls.Add(badge, 0, 0);
         contentLayout.Controls.Add(titleLabel, 0, 1);
@@ -457,7 +457,6 @@ internal sealed class NativeStartPage : UserControl
         base.OnDpiChangedAfterParent(e);
         StartPageArtwork.InvalidateBackdropFrame();
         ApplyDpiMetrics();
-        PerformLayout();
         Invalidate(true);
     }
 
@@ -476,7 +475,8 @@ internal sealed class NativeStartPage : UserControl
         arranging = true;
         try
         {
-            var outerMargin = ScaleLogical(18);
+            var microLayout = ClientSize.Width < ScaleLogical(420) || ClientSize.Height < ScaleLogical(320);
+            var outerMargin = ScaleLogical(microLayout ? 8 : 18);
             var availableWidth = Math.Max(1, ClientSize.Width - (outerMargin * 2));
             var availableHeight = Math.Max(1, ClientSize.Height - (outerMargin * 2));
             var hasQuickLinks = quickLinksHost.Controls.Count > 0;
@@ -484,7 +484,8 @@ internal sealed class NativeStartPage : UserControl
             compactLayout = availableHeight < ScaleLogical(hasQuickLinks ? 545 : 365)
                 || cardWidth < ScaleLogical(620);
 
-            ConfigureContentRows(compactLayout, hasQuickLinks, cardWidth);
+            searchBar.SetCompactMinimumSize(microLayout);
+            ConfigureContentRows(compactLayout, microLayout, hasQuickLinks, cardWidth, availableHeight);
 
             var desiredHeight = CalculateCardHeight();
             var cardHeight = Math.Min(desiredHeight, availableHeight);
@@ -613,10 +614,12 @@ internal sealed class NativeStartPage : UserControl
             ScaleLogical(2));
 
         card.CornerRadius = ScaleLogical(24);
-        var badgeSide = ScaleLogical(compactLayout ? 52 : 60);
+        var micro = ClientSize.Width < ScaleLogical(420) || ClientSize.Height < ScaleLogical(320);
+        var veryTightHeight = micro && ClientSize.Height < ScaleLogical(250);
+        var badgeSide = veryTightHeight ? ScaleLogical(32) : ScaleLogical(micro ? 38 : compactLayout ? 52 : 60);
         badge.Size = new Size(badgeSide, badgeSide);
         searchBar.Margin = Padding.Empty;
-        searchBar.MinimumSize = new Size(ScaleLogical(260), ScaleLogical(48));
+        searchBar.SetCompactMinimumSize(micro);
 
         foreach (var chip in featureChips)
         {
@@ -628,6 +631,7 @@ internal sealed class NativeStartPage : UserControl
             if (control is QuickLinkButton button) button.CornerRadius = ScaleLogical(14);
         }
 
+        if (arranging) return;
         PerformLayout();
     }
 
@@ -650,25 +654,32 @@ internal sealed class NativeStartPage : UserControl
         Invalidate(true);
     }
 
-    private void ConfigureContentRows(bool compact, bool hasQuickLinks, int cardWidth)
+    private void ConfigureContentRows(bool compact, bool micro, bool hasQuickLinks, int cardWidth, int availableHeight)
     {
         contentLayout.Padding = new Padding(
-            ScaleLogical(compact ? 7 : 10),
+            ScaleLogical(micro ? 4 : compact ? 7 : 10),
             ScaleLogical(2),
-            ScaleLogical(compact ? 7 : 10),
+            ScaleLogical(micro ? 4 : compact ? 7 : 10),
             ScaleLogical(2));
 
-        var badgeSide = ScaleLogical(compact ? 52 : 60);
+        var showMicroBadge = !micro || availableHeight >= ScaleLogical(250);
+        var showMicroTitle = !micro || availableHeight >= ScaleLogical(195);
+        badge.Visible = showMicroBadge;
+        titleLabel.Visible = showMicroTitle;
+
+        var badgeSide = ScaleLogical(micro ? 38 : compact ? 52 : 60);
         if (badge.Size.Width != badgeSide || badge.Size.Height != badgeSide)
         {
             badge.Size = new Size(badgeSide, badgeSide);
         }
 
-        SetRowHeight(0, compact ? 58 : 68);
-        SetRowHeight(1, isPrivateModeActive ? (compact ? 48 : 58) : (compact ? 44 : 52));
-        SetRowHeight(2, isPrivateModeActive ? (compact ? 28 : 34) : (compact ? 6 : 10));
-        SetRowHeight(3, compact ? 58 : 66);
-        SetRowHeight(4, compact ? 8 : 12);
+        SetRowHeight(0, showMicroBadge ? (micro ? 42 : compact ? 58 : 68) : 0);
+        SetRowHeight(1, showMicroTitle
+            ? (micro ? 36 : isPrivateModeActive ? (compact ? 48 : 58) : (compact ? 44 : 52))
+            : 0);
+        SetRowHeight(2, micro ? 0 : isPrivateModeActive ? (compact ? 28 : 34) : (compact ? 6 : 10));
+        SetRowHeight(3, micro ? 48 : compact ? 58 : 66);
+        SetRowHeight(4, micro ? 4 : compact ? 8 : 12);
         var contentWidth = Math.Max(1, cardWidth - contentLayout.Padding.Horizontal);
         contentLayout.RowStyles[5].Height = 0;
 
@@ -683,13 +694,13 @@ internal sealed class NativeStartPage : UserControl
         }
         else
         {
-            SetRowHeight(6, compact ? 28 : 34);
+            SetRowHeight(6, micro ? 24 : compact ? 28 : 34);
             if (hasQuickLinks)
             {
                 var columns = DetermineQuickLinkColumns(quickLinksHost.Controls.Count, contentWidth);
                 var rows = Math.Max(1, (int)Math.Ceiling(quickLinksHost.Controls.Count / (double)columns));
-                var quickLinkHeight = ScaleLogical(compact ? 56 : 62);
-                var gap = ScaleLogical(compact ? 6 : 8);
+                var quickLinkHeight = ScaleLogical(micro ? 48 : compact ? 56 : 62);
+                var gap = ScaleLogical(micro ? 5 : compact ? 6 : 8);
                 contentLayout.RowStyles[7].Height = (rows * quickLinkHeight) + ((rows - 1) * gap);
             }
             else
@@ -697,7 +708,7 @@ internal sealed class NativeStartPage : UserControl
                 contentLayout.RowStyles[7].Height = 0;
             }
 
-            quickLinksTitle.Text = hasQuickLinks
+            quickLinksTitle.Text = hasQuickLinks || micro
                 ? "Quick links"
                 : "Quick links \u00B7 Add favorites to see them here";
             quickLinksTitle.AccessibleName = quickLinksTitle.Text;
@@ -764,14 +775,30 @@ internal sealed class NativeStartPage : UserControl
         var headerWidth = quickLinksHeader.ClientSize.Width;
         var headerHeight = quickLinksHeader.ClientSize.Height;
         var gap = ScaleLogical(8);
-        var measuredText = TextRenderer.MeasureText(
-            "Manage",
-            ManageButtonFont,
-            Size.Empty,
-            TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+        var scale = Math.Max(1f, DeviceDpi / 96f);
+        Size measuredText;
+        if (quickLinksHeader.IsHandleCreated)
+        {
+            using var measureGraphics = quickLinksHeader.CreateGraphics();
+            measuredText = TextRenderer.MeasureText(
+                measureGraphics,
+                "Manage",
+                ManageButtonFont,
+                Size.Empty,
+                TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+        }
+        else
+        {
+            measuredText = TextRenderer.MeasureText(
+                "Manage",
+                ManageButtonFont,
+                Size.Empty,
+                TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+        }
+        var chromePadding = (int)Math.Ceiling((9f + 8.5f + 5f + 9f) * scale);
         var pillWidth = Math.Min(
             Math.Max(1, headerWidth / 2),
-            Math.Max(ScaleLogical(74), measuredText.Width + ScaleLogical(34)));
+            Math.Max(ScaleLogical(74), measuredText.Width + chromePadding));
         var pillHeight = Math.Max(
             Math.Min(headerHeight, ScaleLogical(20)),
             Math.Min(headerHeight - Math.Max(2, ScaleLogical(4)), ScaleLogical(compactLayout ? 22 : 25)));
@@ -1059,9 +1086,37 @@ internal sealed class NativeStartPage : UserControl
             }
         }
 
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                var previousRegion = Region;
+                Region = null;
+                previousRegion?.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
         private void UpdateClipRegion()
         {
             if (Width <= 1 || Height <= 1) return;
+
+            var effectiveBorderAlpha = IsFocused ? FocusBorderColor.A : BorderColor.A;
+            if (FillColor.A == 0
+                && FillColorSecondary.A == 0
+                && effectiveBorderAlpha == 0
+                && HighlightColor.A == 0)
+            {
+                if (Region is not null)
+                {
+                    var previousEmpty = Region;
+                    Region = null;
+                    previousEmpty.Dispose();
+                }
+                lastRegionSize = Size.Empty;
+                lastRegionRadius = 0;
+                return;
+            }
 
             var currentSize = new Size(Width, Height);
             if (lastRegionSize == currentSize && lastRegionRadius == CornerRadius && Region is not null)
@@ -1231,12 +1286,18 @@ internal sealed class NativeStartPage : UserControl
     private sealed class QuickLinkButton : Control
     {
         private readonly StartPageLink link;
+        private readonly SiteIconKind iconKind;
+        private readonly string monogram;
+        private readonly string detailText;
         private bool hovered;
         private bool pressed;
 
         public QuickLinkButton(StartPageLink link)
         {
             this.link = link;
+            iconKind = GetSiteIconKind(link.Url);
+            monogram = GetMonogram(link.Title, link.Url);
+            detailText = $"{link.Category} \u00B7 {GetDisplayHost(link.Url)}";
             SetStyle(
                 ControlStyles.AllPaintingInWmPaint
                 | ControlStyles.OptimizedDoubleBuffer
@@ -1354,12 +1415,11 @@ internal sealed class NativeStartPage : UserControl
                 using var halo = new SolidBrush(Color.FromArgb(hovered ? 48 : 24, AccentColor));
                 e.Graphics.FillEllipse(halo, haloBounds);
             }
-            var iconKind = GetSiteIconKind(link.Url);
             DrawSiteIcon(
                 e.Graphics,
                 badgeBounds,
                 iconKind,
-                GetMonogram(link.Title, link.Url),
+                monogram,
                 scale);
 
             var textLeft = badgeBounds.Right + Math.Max(7, (int)Math.Round((dense ? 8 : 10) * scale));
@@ -1379,7 +1439,7 @@ internal sealed class NativeStartPage : UserControl
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
             TextRenderer.DrawText(
                 e.Graphics,
-                $"{link.Category} \u00B7 {GetDisplayHost(link.Url)}",
+                detailText,
                 LinkDetailFont,
                 detailBounds,
                 SystemInformation.HighContrast

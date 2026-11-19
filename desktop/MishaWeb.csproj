@@ -11,10 +11,10 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <AssemblyName>MishaWeb</AssemblyName>
     <RootNamespace>MishaWeb</RootNamespace>
-    <Version>2.4.1</Version>
-    <AssemblyVersion>2.4.1.0</AssemblyVersion>
-    <FileVersion>2.4.1.0</FileVersion>
-    <InformationalVersion>2.4.1</InformationalVersion>
+    <Version>2.5.0</Version>
+    <AssemblyVersion>2.5.0.0</AssemblyVersion>
+    <FileVersion>2.5.0.0</FileVersion>
+    <InformationalVersion>2.5.0</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <AssemblyTitle>MishaWeb</AssemblyTitle>
     <Product>MishaWeb</Product>
@@ -25,6 +25,7 @@
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <RestoreLockedMode Condition="'$(ContinuousIntegrationBuild)' == 'true'">true</RestoreLockedMode>
     <Deterministic>true</Deterministic>
+    <TieredPGO>true</TieredPGO>
     <!-- Custom controls are code-only and never persisted by the WinForms designer. Keep every other analyzer warning enabled. -->
     <NoWarn>$(NoWarn);WFO1000</NoWarn>
     <!-- The loader is embedded and extracted by WebView2LoaderBootstrap. -->

@@ -9,7 +9,9 @@ internal static class WebView2LoaderBootstrap
 {
     private const string ResourceName = "MishaWeb.WebView2Loader.dll";
     private static readonly object LoaderSync = new();
+    private static readonly TimeSpan RuntimeProbeTimeout = TimeSpan.FromSeconds(20);
     private static nint loaderHandle;
+    private static int cleanupStarted;
 
     public static void EnsureLoaded()
     {
@@ -20,10 +22,7 @@ internal static class WebView2LoaderBootstrap
             var assembly = Assembly.GetExecutingAssembly();
             using var stream = assembly.GetManifestResourceStream(ResourceName)
                 ?? throw new InvalidOperationException("The embedded WebView2 loader is missing.");
-            using var buffer = new MemoryStream();
-            stream.CopyTo(buffer);
-            var loaderBytes = buffer.ToArray();
-            var expectedHash = SHA256.HashData(loaderBytes);
+            var expectedHash = SHA256.HashData(stream);
             var versionKey = Convert.ToHexString(expectedHash).ToLowerInvariant();
             var runtimeRoot = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -34,15 +33,28 @@ internal static class WebView2LoaderBootstrap
 
             Directory.CreateDirectory(folder);
             EnsureNoReparsePoints(runtimeRoot, folder, loaderPath);
-            if (!File.Exists(loaderPath) || !LoaderMatches(loaderPath, expectedHash))
+
+            FileStream? verifiedLoader = TryOpenVerifiedLoader(loaderPath, expectedHash);
+            if (verifiedLoader is null)
             {
+                var loaderBytes = ReadEmbeddedLoaderBytes(assembly, stream);
                 WriteLoaderAtomically(loaderPath, loaderBytes);
+                EnsureNoReparsePoints(runtimeRoot, folder, loaderPath);
+                verifiedLoader = OpenVerifiedLoader(loaderPath, expectedHash);
             }
-            EnsureNoReparsePoints(runtimeRoot, folder, loaderPath);
-            using var verifiedLoader = OpenVerifiedLoader(loaderPath, expectedHash);
-            // Keep the non-sharing verification handle open through Load so the
-            // verified bytes cannot be replaced between hashing and mapping.
-            loaderHandle = NativeLibrary.Load(loaderPath);
+
+            try
+            {
+                // Keep the non-sharing verification handle open through Load so the
+                // verified bytes cannot be replaced between hashing and mapping.
+                loaderHandle = NativeLibrary.Load(loaderPath);
+            }
+            finally
+            {
+                verifiedLoader.Dispose();
+            }
+
+            ScheduleObsoleteRuntimeCleanup(runtimeRoot, versionKey);
         }
     }
 
@@ -51,8 +63,46 @@ internal static class WebView2LoaderBootstrap
         EnsureLoaded();
         var environment = await CoreWebView2Environment.CreateAsync(
             browserExecutableFolder: null,
-            userDataFolder: userDataFolder).ConfigureAwait(false);
+            userDataFolder: userDataFolder).WaitAsync(RuntimeProbeTimeout).ConfigureAwait(false);
         return environment.BrowserVersionString;
+    }
+
+    private static byte[] ReadEmbeddedLoaderBytes(Assembly assembly, Stream existingStream)
+    {
+        if (existingStream.CanSeek)
+        {
+            existingStream.Position = 0;
+            var exactBytes = new byte[existingStream.Length];
+            existingStream.ReadExactly(exactBytes);
+            return exactBytes;
+        }
+
+        using var fallbackStream = assembly.GetManifestResourceStream(ResourceName)
+            ?? throw new InvalidOperationException("The embedded WebView2 loader is missing.");
+        using var buffer = new MemoryStream();
+        fallbackStream.CopyTo(buffer);
+        return buffer.ToArray();
+    }
+
+    private static FileStream? TryOpenVerifiedLoader(string loaderPath, ReadOnlySpan<byte> expectedHash)
+    {
+        if (!File.Exists(loaderPath)) return null;
+        try
+        {
+            return OpenVerifiedLoader(loaderPath, expectedHash);
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+        catch (InvalidDataException)
+        {
+            return null;
+        }
     }
 
     private static void WriteLoaderAtomically(string destination, byte[] bytes)
@@ -76,7 +126,17 @@ internal static class WebView2LoaderBootstrap
                 stream.Write(bytes);
                 stream.Flush(flushToDisk: true);
             }
-            File.Move(temporaryPath, destination, true);
+            try
+            {
+                File.Move(temporaryPath, destination, true);
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                // A concurrent MishaWeb process may already have extracted and mapped
+                // the identical content-addressed loader; OpenVerifiedLoader verifies
+                // the destination bytes afterward.
+                if (!File.Exists(destination)) throw;
+            }
         }
         finally
         {
@@ -91,15 +151,34 @@ internal static class WebView2LoaderBootstrap
         }
     }
 
-    private static bool LoaderMatches(string path, ReadOnlySpan<byte> expectedHash)
+    private static void ScheduleObsoleteRuntimeCleanup(string runtimeRoot, string activeVersionKey)
     {
-        try
+        if (Interlocked.Exchange(ref cleanupStarted, 1) != 0) return;
+        _ = Task.Run(() =>
         {
-            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-            return SHA256.HashData(stream).AsSpan().SequenceEqual(expectedHash);
-        }
-        catch (IOException) { return false; }
-        catch (UnauthorizedAccessException) { return false; }
+            try
+            {
+                foreach (var directory in Directory.EnumerateDirectories(runtimeRoot))
+                {
+                    var name = Path.GetFileName(directory);
+                    if (string.Equals(name, activeVersionKey, StringComparison.OrdinalIgnoreCase)) continue;
+                    try
+                    {
+                        var info = new DirectoryInfo(directory);
+                        if (info.Attributes.HasFlag(FileAttributes.ReparsePoint)) continue;
+                        Directory.Delete(directory, recursive: true);
+                    }
+                    catch
+                    {
+                        // Still mapped by another running instance or access-denied; skip.
+                    }
+                }
+            }
+            catch
+            {
+                // Best-effort cache cleanup.
+            }
+        });
     }
 
     private static FileStream OpenVerifiedLoader(string path, ReadOnlySpan<byte> expectedHash)

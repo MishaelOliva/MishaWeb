@@ -25,7 +25,8 @@ internal readonly record struct TabLifecycleSnapshot(
     bool HasCore,
     bool IsSuspended,
     bool KeepAwake,
-    int ProtectedResidentRank = -1);
+    int ProtectedResidentRank = -1,
+    bool IsVisibleInPane = false);
 
 internal readonly record struct TabLifecycleDecision(int Id, TabLifecycleAction Action);
 
@@ -237,14 +238,17 @@ internal static class TabLifecyclePolicy
         if (mode != TabLifecycleMode.Ultra) return;
 
         var residentCoreCount = 0;
+        var visiblePaneCount = 0;
         for (var index = 0; index < snapshots.Count; index++)
         {
             var snapshot = snapshots[index];
-            if (snapshot.HasCore && !snapshot.IsClosed) residentCoreCount++;
+            if (snapshot.IsClosed) continue;
+            if (snapshot.HasCore) residentCoreCount++;
+            if (snapshot.IsActive || snapshot.IsVisibleInPane) visiblePaneCount++;
         }
-        var residentCoreBudget = ResolveUltraResidentCoreBudget(
-            totalPhysicalBytes,
-            logicalProcessorCount);
+        var residentCoreBudget = Math.Max(
+            ResolveUltraResidentCoreBudget(totalPhysicalBytes, logicalProcessorCount),
+            visiblePaneCount);
         var excessResidentCores = residentCoreCount - residentCoreBudget;
         if (excessResidentCores <= 0) return;
 
@@ -434,6 +438,7 @@ internal static class TabLifecyclePolicy
     {
         return snapshot.Id >= 0
             && !snapshot.IsActive
+            && !snapshot.IsVisibleInPane
             && !snapshot.IsClosed
             && !snapshot.IsAudible
             && !snapshot.HasActiveDownload

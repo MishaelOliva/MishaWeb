@@ -6,6 +6,10 @@
 // because of that.
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { OWNED_PROCESS_GROUPS } from './MemoryChurnAnalysis.mjs';
 
 const MEBIBYTE = 1024 * 1024;
@@ -157,6 +161,26 @@ assert.ok(checkNamed(newProcessType, 'known-process-groups').actual.includes('un
 const observing = evaluateAcceptance({ ...OPTIONS, observeOnly: true }, true, [realSample()]);
 assert.ok(observing.checks.some(item => item.name === 'steady-state-reached'));
 assert.equal(observing.checks.some(item => item.name === 'final-private-mib'), false);
+
+// Usage and CLI validation advertise and bound --multi-view <2|3|4>.
+const probePath = path.resolve('desktop.tests', 'MemoryAcceptanceProbe.mjs');
+const usageOutput = spawnSync(process.execPath, [probePath, '--help'], { encoding: 'utf8', windowsHide: true });
+assert.equal(usageOutput.status, 0);
+assert.match(usageOutput.stdout, /--multi-view <2\|3\|4>/);
+
+const rejectedMvOut = path.join(os.tmpdir(), `MishaWeb-MV-Usage-Rejection-${process.pid}-${Date.now()}`);
+const rejectedMvLow = spawnSync(
+  process.execPath,
+  [
+    probePath,
+    '--exe', path.resolve('fixtures', 'MishaWeb.YouTubeProbe.exe'),
+    '--out', rejectedMvOut,
+    '--multi-view', '1'
+  ],
+  { encoding: 'utf8', windowsHide: true });
+assert.equal(rejectedMvLow.status, 2);
+assert.match(rejectedMvLow.stderr, /--multi-view must be an integer from 2 through 4/);
+assert.equal(existsSync(rejectedMvOut), false);
 
 console.log(JSON.stringify({
   status: 'PASS',

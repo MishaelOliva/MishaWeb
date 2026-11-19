@@ -1,4 +1,5 @@
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 
 namespace MishaWeb;
 
@@ -10,6 +11,14 @@ namespace MishaWeb;
 internal static class BrandArtwork
 {
     internal const string LogoResourceName = "MishaWeb.Brand.BunnyLogo.png";
+    private const int MaximumCachedLogoEntries = 8;
+    private const int MaximumCachedLogoSide = 256;
+
+    private readonly record struct RenderedLogoKey(int Width, int Height);
+    private sealed record RenderedLogoEntry(RenderedLogoKey Key, Bitmap Bitmap);
+
+    private static readonly object RenderedLogoSync = new();
+    private static readonly List<RenderedLogoEntry> RenderedLogoCache = new(MaximumCachedLogoEntries);
 
     private static readonly Lazy<Bitmap?> LogoImage = new(
         LoadLogoImage,
@@ -24,6 +33,63 @@ internal static class BrandArtwork
 
         var image = LogoImage.Value;
         if (image is null) return false;
+
+        if (bounds.Width > MaximumCachedLogoSide || bounds.Height > MaximumCachedLogoSide)
+        {
+            RenderLogo(graphics, bounds, image);
+            return true;
+        }
+
+        var key = new RenderedLogoKey(bounds.Width, bounds.Height);
+        lock (RenderedLogoSync)
+        {
+            Bitmap? cached = null;
+            for (var i = RenderedLogoCache.Count - 1; i >= 0; i--)
+            {
+                if (RenderedLogoCache[i].Key != key) continue;
+                var hit = RenderedLogoCache[i];
+                if (i < RenderedLogoCache.Count - 1)
+                {
+                    RenderedLogoCache.RemoveAt(i);
+                    RenderedLogoCache.Add(hit);
+                }
+                cached = hit.Bitmap;
+                break;
+            }
+
+            if (cached is null)
+            {
+                cached = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppPArgb);
+                cached.SetResolution(96f, 96f);
+                using (var renderGraphics = Graphics.FromImage(cached))
+                {
+                    renderGraphics.Clear(Color.Transparent);
+                    RenderLogo(renderGraphics, new Rectangle(0, 0, bounds.Width, bounds.Height), image);
+                }
+
+                if (RenderedLogoCache.Count >= MaximumCachedLogoEntries)
+                {
+                    RenderedLogoCache[0].Bitmap.Dispose();
+                    RenderedLogoCache.RemoveAt(0);
+                }
+                RenderedLogoCache.Add(new RenderedLogoEntry(key, cached));
+            }
+
+            graphics.DrawImage(
+                cached,
+                bounds,
+                0,
+                0,
+                cached.Width,
+                cached.Height,
+                GraphicsUnit.Pixel);
+        }
+
+        return true;
+    }
+
+    private static void RenderLogo(Graphics graphics, Rectangle bounds, Bitmap image)
+    {
 
         var previousSmoothing = graphics.SmoothingMode;
         var previousInterpolation = graphics.InterpolationMode;
@@ -120,7 +186,6 @@ internal static class BrandArtwork
                 using var innerRimPen = new Pen(innerRimBrush, 1f);
                 graphics.DrawPath(innerRimPen, innerPath);
             }
-            return true;
         }
         finally
         {

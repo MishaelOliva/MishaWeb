@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.5.0 - 2026-11-19
+
+### Multi-View workspace and MainForm modularization
+
+- Added Multi-View pane layouts (`Single`, `Split`, `Tri`, `Quad`) in `MultiViewLayout.cs`, `MultiViewControls.cs`, and `MainForm.MultiView.cs`, with draggable horizontal/vertical splitters, per-pane header bars, unique pane-to-tab slot assignment, and persisted split ratios.
+- Split `MainForm.cs` into partial files by subsystem (`MainForm.AdBlock.cs`, `MainForm.BrowserTab.cs`, `MainForm.Chrome.cs`, `MainForm.Controls.cs`, `MainForm.Dialogs.cs`, `MainForm.Extensions.cs`, `MainForm.Lifecycle.cs`, `MainForm.MultiView.cs`, `MainForm.Tabs.cs`, `MainForm.WebView.cs`).
+
+### Lifecycle, performance, and ad blocking
+
+- Enabled `TieredPGO` in `desktop/MishaWeb.csproj` and `PublishReadyToRun` + `TieredPGO` in `build/Publish-MishaWeb.ps1`, alongside startup, loader bootstrap (`WebView2LoaderBootstrap.cs`), system resource detection (`SystemResourceInfo.cs`), and tab lifecycle refinements (`TabLifecyclePolicy.cs`, `BrowserPerformance.cs`).
+- Updated `AdBlockEngine.cs`, `AdBlockDocumentScript.cs`, `BrowserExtensions.cs`, `SearchSuggestionService.cs`, and `AddressSuggestionEngine.cs`, and added `desktop.tests/AdBlockDocumentScript.test.mjs` while removing temporary scratch `.mjs` probes from `desktop.tests/`.
+- Expanded `.github/workflows/windows.yml` to run all five Node contract/script tests plus `PublishTransactionSmoke.ps1` and `Install-MishaWeb.ps1` AST syntax validation in CI.
+
 ## 2.4.1 - 2026-11-14
 
 ### Downloads and notifications

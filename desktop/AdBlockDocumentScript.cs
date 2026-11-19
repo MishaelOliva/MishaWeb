@@ -16,44 +16,44 @@ internal static class AdBlockDocumentScript
         "youtube.com", "youtube-nocookie.com", "youtubekids.com"
     ];
 
-    public const string Source =
+    public const string UniversalBootstrapSource =
         """
         (() => {
             const styleId = '__misha_adblock_style';
             const remoteStyleId = '__misha_adblock_remote_style';
             const controlChannel = '__MISHA_ADBLOCK_CONTROL_CHANNEL__';
             let enabledForDocument = window.__mishaAdBlockEnabled !== false;
-            let stopYouTubeRuntime = () => {};
-            let syncYouTubeRecoveryMask = () => {};
-            const bootstrapObservers = [];
-            const stopBootstrapObservers = () => {
-                for (const observer of bootstrapObservers) observer.disconnect();
-                bootstrapObservers.length = 0;
-            };
-            const isEnabled = () => enabledForDocument;
+            if (!Object.getOwnPropertyDescriptor(window, '__mishaAdBlockEnabled')) {
+                try {
+                    // Keep setter inert so page scripts cannot turn the shield off.
+                    Object.defineProperty(window, '__mishaAdBlockEnabled', {
+                        configurable: false,
+                        enumerable: false,
+                        get: () => enabledForDocument,
+                        set: () => {}
+                    });
+                } catch (_) { }
+            }
             const disableForDocument = () => {
                 enabledForDocument = false;
-                stopBootstrapObservers();
-                stopYouTubeRuntime();
+                try { window.__mishaStopYouTubeRuntime?.(); } catch (_) { }
                 document.getElementById(styleId)?.remove();
                 document.getElementById(remoteStyleId)?.remove();
             };
-            try {
-                // The setter is deliberately inert: this property is writable from
-                // page script, and a live setter would let any site turn the
-                // shield off for itself. The host reaches the runtime through the
-                // private control channel instead, and the site-exception policy
-                // script is registered before this one so its assignment to false
-                // is observed by the enabledForDocument initializer above.
-                Object.defineProperty(window, '__mishaAdBlockEnabled', {
-                    configurable: false,
-                    enumerable: false,
-                    get: () => enabledForDocument,
-                    set: () => {}
-                });
-            } catch (_) { }
             window.addEventListener(controlChannel, disableForDocument);
+            void styleId;
+            void remoteStyleId;
+        })();
+        """;
 
+    private const string SharedYouTubeBootstrapPrefix =
+        """
+            const styleId = '__misha_adblock_style';
+            const remoteStyleId = '__misha_adblock_remote_style';
+        """;
+
+    private const string SharedYouTubeBody =
+        """
             const isYouTubeHost = value => value === 'youtube.com'
                 || value.endsWith('.youtube.com')
                 || value === 'youtube-nocookie.com'
@@ -66,21 +66,8 @@ internal static class AdBlockDocumentScript
             const recoveryMaskAttribute = 'data-misha-youtube-recovery';
 
             // Curated list rules and the audited selectors below cover YouTube.
-            // Keep these broad fallback heuristics off its application shell so
-            // ordinary watch-page controls cannot be mistaken for ad chrome.
-            const selectors = isYouTube ? [] : [
-                '[id^="ad-"]', '[id*="-ad-"]', '[id$="-ad"]', '[id="ad"]',
-                '[class^="ad-"]', '[class*=" ad-"]', '[class$="-ad"]',
-                '[id*="advert"]', '[class*="advert"]', '[id*="sponsor"]',
-                '[class*="sponsor"]', '[data-ad]', '[data-ad-slot]',
-                '[data-ad-client]', '[data-google-query-id]',
-                '[aria-label="Advertisement"]', '[aria-label*="advertisement"]',
-                '.adsbygoogle', '.advertisement', '.advert', '.ad-banner',
-                '.ad-container', '.ad-wrapper', '.ad-unit', '.popunder',
-                '.popup-ad', '.ad-overlay', '.sponsor-ad',
-                'iframe[src*="doubleclick"]', 'iframe[src*="googlesyndication"]',
-                'iframe[src*="adservice"]', 'iframe[src*="adsrvr"]'
-            ];
+            // Compiled CosmeticRuleSet handles general sites without slow wildcard globs.
+            const selectors = [];
 
             if (isYouTube) {
                 // Ad placements collapse the single unit that hosts them. Hiding a
@@ -116,7 +103,7 @@ internal static class AdBlockDocumentScript
                     stopBootstrapObservers();
                     return;
                 }
-                if (!document.documentElement || document.getElementById(styleId)) return;
+                if (!isYouTube || !document.documentElement || document.getElementById(styleId)) return;
                 const style = document.createElement('style');
                 style.id = styleId;
                 style.textContent = selectors.join(',')
@@ -146,7 +133,7 @@ internal static class AdBlockDocumentScript
                 }
             };
             installStyle();
-            if (!document.documentElement) {
+            if (isYouTube && !document.documentElement) {
                 const styleBootstrapObserver = new MutationObserver(() => {
                     installStyle();
                     if (document.documentElement || !isEnabled()) {
@@ -156,7 +143,7 @@ internal static class AdBlockDocumentScript
                 bootstrapObservers.push(styleBootstrapObserver);
                 styleBootstrapObserver.observe(document, { childList: true });
             }
-            if (document.readyState === 'loading') {
+            if (isYouTube && document.readyState === 'loading') {
                 document.addEventListener('DOMContentLoaded', installStyle, { once: true });
             }
 
@@ -172,6 +159,76 @@ internal static class AdBlockDocumentScript
                     stopRecovery();
                     stopPristineFrameHook();
                 };
+        """;
+
+    public const string Source =
+        "(() => {\n"
+        + SharedYouTubeBootstrapPrefix
+        + "\n"
+        + """
+            const controlChannel = '__MISHA_ADBLOCK_CONTROL_CHANNEL__';
+            let enabledForDocument = window.__mishaAdBlockEnabled !== false;
+            let stopYouTubeRuntime = () => {};
+            let syncYouTubeRecoveryMask = () => {};
+            const bootstrapObservers = [];
+            const stopBootstrapObservers = () => {
+                for (const observer of bootstrapObservers) observer.disconnect();
+                bootstrapObservers.length = 0;
+            };
+            const isEnabled = () => enabledForDocument;
+            const disableForDocument = () => {
+                enabledForDocument = false;
+                stopBootstrapObservers();
+                stopYouTubeRuntime();
+                document.getElementById(styleId)?.remove();
+                document.getElementById(remoteStyleId)?.remove();
+            };
+            try {
+                // The setter is deliberately inert: this property is writable from
+                // page script, and a live setter would let any site turn the
+                // shield off for itself. The host reaches the runtime through the
+                // private control channel instead, and the site-exception policy
+                // script is registered before this one so its assignment to false
+                // is observed by the enabledForDocument initializer above.
+                Object.defineProperty(window, '__mishaAdBlockEnabled', {
+                    configurable: false,
+                    enumerable: false,
+                    get: () => enabledForDocument,
+                    set: () => {}
+                });
+            } catch (_) { }
+            window.addEventListener(controlChannel, disableForDocument);
+        """
+        + "\n"
+        + SharedYouTubeBody
+        + "\n"
+        + SharedYouTubeTrailer;
+
+    public const string YouTubeRuntimeSource =
+        "(() => {\n"
+        + SharedYouTubeBootstrapPrefix
+        + "\n"
+        + """
+            let stopYouTubeRuntime = () => {};
+            let syncYouTubeRecoveryMask = () => {};
+            const bootstrapObservers = [];
+            const stopBootstrapObservers = () => {
+                for (const observer of bootstrapObservers) observer.disconnect();
+                bootstrapObservers.length = 0;
+            };
+            const isEnabled = () => window.__mishaAdBlockEnabled !== false;
+            window.__mishaStopYouTubeRuntime = () => {
+                stopBootstrapObservers();
+                stopYouTubeRuntime();
+            };
+        """
+        + "\n"
+        + SharedYouTubeBody
+        + "\n"
+        + SharedYouTubeTrailer;
+
+    private const string SharedYouTubeTrailer =
+        """
                 const isYouTubeWatch = () => host === 'www.youtube.com'
                     && location.pathname === '/watch';
                 // The player loop re-reads the watch query several times per tick.
@@ -183,8 +240,8 @@ internal static class AdBlockDocumentScript
                 const watchQuery = () => {
                     const search = location.search;
                     if (search !== watchQueryKey) {
-                        watchQueryKey = search;
                         watchQueryCache = new URLSearchParams(search);
+                        watchQueryKey = search;
                     }
                     return watchQueryCache;
                 };
@@ -404,25 +461,6 @@ internal static class AdBlockDocumentScript
                     try { flags[name] = false; } catch (_) { }
                 }
             };
-            const forceTrueFlag = (flags, name) => {
-                if (!isEnabled()) return;
-                if (!flags || typeof flags !== 'object') return;
-                try {
-                    const descriptor = Object.getOwnPropertyDescriptor(flags, name);
-                    if (descriptor && !descriptor.configurable) {
-                        flags[name] = true;
-                        return;
-                    }
-                    Object.defineProperty(flags, name, {
-                        configurable: true,
-                        enumerable: descriptor?.enumerable ?? true,
-                        get: () => true,
-                        set: () => {}
-                    });
-                } catch (_) {
-                    try { flags[name] = true; } catch (_) { }
-                }
-            };
             const patchExperimentFlags = flags => {
                 // These were the only mutations in this file that ignored
                 // isEnabled(), so "disable for this site" left the network
@@ -444,7 +482,8 @@ internal static class AdBlockDocumentScript
                 } catch (_) { }
             };
             const patchYtcfgData = data => {
-                if (!data || typeof data !== 'object') return;
+                if (!data || typeof data !== 'object' || patchedYtcfgData.has(data)) return;
+                patchedYtcfgData.add(data);
                 try {
                     if (data.PLAYER_VARS) sanitizePlayerVars(data.PLAYER_VARS);
                     let storedFlags = data.EXPERIMENT_FLAGS;
@@ -658,7 +697,15 @@ internal static class AdBlockDocumentScript
                     || watchQuery().get('v')
                     || '';
                 const status = playerResponse?.playabilityStatus;
-                const errorScreen = status?.errorScreen;
+                if (!status || status.status === 'OK') {
+                    return {
+                        videoId,
+                        status,
+                        exactContractError: false,
+                        exactAdBlockEnforcement: false
+                    };
+                }
+                const errorScreen = status.errorScreen;
                 const captcha = errorScreen?.playerErrorMessageRenderer?.playerCaptchaViewModel;
                 const description = JSON.stringify(
                     errorScreen?.playerErrorMessageRenderer?.subreason?.runs
@@ -959,6 +1006,7 @@ internal static class AdBlockDocumentScript
                 const nativeFetch = window.fetch;
                 window.fetch = new Proxy(nativeFetch, {
                     apply(target, thisArg, args) {
+                        if (!isEnabled()) return Reflect.apply(target, thisArg, args);
                         try {
                             const firstArg = args[0];
                             const isReq = typeof Request !== 'undefined' && firstArg instanceof Request;
@@ -1076,7 +1124,7 @@ internal static class AdBlockDocumentScript
                                     () => {
                                         try {
                                             if (xhrSanitizedCache.has(thisArg)) return;
-                                            _ = thisArg.response;
+                                            void thisArg.response;
                                         } catch (_) { }
                                     },
                                     { once: true });
@@ -1147,7 +1195,7 @@ internal static class AdBlockDocumentScript
                 '[id^="skip-button:"] button'
             ];
             const skipAdSelector = skipSelectors.join(',');
-            const clickedSkipButtons = new Set();
+            let clickedSkipButtons = new WeakSet();
 
             const maybeRecoverServerContract = (player, playerResponse) => {
                 if (host !== 'www.youtube.com'
@@ -1516,7 +1564,7 @@ internal static class AdBlockDocumentScript
             const restoreAfterAd = () => {
                 if (!adWasActive) return;
                 adWasActive = false;
-                clickedSkipButtons.clear();
+                clickedSkipButtons = new WeakSet();
                 muteAppliedByBlocker = false;
                 const videos = document.querySelectorAll('video.html5-main-video, video');
                 for (const video of videos) {
@@ -1537,7 +1585,6 @@ internal static class AdBlockDocumentScript
             let autoplayAttempts = 0;
             let autoplayCompletedForVideoId = '';
             let lastPlayAttempt = 0;
-            let watchPageLoadTime = performance.now();
             let hookedVideo = null;
             let removeVideoHooks = () => {};
 
@@ -1663,17 +1710,17 @@ internal static class AdBlockDocumentScript
                         progress,
                         recoveredVideo,
                         snapshot)) return true;
-                    const serverContract = snapshot.refresh().stats?.debug_info;
-                    const unfinished = progress?.duration > 0
-                        && (progress.loaded < progress.duration
-                            || progress.duration - progress.current > 1);
-                    if (host === 'www.youtube.com'
-                        && location.pathname === '/watch'
-                        && !isPremium()
-                        && serverContract?.startsWith?.('SSAP, AD')
-                        && unfinished) {
-                        player.seekTo?.(progress.duration, true);
-                        adActivity = true;
+                    if (isYouTubeWatch() && !isPremium()) {
+                        const unfinished = progress?.duration > 0
+                            && (progress.loaded < progress.duration
+                                || progress.duration - progress.current > 1);
+                        if (unfinished) {
+                            const serverContract = snapshot.refresh().stats?.debug_info;
+                            if (serverContract?.startsWith?.('SSAP, AD')) {
+                                player.seekTo?.(progress.duration, true);
+                                adActivity = true;
+                            }
+                        }
                     }
 
                     const isClientAd = player?.classList?.contains('ad-showing')
@@ -1831,21 +1878,31 @@ internal static class AdBlockDocumentScript
             let instantPlayTimer = 0;
             const scheduleInstantPlayCheck = () => {
                 window.clearTimeout(instantPlayTimer);
-                if (!isEnabled() || !isYouTubeWatch() || autoplayCompletedForVideoId || userManuallyPaused) return;
+                if (!isEnabled()
+                    || !isYouTubeWatch()
+                    || autoplayCompletedForVideoId
+                    || userManuallyPaused
+                    || document.hidden
+                    || autoplayAttempts >= 20)
+                {
+                    return;
+                }
                 triggerInstantPlay();
-                if (!autoplayCompletedForVideoId) {
+                if (!autoplayCompletedForVideoId
+                    && !userManuallyPaused
+                    && !document.hidden
+                    && autoplayAttempts < 20)
+                {
                     instantPlayTimer = window.setTimeout(scheduleInstantPlayCheck, 200);
                 }
             };
             const scheduleFallback = adActivity => {
                 window.clearTimeout(fallbackTimer);
-                if (!isEnabled()) return;
-                const fastRecoveryPoll = isYouTubeWatch()
-                    && performance.now() < transportRecoveryFastPollUntil;
-                const delay = document.hidden
-                    ? 30_000
-                    : (fastRecoveryPoll ? 250 : (adActivity ? 500 : 3_000));
+                if (!isEnabled() || document.hidden || !isYouTubeWatch()) return;
+                const fastRecoveryPoll = performance.now() < transportRecoveryFastPollUntil;
+                const delay = fastRecoveryPoll ? 250 : (adActivity ? 500 : 3_000);
                 fallbackTimer = window.setTimeout(() => {
+                    if (!isEnabled() || document.hidden || !isYouTubeWatch()) return;
                     const activity = cleanPlayerAds();
                     if (!autoplayCompletedForVideoId) scheduleInstantPlayCheck();
                     observePlayer();
@@ -1853,21 +1910,22 @@ internal static class AdBlockDocumentScript
                 }, delay);
             };
             const queueCleanup = () => {
-                if (cleanupQueued || !isEnabled()) return;
+                if (cleanupQueued || !isEnabled() || document.hidden) return;
                 cleanupQueued = true;
                 cleanupSignalTimer = window.setTimeout(() => {
                     cleanupQueued = false;
+                    if (!isEnabled() || document.hidden) return;
                     const activity = cleanPlayerAds();
                     observePlayer();
                     if (activity) scheduleFallback(true);
-                }, document.hidden ? 5_000 : 150);
+                }, 150);
             };
             // The player class attribute churns many times per second while an
             // ad is on screen, and every mutation used to run a full pass in a
             // microtask. Keep the first pass immediate and floor the rest so a
             // single ad cannot drive hundreds of redundant player round trips.
             const urgentCleanupIntervalMs = 100;
-            let lastUrgentCleanupAt = 0;
+            let lastUrgentCleanupAt = -urgentCleanupIntervalMs;
             let urgentCleanupTimer = 0;
             const runCleanupPass = () => {
                 lastUrgentCleanupAt = performance.now();
@@ -1992,7 +2050,21 @@ internal static class AdBlockDocumentScript
                 }
             };
             const onVisibilityChange = () => {
-                if (!document.hidden) queueCleanup();
+                if (document.hidden) {
+                    window.clearTimeout(cleanupSignalTimer);
+                    window.clearTimeout(instantPlayTimer);
+                    window.clearTimeout(urgentCleanupTimer);
+                    cleanupQueued = false;
+                    urgentCleanupQueued = false;
+                    instantPlayTimer = 0;
+                    urgentCleanupTimer = 0;
+                    scheduleFallback(false);
+                    return;
+                }
+                if (isYouTubeWatch()) {
+                    queueCleanup();
+                    scheduleInstantPlayCheck();
+                }
                 scheduleFallback(false);
             };
             const onNavigationStart = () => {
@@ -2004,7 +2076,6 @@ internal static class AdBlockDocumentScript
                 autoplayAttempts = 0;
                 autoplayCompletedForVideoId = '';
                 lastPlayAttempt = 0;
-                watchPageLoadTime = performance.now();
                 clearRecoveryMask();
                 if (activeRecoveryMarker) setRecoveryMarker('');
                 recoveryVideoId = '';
@@ -2030,7 +2101,6 @@ internal static class AdBlockDocumentScript
                 autoplayAttempts = 0;
                 autoplayCompletedForVideoId = '';
                 lastPlayAttempt = 0;
-                watchPageLoadTime = performance.now();
                 if (isYouTubeWatch()) {
                     resetTransportRecovery();
                 } else {
@@ -2042,11 +2112,11 @@ internal static class AdBlockDocumentScript
                 triggerInstantPlay();
                 scheduleInstantPlayCheck();
                 queueCleanup();
+                scheduleFallback(false);
             };
             const startCleanup = () => {
                 if (!isEnabled() || cleanupStarted || !document.documentElement) return;
                 cleanupStarted = true;
-                watchPageLoadTime = performance.now();
                 const activity = cleanPlayerAds();
                 triggerInstantPlay();
                 scheduleInstantPlayCheck();
@@ -2082,7 +2152,7 @@ internal static class AdBlockDocumentScript
                     urgentCleanupTimer = 0;
                     cleanupQueued = false;
                     urgentCleanupQueued = false;
-                    clickedSkipButtons.clear();
+                    clickedSkipButtons = new WeakSet();
                     for (const eventName of cleanupEvents) {
                         document.removeEventListener(eventName, queueCleanup);
                     }

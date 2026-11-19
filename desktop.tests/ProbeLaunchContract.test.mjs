@@ -10,6 +10,7 @@ import {
   createProbeLaunchContract,
   extractWebViewUserDataFolder,
   ISOLATED_PROBE_IMAGE_NAME,
+  MULTI_VIEW_ARGUMENT,
   NORMAL_PROFILE_ARGUMENT,
   PACKAGED_BROWSER_IMAGE_NAME,
   PRIVATE_CHURN_PROBE_ARGUMENT,
@@ -211,6 +212,78 @@ const rejectedNormalChurn = spawnSync(
 assert.equal(rejectedNormalChurn.status, 2);
 assert.match(rejectedNormalChurn.stderr, /private-only/);
 assert.equal(existsSync(rejectedChurnOutput), false);
+
+for (const paneCount of [2, 3, 4]) {
+  const multiViewLaunch = createProbeLaunchContract({
+    executablePath: isolatedExecutable,
+    startupUrl,
+    multiView: paneCount
+  });
+  assert.equal(multiViewLaunch.multiView, paneCount);
+  assert.equal(multiViewLaunch.workload, `multi-view-${paneCount}`);
+  assert.deepEqual(multiViewLaunch.childArguments, [
+    PRIVATE_PROBE_ARGUMENT,
+    startupUrl,
+    MULTI_VIEW_ARGUMENT,
+    String(paneCount)
+  ]);
+}
+
+const multiViewChurnLaunch = createProbeLaunchContract({
+  executablePath: isolatedExecutable,
+  startupUrl: churnUrl,
+  churn: { cycles: 6, batchSize: 2, dwellMs: 500 },
+  multiView: 4
+});
+assert.equal(multiViewChurnLaunch.workload, 'multi-view-bounded-tab-churn');
+assert.deepEqual(multiViewChurnLaunch.childArguments, [
+  PRIVATE_CHURN_PROBE_ARGUMENT,
+  churnUrl,
+  '6',
+  '2',
+  '500',
+  MULTI_VIEW_ARGUMENT,
+  '4'
+]);
+
+assert.throws(
+  () => createProbeLaunchContract({
+    executablePath: isolatedExecutable,
+    startupUrl,
+    multiView: 1
+  }),
+  /multiView must be an integer from 2 through 4/);
+assert.throws(
+  () => createProbeLaunchContract({
+    executablePath: isolatedExecutable,
+    startupUrl,
+    multiView: 5
+  }),
+  /multiView must be an integer from 2 through 4/);
+assert.throws(
+  () => createProbeLaunchContract({
+    executablePath: packagedExecutable,
+    startupUrl,
+    normalProfile: true,
+    multiView: 3
+  }),
+  /Multi-view probe requires MishaWeb\.YouTubeProbe\.exe/);
+
+const rejectedMultiViewOutput = path.join(
+  os.tmpdir(),
+  `MishaWeb-MultiView-Contract-Rejection-${process.pid}-${Date.now()}`);
+const rejectedInvalidMultiView = spawnSync(
+  process.execPath,
+  [
+    memoryProbeScript,
+    '--exe', isolatedExecutable,
+    '--out', rejectedMultiViewOutput,
+    '--multi-view', '5'
+  ],
+  { encoding: 'utf8', windowsHide: true });
+assert.equal(rejectedInvalidMultiView.status, 2);
+assert.match(rejectedInvalidMultiView.stderr, /--multi-view must be an integer from 2 through 4/);
+assert.equal(existsSync(rejectedMultiViewOutput), false);
 
 console.log(JSON.stringify({
   status: 'PASS',
