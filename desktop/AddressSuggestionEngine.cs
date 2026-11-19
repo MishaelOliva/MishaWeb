@@ -195,7 +195,22 @@ internal static class AddressSuggestionEngine
                 || string.IsNullOrWhiteSpace(tab.Url)
                 || tab.Url.Length > BrowserPolicy.MaximumUrlLength
                 || tab.Url.Equals(StartPage.Url, StringComparison.OrdinalIgnoreCase)
-                || !Uri.TryCreate(tab.Url, UriKind.Absolute, out var parsedUrl)
+                || !TryExtractHttpHostSpan(tab.Url.AsSpan(), out var hostSpan, out var isRootHost))
+            {
+                continue;
+            }
+
+            var rawTitle = string.IsNullOrWhiteSpace(tab.Title) ? tab.Url : tab.Title;
+            var match = Classify(
+                query,
+                rawTitle,
+                tab.Url,
+                hostSpan,
+                isRootHost,
+                isSearchQuery: false);
+            if (!match.IsMatch) continue;
+
+            if (!Uri.TryCreate(tab.Url, UriKind.Absolute, out var parsedUrl)
                 || (parsedUrl.Scheme != Uri.UriSchemeHttp && parsedUrl.Scheme != Uri.UriSchemeHttps))
             {
                 continue;
@@ -212,45 +227,34 @@ internal static class AddressSuggestionEngine
 
             var host = parsedUrl.IdnHost;
             if (host.StartsWith("www.", StringComparison.OrdinalIgnoreCase)) host = host[4..];
-            var isRootHost = parsedUrl.AbsolutePath.Length <= 1 && string.IsNullOrEmpty(parsedUrl.Query);
-
-            var indexed = new IndexedCandidate(
-                AddressSuggestionSource.OpenTab,
-                index,
-                title,
-                tab.Url,
-                formattedUrl,
-                GetUrlHash(parsedUrl),
-                AcceptedCount: 0,
-                LastAcceptedUtc: DateTimeOffset.UnixEpoch,
-                IsSearchQuery: false,
-                SearchProviderName: string.Empty,
-                host,
-                isRootHost);
-
-            var match = Classify(
-                query,
-                indexed.Title,
-                indexed.Url,
-                indexed.Host,
-                indexed.IsRootHost,
-                indexed.IsSearchQuery);
-            if (!match.IsMatch) continue;
+            isRootHost = parsedUrl.AbsolutePath.Length <= 1 && string.IsNullOrEmpty(parsedUrl.Query);
+            if (!string.Equals(title, rawTitle, StringComparison.Ordinal)
+                || !hostSpan.Equals(host.AsSpan(), StringComparison.OrdinalIgnoreCase))
+            {
+                match = Classify(
+                    query,
+                    title,
+                    tab.Url,
+                    host.AsSpan(),
+                    isRootHost,
+                    isSearchQuery: false);
+                if (!match.IsMatch) continue;
+            }
 
             matchedUrls ??= new HashSet<string>(BrowserPolicy.UrlComparer);
-            if (!matchedUrls.Add(indexed.Url)) continue;
+            if (!matchedUrls.Add(tab.Url)) continue;
 
             var candidate = new Candidate(
                 AddressSuggestionSource.OpenTab,
                 match.Kind,
                 match.Quality,
-                indexed.SourceIndex,
-                indexed.Title,
-                indexed.Url,
-                indexed.FormattedUrl,
-                indexed.AcceptedCount,
-                indexed.LastAcceptedUtc,
-                indexed.UrlHash);
+                index,
+                title,
+                tab.Url,
+                formattedUrl,
+                AcceptedCount: 0,
+                LastAcceptedUtc: DateTimeOffset.UnixEpoch,
+                GetUrlHash(parsedUrl));
             AddTopCandidate(candidate, topCandidates, topCandidateLimit, ref topCandidateCount);
         }
 
@@ -439,8 +443,16 @@ internal static class AddressSuggestionEngine
         var searchProviderName = string.Empty;
         if (source == AddressSuggestionSource.History && TryExtractSearchEngineQuery(parsedUrl, out var queryText, out searchProviderName))
         {
-            title = queryText;
-            isSearchQuery = true;
+            var sanitizedQuery = TextSafety.SanitizeSingleLine(queryText, MaximumTitleCharactersToMatch);
+            if (sanitizedQuery.Length > 0)
+            {
+                title = sanitizedQuery;
+                isSearchQuery = true;
+            }
+            else
+            {
+                title = TextSafety.FormatUrlForDisplay(url, MaximumTitleCharactersToMatch);
+            }
         }
         else
         {
@@ -471,11 +483,57 @@ internal static class AddressSuggestionEngine
             isRootHost));
     }
 
+    private static bool TryExtractHttpHostSpan(
+        ReadOnlySpan<char> url,
+        out ReadOnlySpan<char> host,
+        out bool isRootHost)
+    {
+        host = default;
+        isRootHost = false;
+        var rest = url.TrimStart();
+        if (rest.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            rest = rest[8..];
+        }
+        else if (rest.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+        {
+            rest = rest[7..];
+        }
+        else
+        {
+            return false;
+        }
+
+        var authorityEnd = rest.IndexOfAny('/', '?', '#');
+        var authority = authorityEnd < 0 ? rest : rest[..authorityEnd];
+        if (authority.IsEmpty) return false;
+
+        var atIndex = authority.IndexOf('@');
+        if (atIndex >= 0) authority = authority[(atIndex + 1)..];
+        if (authority.IsEmpty) return false;
+
+        if (authority[0] != '[')
+        {
+            var colonIndex = authority.IndexOf(':');
+            if (colonIndex >= 0) authority = authority[..colonIndex];
+        }
+        if (authority.IsEmpty) return false;
+
+        if (authority.StartsWith("www.", StringComparison.OrdinalIgnoreCase))
+        {
+            authority = authority[4..];
+        }
+        host = authority;
+        var pathAndQuery = authorityEnd < 0 ? ReadOnlySpan<char>.Empty : rest[authorityEnd..];
+        isRootHost = pathAndQuery.IsEmpty || (pathAndQuery.Length == 1 && pathAndQuery[0] == '/');
+        return true;
+    }
+
     private static MatchResult Classify(
         string query,
         string title,
         string url,
-        string host,
+        ReadOnlySpan<char> hostSpan,
         bool isRootHost,
         bool isSearchQuery)
     {
@@ -498,7 +556,6 @@ internal static class AddressSuggestionEngine
         var urlSpan = Limit(url.AsSpan(), MaximumUrlCharactersToMatch);
 
         // 1. Host Prefix Matches (Highest priority for omnibox navigation)
-        var hostSpan = host.AsSpan();
         if (hostSpan.StartsWith(querySpan, StringComparison.OrdinalIgnoreCase))
         {
             // Root host prefix match: e.g. "youtube.com" or "github.com" for query "y" or "git"
@@ -576,9 +633,7 @@ internal static class AddressSuggestionEngine
         var host = uri.IdnHost;
         if (host.StartsWith("www.", StringComparison.OrdinalIgnoreCase)) host = host[4..];
 
-        if (host.Equals("google.com", StringComparison.OrdinalIgnoreCase)
-            || host.EndsWith(".google.com", StringComparison.OrdinalIgnoreCase)
-            || host.StartsWith("google.", StringComparison.OrdinalIgnoreCase))
+        if (IsGoogleSearchHost(host))
         {
             if (uri.AbsolutePath.Equals("/search", StringComparison.OrdinalIgnoreCase))
             {
@@ -612,6 +667,34 @@ internal static class AddressSuggestionEngine
             }
         }
         return false;
+    }
+
+    private static bool IsGoogleSearchHost(string host)
+    {
+        if (host.Equals("google.com", StringComparison.OrdinalIgnoreCase)
+            || host.EndsWith(".google.com", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (!host.StartsWith("google.", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var suffix = host.AsSpan(7);
+        if (IsTwoAsciiLetters(suffix) || suffix.Equals("cat", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        if (suffix.StartsWith("co.", StringComparison.OrdinalIgnoreCase) && IsTwoAsciiLetters(suffix[3..]))
+        {
+            return true;
+        }
+        return suffix.StartsWith("com.", StringComparison.OrdinalIgnoreCase) && IsTwoAsciiLetters(suffix[4..]);
+
+        static bool IsTwoAsciiLetters(ReadOnlySpan<char> value) =>
+            value.Length == 2 && char.IsAsciiLetter(value[0]) && char.IsAsciiLetter(value[1]);
     }
 
     private static bool TryGetQueryParam(string queryString, string paramName, out string value)
