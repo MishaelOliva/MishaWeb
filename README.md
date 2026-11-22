@@ -62,7 +62,7 @@ Instead of packaging Chromium and Node.js binaries (like Electron), MishaWeb rel
 
 ### Option 1: Download Prebuilt Release (No .NET Install Required)
 
-1. Download **`MishaWeb-v2.5.0-win-x64.zip`** from the [Latest Release](https://github.com/MishaelOliva/MishaWeb/releases/latest).
+1. Download **`MishaWeb-v2.5.1-win-x64.zip`** from the [Latest Release](https://github.com/MishaelOliva/MishaWeb/releases/latest).
 2. Extract the zip archive and open the extracted folder.
 3. Double-click **`MishaWeb.exe`** to launch directly (the release zip bundles .NET 10, so only Windows 10/11 x64 and the pre-installed Edge WebView2 Runtime are required).
 

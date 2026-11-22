@@ -101,7 +101,7 @@ internal static class BrowserPerformance
                 }
             } catch (_) {}
 
-            // 3. Bounded, Leak-Free Hover Intent Link Preconnect / DNS-Prefetch
+            // 3. Bounded, Leak-Free Hover/Press/Focus Intent Link Preconnect / DNS-Prefetch
             try {
                 const preconnectedOrigins = new Set();
                 const activePreconnectLinks = [];
@@ -116,50 +116,66 @@ internal static class BrowserPerformance
                     }
                 };
 
+                const preconnectAnchor = (anchor) => {
+                    if (!anchor || document.hidden) return;
+                    try {
+                        const href = anchor.href;
+                        if (!href || (!href.startsWith('http://') && !href.startsWith('https://'))) return;
+                        const targetOrigin = new URL(href).origin;
+                        if (targetOrigin === location.origin || preconnectedOrigins.has(targetOrigin)) return;
+
+                        preconnectedOrigins.add(targetOrigin);
+                        const head = document.head || document.documentElement;
+                        if (!head) return;
+
+                        // Prune oldest if at capacity to prevent memory leaks in SPAs
+                        if (activePreconnectLinks.length >= maxPreconnectCount) {
+                            const oldest = activePreconnectLinks.shift();
+                            if (oldest) {
+                                preconnectedOrigins.delete(oldest.origin);
+                                oldest.links.forEach(el => el.remove());
+                            }
+                        }
+
+                        const dnsEl = document.createElement('link');
+                        dnsEl.rel = 'dns-prefetch';
+                        dnsEl.href = targetOrigin;
+                        head.appendChild(dnsEl);
+
+                        const preconnectEl = document.createElement('link');
+                        preconnectEl.rel = 'preconnect';
+                        preconnectEl.href = targetOrigin;
+                        head.appendChild(preconnectEl);
+
+                        activePreconnectLinks.push({ origin: targetOrigin, links: [dnsEl, preconnectEl] });
+                    } catch (_) {}
+                };
+
                 document.addEventListener('mouseover', (e) => {
                     const target = e.target;
                     const anchor = target && typeof target.closest === 'function' ? target.closest('a[href]') : null;
                     if (anchor === currentAnchor) return;
                     currentAnchor = anchor;
                     clearHoverTimer();
-                    if (!anchor) return;
+                    if (!anchor || document.hidden) return;
 
                     hoverTimer = setTimeout(() => {
                         hoverTimer = null;
                         if (currentAnchor !== anchor) return;
-                        try {
-                            const href = anchor.href;
-                            if (!href || (!href.startsWith('http://') && !href.startsWith('https://'))) return;
-                            const targetOrigin = new URL(href).origin;
-                            if (targetOrigin === location.origin || preconnectedOrigins.has(targetOrigin)) return;
-
-                            preconnectedOrigins.add(targetOrigin);
-                            const head = document.head || document.documentElement;
-                            if (!head) return;
-
-                            // Prune oldest if at capacity to prevent memory leaks in SPAs
-                            if (activePreconnectLinks.length >= maxPreconnectCount) {
-                                const oldest = activePreconnectLinks.shift();
-                                if (oldest) {
-                                    preconnectedOrigins.delete(oldest.origin);
-                                    oldest.links.forEach(el => el.remove());
-                                }
-                            }
-
-                            const dnsEl = document.createElement('link');
-                            dnsEl.rel = 'dns-prefetch';
-                            dnsEl.href = targetOrigin;
-                            head.appendChild(dnsEl);
-
-                            const preconnectEl = document.createElement('link');
-                            preconnectEl.rel = 'preconnect';
-                            preconnectEl.href = targetOrigin;
-                            head.appendChild(preconnectEl);
-
-                            activePreconnectLinks.push({ origin: targetOrigin, links: [dnsEl, preconnectEl] });
-                        } catch (_) {}
+                        preconnectAnchor(anchor);
                     }, 65);
                 }, { passive: true });
+
+                const preconnectEventTarget = (e) => {
+                    const target = e.target;
+                    const anchor = target && typeof target.closest === 'function' ? target.closest('a[href]') : null;
+                    if (anchor) {
+                        clearHoverTimer();
+                        preconnectAnchor(anchor);
+                    }
+                };
+                document.addEventListener('mousedown', preconnectEventTarget, { passive: true });
+                document.addEventListener('focusin', preconnectEventTarget, { passive: true });
 
                 document.addEventListener('mouseout', (e) => {
                     if (!currentAnchor) return;

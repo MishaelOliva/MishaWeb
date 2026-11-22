@@ -223,6 +223,45 @@ if (args.Length == 2
     }
 }
 
+if (args.Length is 2 or 3
+    && args[0].Equals("--qa-cdp-session", StringComparison.Ordinal))
+{
+    if (!int.TryParse(args[1], CultureInfo.InvariantCulture, out var cdpPort)
+        || cdpPort is < 1024 or > 65535)
+    {
+        Console.Error.WriteLine("Invalid CDP port (expected 1024-65535).");
+        return 2;
+    }
+
+    var durationSeconds = 45;
+    if (args.Length == 3
+        && (!int.TryParse(args[2], CultureInfo.InvariantCulture, out durationSeconds)
+            || durationSeconds is < 5 or > 300))
+    {
+        Console.Error.WriteLine("Invalid QA session duration seconds (expected 5-300).");
+        return 2;
+    }
+
+    Environment.SetEnvironmentVariable(
+        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+        $"--remote-debugging-port={cdpPort} --remote-debugging-address=127.0.0.1");
+
+    var probeFolder = Path.Combine(
+        Path.GetTempPath(),
+        "MishaWeb-QA-CDP-" + Environment.ProcessId + "-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        RunQaCdpSession(probeFolder, cdpPort, durationSeconds);
+        return 0;
+    }
+    catch (Exception error)
+    {
+        var cause = error.GetBaseException();
+        Console.Error.WriteLine($"qaError={cause.GetType().Name}: {cause.Message}");
+        return 1;
+    }
+}
+
 if (args.Length == 1 && args[0].Equals("--check-live-filters", StringComparison.Ordinal))
 {
     var liveEngine = new AdBlockEngine();
@@ -3999,9 +4038,9 @@ var informationalVersion = System.Reflection.CustomAttributeExtensions
     .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(productAssembly)
     ?.InformationalVersion;
 Check(
-    "release assemblies carry the 2.5.0 product version",
-    productAssembly.GetName().Version == new Version(2, 5, 0, 0)
-        && informationalVersion == "2.5.0");
+    "release assemblies carry the 2.5.1 product version",
+    productAssembly.GetName().Version == new Version(2, 5, 1, 0)
+        && informationalVersion == "2.5.1");
 Check(
     "new sessions default to standard memory saver",
     new BrowserState().MemorySaverEnabled && new BrowserState().UltraLightModeEnabled == false);
@@ -6856,6 +6895,38 @@ Check(
 Check(
     "Split view closing a non-active pane resets remaining pane to full-width Single layout",
     VerifySplitViewCloseNonActivePaneReset());
+
+Check(
+    "CleanLinkPolicy strips cross-platform analytics and video tracking parameters while preserving signed URLs",
+    CleanLinkPolicy.Clean(
+        "https://example.com/watch?id=42&mtm_campaign=spring&pk_source=feed&hsa_ad=9&_gl=1*abc&_ga=GA1.2.3&s_kwcid=AL!1&rb_clickid=r1&wickedid=w1&zanpid=z1&spm_id_from=333.1&vd_source=abc")
+        == "https://example.com/watch?id=42"
+    && CleanLinkPolicy.Clean(
+        "https://example.com/download?id=42&mtm_campaign=spring&Signature=keep")
+        == "https://example.com/download?id=42&mtm_campaign=spring&Signature=keep");
+
+Check(
+    "ReaderModeScript includes reading progress bar, font tri-stack controls, and reduced-motion rules",
+    ReaderModeScript.Toggle.Contains("__misha_reader_progress", StringComparison.Ordinal)
+        && ReaderModeScript.Toggle.Contains("Sans-serif font", StringComparison.Ordinal)
+        && ReaderModeScript.Toggle.Contains("Serif font", StringComparison.Ordinal)
+        && ReaderModeScript.Toggle.Contains("Monospace font", StringComparison.Ordinal)
+        && ReaderModeScript.Toggle.Contains("@media (prefers-reduced-motion:reduce)", StringComparison.Ordinal));
+
+var alreadyCleanTitle = "Open settings panel";
+var alreadyCleanUrl = "https://example.com/docs/guide";
+Check(
+    "CommandRankingEngine.Normalize and CleanLinkPolicy avoid allocations on clean inputs",
+    ReferenceEquals(CommandRankingEngine.Normalize(alreadyCleanTitle), alreadyCleanTitle)
+        && CommandRankingEngine.Normalize("  Open\t  settings\npanel  ") == "Open settings panel"
+        && ReferenceEquals(CleanLinkPolicy.Clean(alreadyCleanUrl), alreadyCleanUrl));
+
+Check(
+    "SiteResponsivenessDocumentScript preconnects on mousedown and focusin with hidden-tab guard",
+    CanParseJavaScript(BrowserPerformance.SiteResponsivenessDocumentScript)
+        && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("document.hidden", StringComparison.Ordinal)
+        && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("'mousedown'", StringComparison.Ordinal)
+        && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("'focusin'", StringComparison.Ordinal));
 
 if (failures.Count > 0)
 {
@@ -13774,6 +13845,200 @@ bool VerifyControlsHaveZeroGdiAndUserHandleLeakSta()
 
     static void ExceptionDispatchInfoThrow(Exception ex) =>
         System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(ex);
+}
+
+[System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+void RunQaCdpSession(string probeFolder, int cdpPort, int durationSeconds)
+{
+    int port;
+    using (var portProbe = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0))
+    {
+        portProbe.Start();
+        port = ((IPEndPoint)portProbe.LocalEndpoint).Port;
+    }
+
+    using var listener = new HttpListener();
+    listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+    listener.Start();
+
+    var qaUrl = $"http://127.0.0.1:{port}/qa";
+    var readerScriptPayload = "window.__mishaInvokeReader = function() { return " + ReaderModeScript.Toggle + "; };";
+    const string qaHtml = """
+        <!doctype html>
+        <html lang="en">
+        <head>
+          <meta charset="utf-8">
+          <title>MishaWeb Full-Stack QA Article</title>
+          <style>
+            body { margin: 0; font-family: system-ui, sans-serif; background: #180b16; color: #fff6f9; }
+            header { padding: 16px 24px; border-bottom: 1px solid #965d7e; display: flex; justify-content: space-between; align-items: center; }
+            article { max-width: 720px; margin: 24px auto; padding: 0 24px 64px; line-height: 1.65; }
+            button { background: #ff78ae; color: #2b0818; border: 0; border-radius: 999px; padding: 8px 16px; font-weight: 600; cursor: pointer; }
+          </style>
+        </head>
+        <body>
+          <header>
+            <strong>MishaWeb QA Harness</strong>
+            <button id="trigger-reader" type="button" onclick="window.__mishaInvokeReader()">Toggle Reader Mode</button>
+          </header>
+          <article>
+            <h1>MishaWeb Full-Stack Architecture and Design Audit</h1>
+            <p>MishaWeb pairs a lightweight Windows Forms native shell with the Microsoft Edge WebView2 Evergreen Runtime, avoiding bundled Chromium binaries while delivering custom network filtering, Multi-View split panes, and strict tab lifecycle controls.</p>
+            <h2>Cross-Platform Privacy and URL Hygiene</h2>
+            <p>Clean link stripping removes cross-platform campaign, analytics, and video referral trackers including Matomo, Piwik, HubSpot, Google linker tokens, and Bilibili referral identifiers while keeping signed URLs intact.</p>
+            <blockquote>Clean separation between native chrome controls and document-start WebView2 protections keeps memory usage predictable across long browsing sessions.</blockquote>
+            <h2>Design System and Reader Mode Ergonomics</h2>
+            <p>The reader overlay provides a reading progress indicator, Sans, Serif, and Mono typography switching, keyboard scaling shortcuts, table formatting, and reduced-motion rules aligned with modern browser design standards.</p>
+            <p>Long-form technical articles benefit from bounded column widths, comfortable line height, and immediate keyboard exit via Escape so users can focus without distraction.</p>
+            <p>Every control surface respects a 4px spacing rhythm and clear focus-visible outlines for accessible keyboard navigation across themes.</p>
+            <table>
+              <thead><tr><th>Subsystem</th><th>Responsibility</th><th>Status</th></tr></thead>
+              <tbody>
+                <tr><td>CleanLinkPolicy</td><td>Tracking parameter stripping</td><td>Verified</td></tr>
+                <tr><td>ReaderModeScript</td><td>Typography and progress UI</td><td>Verified</td></tr>
+              </tbody>
+            </table>
+            <pre><code>npm run desktop:check</code></pre>
+            <p><a id="tracked-link" href="https://example.com/article?id=7&amp;utm_source=qa&amp;mtm_campaign=design&amp;_gl=1*test">Sample tracked reference link</a></p>
+          </article>
+          <script src="/reader-toggle.js"></script>
+        </body>
+        </html>
+        """;
+
+    using var serverCts = new CancellationTokenSource();
+    var serverLoop = Task.Run(async () =>
+    {
+        while (!serverCts.IsCancellationRequested)
+        {
+            HttpListenerContext? context = null;
+            try
+            {
+                context = await listener.GetContextAsync().ConfigureAwait(false);
+            }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
+            catch (HttpListenerException)
+            {
+                break;
+            }
+
+            try
+            {
+                var path = context.Request.Url?.AbsolutePath ?? "/";
+                if (path.Equals("/favicon.ico", StringComparison.OrdinalIgnoreCase))
+                {
+                    context.Response.StatusCode = 204;
+                    context.Response.Close();
+                    continue;
+                }
+
+                string responseBody;
+                string contentType;
+                int statusCode;
+                if (path.Equals("/qa", StringComparison.OrdinalIgnoreCase))
+                {
+                    responseBody = qaHtml;
+                    contentType = "text/html; charset=utf-8";
+                    statusCode = 200;
+                }
+                else if (path.Equals("/reader-toggle.js", StringComparison.OrdinalIgnoreCase))
+                {
+                    responseBody = readerScriptPayload;
+                    contentType = "application/javascript; charset=utf-8";
+                    statusCode = 200;
+                }
+                else
+                {
+                    responseBody = "Not Found";
+                    contentType = "text/plain; charset=utf-8";
+                    statusCode = 404;
+                }
+
+                context.Response.StatusCode = statusCode;
+                context.Response.ContentType = contentType;
+                var bytes = Encoding.UTF8.GetBytes(responseBody);
+                context.Response.ContentLength64 = bytes.Length;
+                await context.Response.OutputStream.WriteAsync(bytes).ConfigureAwait(false);
+                context.Response.Close();
+            }
+            catch
+            {
+                try { context.Response.Abort(); } catch { }
+            }
+        }
+    });
+
+    Exception? sessionError = null;
+    try
+    {
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+
+                using var form = new MainForm(
+                    startBrowserOnShown: true,
+                    previewState: null,
+                    startupAddress: qaUrl,
+                    mode: BrowserMode.Private,
+                    webViewUserDataFolderOverride: probeFolder)
+                {
+                    StartPosition = FormStartPosition.Manual,
+                    Location = new Point(-20_000, -20_000),
+                    ShowInTaskbar = false,
+                    ClientSize = new Size(1280, 800)
+                };
+
+                using var closeTimer = new System.Windows.Forms.Timer
+                {
+                    Interval = durationSeconds * 1000
+                };
+                closeTimer.Tick += (_, _) =>
+                {
+                    closeTimer.Stop();
+                    if (!form.IsDisposed) form.Close();
+                };
+                form.Shown += (_, _) =>
+                {
+                    closeTimer.Start();
+                    Console.WriteLine($"QA_READY httpUrl={qaUrl} cdpUrl=http://127.0.0.1:{cdpPort}");
+                    Console.Out.Flush();
+                };
+
+                Application.Run(form);
+            }
+            catch (Exception caught)
+            {
+                sessionError = caught;
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+    }
+    finally
+    {
+        serverCts.Cancel();
+        try { listener.Stop(); } catch { }
+        try { listener.Close(); } catch { }
+        try { serverLoop.Wait(1000); } catch { }
+        DeleteScopedTempProbeFolder(
+            probeFolder,
+            "MishaWeb-QA-CDP-",
+            attempts: 15,
+            delayMs: 300);
+    }
+
+    if (sessionError is not null)
+    {
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(sessionError);
+    }
 }
 
 bool DeleteScopedTempProbeFolder(string probeFolder, string expectedPrefix, int attempts, int delayMs)

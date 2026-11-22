@@ -87,6 +87,11 @@ internal static class ReaderModeScript
 
   const prefKey = '__misha_reader_prefs';
   const fontSteps = [0.94, 1.04, 1.15, 1.28, 1.42];
+  const fonts = {
+    sans: 'system-ui,-apple-system,"Segoe UI",sans-serif',
+    serif: 'Georgia,Cambria,"Times New Roman",serif',
+    mono: '"Cascadia Mono",Consolas,"Courier New",monospace'
+  };
   const themes = {
     night: {
       scheme: 'dark',
@@ -137,13 +142,14 @@ internal static class ReaderModeScript
       activeFg: '#6c163f'
     }
   };
-  let prefs = { theme: 'night', fontIndex: 2, width: 'compact' };
+  let prefs = { theme: 'night', fontIndex: 2, width: 'compact', fontFamily: 'sans' };
   try {
     if (typeof localStorage !== 'undefined') {
       const saved = JSON.parse(localStorage.getItem(prefKey) || 'null');
       if (saved && typeof saved.theme === 'string' && Object.hasOwn(themes, saved.theme)) prefs.theme = saved.theme;
       if (saved && Number.isInteger(saved.fontIndex) && saved.fontIndex >= 0 && saved.fontIndex < fontSteps.length) prefs.fontIndex = saved.fontIndex;
       if (saved && (saved.width === 'compact' || saved.width === 'wide')) prefs.width = saved.width;
+      if (saved && typeof saved.fontFamily === 'string' && Object.hasOwn(fonts, saved.fontFamily)) prefs.fontFamily = saved.fontFamily;
     }
   } catch (_) {}
   const savePrefs = () => {
@@ -177,6 +183,17 @@ internal static class ReaderModeScript
   overlay.setAttribute('role', 'document');
 
   const styleEl = document.createElement('style');
+  const progressTrack = document.createElement('div');
+  progressTrack.id = '__misha_reader_progress_track';
+  progressTrack.setAttribute('aria-hidden', 'true');
+  const progressBar = document.createElement('div');
+  progressBar.id = '__misha_reader_progress';
+  progressBar.setAttribute('role', 'progressbar');
+  progressBar.setAttribute('aria-label', 'Reading progress');
+  progressBar.setAttribute('aria-valuemin', '0');
+  progressBar.setAttribute('aria-valuemax', '100');
+  progressBar.setAttribute('aria-valuenow', '0');
+  progressTrack.appendChild(progressBar);
   const bar = document.createElement('div');
   bar.setAttribute('role', 'toolbar');
   bar.setAttribute('aria-label', 'Reader mode controls');
@@ -213,16 +230,27 @@ internal static class ReaderModeScript
 
   const sep1 = document.createElement('span');
   sep1.className = 'misha-rm-sep';
+  const sepFont = document.createElement('span');
+  sepFont.className = 'misha-rm-sep';
   const sep2 = document.createElement('span');
   sep2.className = 'misha-rm-sep';
   const sep3 = document.createElement('span');
   sep3.className = 'misha-rm-sep';
 
-  const fontDownBtn = makeButton('A-', 'Decrease font size', () => {
+  const fontDownBtn = makeButton('A-', 'Decrease font size (-)', () => {
     if (prefs.fontIndex > 0) { prefs.fontIndex--; savePrefs(); applyState(); }
   });
-  const fontUpBtn = makeButton('A+', 'Increase font size', () => {
+  const fontUpBtn = makeButton('A+', 'Increase font size (+)', () => {
     if (prefs.fontIndex < fontSteps.length - 1) { prefs.fontIndex++; savePrefs(); applyState(); }
+  });
+  const sansBtn = makeButton('Sans', 'Sans-serif font', () => {
+    prefs.fontFamily = 'sans'; savePrefs(); applyState();
+  });
+  const serifBtn = makeButton('Serif', 'Serif font', () => {
+    prefs.fontFamily = 'serif'; savePrefs(); applyState();
+  });
+  const monoBtn = makeButton('Mono', 'Monospace font', () => {
+    prefs.fontFamily = 'mono'; savePrefs(); applyState();
   });
   const compactBtn = makeButton('Compact', 'Compact column width', () => {
     prefs.width = 'compact'; savePrefs(); applyState();
@@ -242,20 +270,36 @@ internal static class ReaderModeScript
   const closeBtn = makeButton('\u00D7', 'Close reader mode (Esc)', closeReader);
   closeBtn.title = 'Close reader mode (Esc)';
 
-  [timeBadge, sep1, fontDownBtn, fontUpBtn, sep2, compactBtn, wideBtn, sep3, nightBtn, sepiaBtn, lightBtn, closeBtn]
+  [timeBadge, sep1, fontDownBtn, fontUpBtn, sepFont, sansBtn, serifBtn, monoBtn, sep2, compactBtn, wideBtn, sep3, nightBtn, sepiaBtn, lightBtn, closeBtn]
     .forEach(node => bar.appendChild(node));
+
+  let lastPct = -1;
+  const updateProgress = () => {
+    const maxScroll = Math.max(0, (overlay.scrollHeight || 0) - (overlay.clientHeight || 0));
+    const scrollTop = Math.max(0, overlay.scrollTop || 0);
+    const pct = maxScroll > 0 ? Math.min(100, Math.round((scrollTop / maxScroll) * 100)) : 0;
+    if (pct === lastPct) return;
+    lastPct = pct;
+    progressBar.style.width = `${pct}%`;
+    progressBar.setAttribute('aria-valuenow', String(pct));
+  };
 
   const applyState = () => {
     const t = themes[prefs.theme] || themes.night;
     const maxW = prefs.width === 'wide' ? '920px' : '680px';
     const fontEm = fontSteps[prefs.fontIndex] || 1.15;
-    overlay.style.cssText = `position:fixed;inset:0;z-index:2147483646;overflow:auto;background:${t.bg};color:${t.fg};padding:18px 20px 72px;box-sizing:border-box;font:1em/1.68 system-ui,-apple-system,"Segoe UI",sans-serif;color-scheme:${t.scheme};`;
-    bar.style.cssText = `position:sticky;top:12px;z-index:2;max-width:${maxW};margin:0 auto 22px;padding:7px 10px;border-radius:999px;display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:6px;background:${t.barBg};border:1px solid ${t.barBorder};backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);box-shadow:0 10px 28px rgba(0,0,0,0.24);font-size:13px;line-height:1.2;box-sizing:border-box;`;
-    content.style.cssText = `max-width:${maxW};margin:0 auto;font-size:${fontEm}em;overflow-wrap:break-word;`;
-    styleEl.textContent = `#${id} a{color:${t.link};text-decoration-thickness:1px;text-underline-offset:2px;}#${id} blockquote{border-left:3px solid ${t.quoteBorder};margin:1.1em 0;padding:0.2em 0 0.2em 1em;color:${t.muted};}#${id} pre,#${id} code{background:${t.codeBg};border-radius:6px;}#${id} pre{padding:12px 14px;overflow:auto;}#${id} .misha-rm-badge{color:${t.muted};font-weight:600;padding:4px 10px;border-radius:999px;background:${t.pillBg};white-space:nowrap;}#${id} .misha-rm-sep{width:1px;height:16px;background:${t.barBorder};margin:0 2px;}#${id} .misha-rm-btn{appearance:none;border:1px solid transparent;background:${t.pillBg};color:${t.fg};border-radius:999px;padding:5px 11px;font:600 12.5px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer;transition:background .14s ease,border-color .14s ease,opacity .14s ease;}#${id} .misha-rm-btn:hover{background:${t.pillHover};}#${id} .misha-rm-btn[data-active="true"]{background:${t.activeBg};border-color:${t.activeBorder};color:${t.activeFg};}#${id} .misha-rm-btn[disabled]{opacity:0.42;cursor:default;}`;
+    const fontStack = fonts[prefs.fontFamily] || fonts.sans;
+    overlay.style.cssText = `position:fixed;inset:0;z-index:2147483646;overflow:auto;background:${t.bg};color:${t.fg};padding:16px 20px 72px;box-sizing:border-box;font:1em/1.68 ${fontStack};color-scheme:${t.scheme};`;
+    bar.style.cssText = `position:sticky;top:12px;z-index:2;max-width:${maxW};margin:0 auto 24px;padding:8px 12px;border-radius:999px;display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:4px;background:${t.barBg};border:1px solid ${t.barBorder};backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);box-shadow:inset 0 1px 0 rgba(255,255,255,0.14),0 12px 32px rgba(0,0,0,0.28);font-size:13px;line-height:1.2;box-sizing:border-box;`;
+    content.style.cssText = `max-width:${maxW};margin:0 auto;font-size:${fontEm}em;font-family:${fontStack};overflow-wrap:break-word;`;
+    progressBar.style.background = t.quoteBorder;
+    styleEl.textContent = `#__misha_reader_progress_track{position:fixed;top:0;left:0;right:0;height:3px;z-index:3;background:transparent;pointer-events:none;}#__misha_reader_progress{height:100%;width:0%;transition:width .12s ease-out;}#${id} a{color:${t.link};text-decoration-thickness:1px;text-underline-offset:2px;}#${id} blockquote{border-left:3px solid ${t.quoteBorder};margin:16px 0;padding:4px 0 4px 16px;color:${t.muted};}#${id} pre,#${id} code{background:${t.codeBg};border-radius:6px;}#${id} pre{padding:12px 16px;overflow:auto;}#${id} table{border-collapse:collapse;width:100%;margin:16px 0;font-size:0.95em;}#${id} th,#${id} td{border:1px solid ${t.barBorder};padding:8px 12px;text-align:left;}#${id} .misha-rm-badge{color:${t.muted};font-weight:600;padding:4px 12px;border-radius:999px;background:${t.pillBg};white-space:nowrap;}#${id} .misha-rm-sep{width:1px;height:16px;background:${t.barBorder};margin:0 2px;}#${id} .misha-rm-btn{appearance:none;border:1px solid transparent;background:${t.pillBg};color:${t.fg};border-radius:999px;padding:4px 12px;font:600 12.5px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer;transition:background .14s ease,border-color .14s ease,opacity .14s ease;}#${id} .misha-rm-btn:hover{background:${t.pillHover};}#${id} .misha-rm-btn:focus-visible{outline:2px solid ${t.quoteBorder};outline-offset:2px;}#${id} .misha-rm-btn[data-active="true"]{background:${t.activeBg};border-color:${t.activeBorder};color:${t.activeFg};}#${id} .misha-rm-btn[disabled]{opacity:0.42;cursor:default;}@media (prefers-reduced-motion:reduce){#${id} *,#${id} .misha-rm-btn{transition:none !important;}}`;
 
     fontDownBtn.disabled = prefs.fontIndex <= 0;
     fontUpBtn.disabled = prefs.fontIndex >= fontSteps.length - 1;
+    sansBtn.setAttribute('data-active', prefs.fontFamily === 'sans' ? 'true' : 'false');
+    serifBtn.setAttribute('data-active', prefs.fontFamily === 'serif' ? 'true' : 'false');
+    monoBtn.setAttribute('data-active', prefs.fontFamily === 'mono' ? 'true' : 'false');
     compactBtn.setAttribute('data-active', prefs.width === 'compact' ? 'true' : 'false');
     wideBtn.setAttribute('data-active', prefs.width === 'wide' ? 'true' : 'false');
     nightBtn.setAttribute('data-active', prefs.theme === 'night' ? 'true' : 'false');
@@ -264,24 +308,43 @@ internal static class ReaderModeScript
   };
 
   applyState();
+  updateProgress();
 
   const onKeyDown = (event) => {
-    if (event && event.key === 'Escape') {
+    if (!event || event.ctrlKey || event.altKey || event.metaKey) return;
+    if (event.key === 'Escape') {
       if (typeof event.preventDefault === 'function') event.preventDefault();
       if (typeof event.stopPropagation === 'function') event.stopPropagation();
       closeReader();
+    } else if (event.key === '+' || event.key === '=') {
+      if (prefs.fontIndex < fontSteps.length - 1) {
+        if (typeof event.preventDefault === 'function') event.preventDefault();
+        prefs.fontIndex++; savePrefs(); applyState();
+      }
+    } else if (event.key === '-') {
+      if (prefs.fontIndex > 0) {
+        if (typeof event.preventDefault === 'function') event.preventDefault();
+        prefs.fontIndex--; savePrefs(); applyState();
+      }
     }
   };
   if (typeof document.addEventListener === 'function') {
     document.addEventListener('keydown', onKeyDown, true);
   }
+  if (typeof overlay.addEventListener === 'function') {
+    overlay.addEventListener('scroll', updateProgress, { passive: true });
+  }
   overlay.__mishaCleanup = () => {
     if (typeof document.removeEventListener === 'function') {
       document.removeEventListener('keydown', onKeyDown, true);
     }
+    if (typeof overlay.removeEventListener === 'function') {
+      overlay.removeEventListener('scroll', updateProgress);
+    }
   };
 
   overlay.appendChild(styleEl);
+  overlay.appendChild(progressTrack);
   overlay.appendChild(bar);
   overlay.appendChild(content);
   document.documentElement.dataset.mishaReaderOverflow = document.documentElement.style.overflow || '';

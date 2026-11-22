@@ -30,10 +30,13 @@ const toggle = extractToggle(source);
 // selector queries inside score() into one would be a strict improvement to the
 // function this test exists to protect, and a walk count would forbid it.
 function makeElement(spec) {
+  const attributes = { ...(spec.attributes ?? {}) };
   const element = {
     name: spec.name,
+    id: '',
     scorings: 0,
     walks: 0,
+    removed: false,
     children: [],
     innerText: spec.innerText ?? '',
     querySelectorAll(selector) {
@@ -49,10 +52,10 @@ function makeElement(spec) {
       if (selector.includes('nav')) return spec.bad ?? [];
       return [];
     },
-    getAttribute: (name) => spec.attributes?.[name] ?? null,
-    setAttribute() {},
-    removeAttribute() {},
-    remove() {},
+    getAttribute: (name) => attributes[name] ?? null,
+    setAttribute(name, value) { attributes[name] = value; },
+    removeAttribute(name) { delete attributes[name]; },
+    remove() { element.removed = true; },
     appendChild(node) {
       element.children.push(node);
       return node;
@@ -76,6 +79,7 @@ const filler = (count) => Array.from({ length: count }, () => ({}));
 
 function runToggle(candidates, bySelector, bodyText = 'E'.repeat(600)) {
   const appended = [];
+  const docListeners = new Map();
   const documentElement = { dataset: {}, style: { overflow: 'auto' } };
   const body = makeElement({ name: 'body', innerText: bodyText });
   body.appendChild = (node) => {
@@ -87,7 +91,16 @@ function runToggle(candidates, bySelector, bodyText = 'E'.repeat(600)) {
     body,
     getElementById: () => null,
     querySelectorAll: (selector) => bySelector[selector] ?? [],
-    createElement: (tag) => makeElement({ name: tag })
+    createElement: (tag) => makeElement({ name: tag }),
+    addEventListener: (name, cb) => {
+      const list = docListeners.get(name) ?? [];
+      list.push(cb);
+      docListeners.set(name, list);
+    },
+    removeEventListener: (name, cb) => {
+      const list = docListeners.get(name);
+      if (list) docListeners.set(name, list.filter((entry) => entry !== cb));
+    }
   };
   const context = {
     document,
@@ -96,7 +109,15 @@ function runToggle(candidates, bySelector, bodyText = 'E'.repeat(600)) {
     Set
   };
   const run = new Function(...Object.keys(context), `return (${toggle});`);
-  return { applied: run(...Object.values(context)), appended };
+  return {
+    applied: run(...Object.values(context)),
+    appended,
+    emitKey(key) {
+      for (const cb of [...(docListeners.get('keydown') ?? [])]) {
+        cb({ key, ctrlKey: false, altKey: false, metaKey: false, preventDefault() {}, stopPropagation() {} });
+      }
+    }
+  };
 }
 
 const article = makeElement({
@@ -140,6 +161,34 @@ const shown = content.children.at(-1);
 // highest scoring candidate rather than of the first or the largest element.
 assert.ok(shown, 'the winning candidate clone must be inserted into the content wrapper');
 assert.equal(shown.name, 'article-clone');
+
+// Verify design system additions: progress track, font family buttons (Sans/Serif/Mono),
+// and +/-/Escape keyboard controls.
+const progressTrack = overlay.children.find((node) => node.id === '__misha_reader_progress_track');
+assert.ok(progressTrack, 'reader overlay must include a reading progress track');
+const toolbar = overlay.children.find((node) => node.getAttribute('role') === 'toolbar');
+assert.ok(toolbar, 'reader overlay must include a toolbar');
+const findButton = (label) => toolbar.children.find((node) => node.textContent === label);
+const sansBtn = findButton('Sans');
+const serifBtn = findButton('Serif');
+const monoBtn = findButton('Mono');
+assert.ok(sansBtn && serifBtn && monoBtn, 'toolbar must expose Sans, Serif, and Mono font buttons');
+assert.equal(sansBtn.getAttribute('data-active'), 'true');
+serifBtn.onclick();
+assert.equal(serifBtn.getAttribute('data-active'), 'true');
+assert.equal(sansBtn.getAttribute('data-active'), 'false');
+assert.match(content.style.cssText, /Georgia,Cambria/);
+monoBtn.onclick();
+assert.equal(monoBtn.getAttribute('data-active'), 'true');
+assert.match(content.style.cssText, /Cascadia Mono/);
+
+assert.match(content.style.cssText, /font-size:1\.15em/);
+page.emitKey('+');
+assert.match(content.style.cssText, /font-size:1\.28em/);
+page.emitKey('-');
+assert.match(content.style.cssText, /font-size:1\.15em/);
+page.emitKey('Escape');
+assert.equal(overlay.removed, true, 'Escape must remove the reader overlay');
 
 // Each candidate must be scored exactly once. Recomputing the incumbent's score
 // inside the comparison loop scored the winner on every iteration instead,

@@ -195,8 +195,8 @@ public sealed partial class MainForm
     {
         return !tab.IsClosed
             && !tab.IsStartPage
-            && tabs.Contains(tab)
-            && (tab.Core is not null || tab.IsInitializing);
+            && (tab.Core is not null || tab.IsInitializing)
+            && tabs.Contains(tab);
     }
 
     private int GetProtectedResidentRank(BrowserTab target)
@@ -260,9 +260,13 @@ public sealed partial class MainForm
 
     private void RefreshLiveTabMemoryTargets()
     {
-        foreach (var tab in tabs.Where(item => !item.IsClosed))
+        for (var index = 0; index < tabs.Count; index++)
         {
-            ApplyLiveTabMemoryTarget(tab, IsTabForegroundForLifecycle(tab));
+            var tab = tabs[index];
+            if (!tab.IsClosed)
+            {
+                ApplyLiveTabMemoryTarget(tab, IsTabForegroundForLifecycle(tab));
+            }
         }
     }
 
@@ -394,8 +398,11 @@ public sealed partial class MainForm
             systemMemory = SystemResourceInfo.CaptureMemory();
             var nowUtc = DateTime.UtcNow;
             var snapshotTabs = tabs.ToArray();
-            var snapshots = snapshotTabs
-                .Select((tab, index) => new TabLifecycleSnapshot(
+            var snapshots = new TabLifecycleSnapshot[snapshotTabs.Length];
+            for (var index = 0; index < snapshotTabs.Length; index++)
+            {
+                var tab = snapshotTabs[index];
+                snapshots[index] = new TabLifecycleSnapshot(
                     index,
                     tab.LastActiveUtc,
                     tab == activeTab && !isWindowMinimized,
@@ -408,8 +415,8 @@ public sealed partial class MainForm
                     tab.IsSuspended,
                     IsBackgroundProtected(tab),
                     GetProtectedResidentRank(tab),
-                    !isWindowMinimized && IsTabVisibleInAnyPane(tab)))
-                .ToArray();
+                    !isWindowMinimized && IsTabVisibleInAnyPane(tab));
+            }
             var decisions = TabLifecyclePolicy.PlanSweep(
                 snapshots,
                 mode,

@@ -485,9 +485,15 @@ internal sealed class PaneHeaderBar : Control
 
         if (isFocusedPane)
         {
+            var barHeight = Math.Max(2, (int)Math.Round(2f * scale));
             var barColor = highContrast ? SystemColors.HighlightText : NativeUiTheme.Accent;
             using var accentBrush = new SolidBrush(barColor);
-            graphics.FillRectangle(accentBrush, 0, 0, Width, Math.Max(2, (int)Math.Round(2f * scale)));
+            graphics.FillRectangle(accentBrush, 0, 0, Width, barHeight);
+            if (!highContrast && Width > 2)
+            {
+                using var sheenPen = new Pen(Color.FromArgb(36, 255, 240, 248), 1f);
+                graphics.DrawLine(sheenPen, 0, barHeight, Width - 1, barHeight);
+            }
         }
 
         using (var bottomLine = new Pen(highContrast ? SystemColors.WindowText : NativeUiTheme.Border, 1f))
@@ -535,8 +541,9 @@ internal sealed class PaneHeaderBar : Control
         {
             if (audioHovered)
             {
+                using var hoverPath = NativeUiTheme.CreateRoundedPath(audioBounds, 4f * scale);
                 using var hoverBrush = new SolidBrush(highContrast ? SystemColors.Highlight : NativeUiTheme.Hover);
-                graphics.FillRectangle(hoverBrush, audioBounds);
+                graphics.FillPath(hoverBrush, hoverPath);
             }
             var audioColor = highContrast
                 ? textColor
@@ -573,8 +580,9 @@ internal sealed class PaneHeaderBar : Control
         {
             if (switchHovered)
             {
+                using var hoverPath = NativeUiTheme.CreateRoundedPath(switchBounds, 4f * scale);
                 using var hoverBrush = new SolidBrush(highContrast ? SystemColors.Highlight : NativeUiTheme.Hover);
-                graphics.FillRectangle(hoverBrush, switchBounds);
+                graphics.FillPath(hoverBrush, hoverPath);
             }
             using var arrowPen = new Pen(textColor, Math.Max(1.2f, 1.3f * scale))
             {
@@ -597,8 +605,9 @@ internal sealed class PaneHeaderBar : Control
         {
             if (closeHovered)
             {
+                using var hoverPath = NativeUiTheme.CreateRoundedPath(closeBounds, 4f * scale);
                 using var hoverBrush = new SolidBrush(highContrast ? SystemColors.Highlight : Color.FromArgb(148, 36, 74));
-                graphics.FillRectangle(hoverBrush, closeBounds);
+                graphics.FillPath(hoverBrush, hoverPath);
             }
             using var closePen = new Pen(
                 closeHovered && !highContrast ? Color.White : textColor,

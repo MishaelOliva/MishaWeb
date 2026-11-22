@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.5.1 - 2026-11-22
+
+### Reader mode, policies, and performance
+
+- Updated `ReaderModeScript.cs` and `desktop.tests/ReaderModeScript.test.mjs` with reading progress tracking, `Sans`/`Serif`/`Mono` font family switcher buttons, and `+`/`-`/`Escape` keyboard controls.
+- Optimized `BrowserFeaturePolicies.cs` (`CommandRankingEngine` bounded top-N insertion, allocation-free whitespace normalization check, and span-based `CleanLinkPolicy` query stripping with expanded tracker parameters) and `BrowserPerformance.cs` (press/focus/hover intent preconnect with bounded pruning).
+- Reduced LINQ allocations in `MainForm.Lifecycle.cs` memory-target updates and sweep snapshots, and added rounded hover fills plus top accent sheen on `PaneHeaderBar` in `MultiViewControls.cs`.
+- Expanded `desktop.tests/Program.cs` test coverage for the updated policy, performance, and reader-mode changes, and pinned default installer release tags to `v2.5.1`.
+
 ## 2.5.0 - 2026-11-19
 
 ### Multi-View workspace and MainForm modularization

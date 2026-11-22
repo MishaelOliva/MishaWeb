@@ -56,18 +56,29 @@ internal static class CommandRankingEngine
         if (limit == 0) return Array.Empty<RankedCommand>();
 
         var normalizedQuery = Normalize(query);
-        var matches = new List<RankedCommand>();
+        var matches = new List<RankedCommand>(limit);
         foreach (var candidate in candidates)
         {
             if (candidate is null || !IsSafeTarget(candidate.Url)) continue;
 
             var match = Classify(candidate, normalizedQuery);
             if (match is null) continue;
-            matches.Add(new RankedCommand(candidate, match.Value.Kind, match.Value.Quality));
+            var ranked = new RankedCommand(candidate, match.Value.Kind, match.Value.Quality);
+            if (matches.Count == limit && Compare(ranked, matches[^1]) >= 0) continue;
+
+            var insertionIndex = matches.Count;
+            while (insertionIndex > 0 && Compare(ranked, matches[insertionIndex - 1]) < 0)
+            {
+                insertionIndex--;
+            }
+
+            if (matches.Count == limit)
+            {
+                matches.RemoveAt(limit - 1);
+            }
+            matches.Insert(insertionIndex, ranked);
         }
 
-        matches.Sort(Compare);
-        if (matches.Count > limit) matches.RemoveRange(limit, matches.Count - limit);
         return matches;
     }
 
@@ -182,6 +193,7 @@ internal static class CommandRankingEngine
     internal static string Normalize(string? value)
     {
         if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+        if (IsAlreadyNormalized(value)) return value;
 
         var builder = new StringBuilder(value.Length);
         var pendingSpace = false;
@@ -198,6 +210,27 @@ internal static class CommandRankingEngine
             pendingSpace = false;
         }
         return builder.ToString();
+    }
+
+    private static bool IsAlreadyNormalized(string value)
+    {
+        if (value[0] == ' ' || value[^1] == ' ') return false;
+
+        var previousWasSpace = false;
+        for (var index = 0; index < value.Length; index++)
+        {
+            var character = value[index];
+            if (char.IsSurrogate(character)) return false;
+            if (character == ' ')
+            {
+                if (previousWasSpace) return false;
+                previousWasSpace = true;
+                continue;
+            }
+            if (char.IsWhiteSpace(character)) return false;
+            previousWasSpace = false;
+        }
+        return true;
     }
 
     private static string Limit(string value, int maximumLength)
@@ -236,7 +269,9 @@ internal static class CleanLinkPolicy
         "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid", "igshid",
         "twclid", "ttclid", "srsltid", "gbraid", "wbraid", "gad_source",
         "li_fat_id", "mkt_tok", "rdt_cid", "sc_cid", "epik", "yclid",
-        "vero_id", "vero_conv", "oly_anon_id", "oly_enc_id", "_hsenc", "_hsmi"
+        "vero_id", "vero_conv", "oly_anon_id", "oly_enc_id", "_hsenc", "_hsmi",
+        "_gl", "_ga", "s_kwcid", "rb_clickid", "wickedid", "zanpid",
+        "spm_id_from", "vd_source"
     };
 
     private static readonly HashSet<string> SigningKeys = new(StringComparer.OrdinalIgnoreCase)
@@ -245,9 +280,17 @@ internal static class CleanLinkPolicy
         "access_token", "auth", "expires", "policy", "key-pair-id"
     };
 
+    private static readonly HashSet<string>.AlternateLookup<ReadOnlySpan<char>> RemovableKeysSpanLookup =
+        RemovableKeys.GetAlternateLookup<ReadOnlySpan<char>>();
+
+    private static readonly HashSet<string>.AlternateLookup<ReadOnlySpan<char>> SigningKeysSpanLookup =
+        SigningKeys.GetAlternateLookup<ReadOnlySpan<char>>();
+
     public static string Clean(string? value)
     {
         if (string.IsNullOrEmpty(value) || value.Length > BrowserPolicy.MaximumUrlLength) return value ?? string.Empty;
+        var queryStart = value.IndexOf('?');
+        if (queryStart < 0) return value;
         if (HasMalformedPercentEscape(value)) return value;
         if (!Uri.TryCreate(value, UriKind.Absolute, out var uri)
             || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
@@ -255,39 +298,54 @@ internal static class CleanLinkPolicy
             return value;
         }
 
-        var queryStart = value.IndexOf('?');
-        if (queryStart < 0) return value;
         var fragmentStart = value.IndexOf('#', queryStart + 1);
         var queryEnd = fragmentStart >= 0 ? fragmentStart : value.Length;
-        var query = value[(queryStart + 1)..queryEnd];
-        if (query.Length == 0) return value;
+        var querySpan = value.AsSpan(queryStart + 1, queryEnd - (queryStart + 1));
+        if (querySpan.IsEmpty) return value;
 
-        var parts = query.Split('&');
-        List<string>? retained = null;
-        for (var index = 0; index < parts.Length; index++)
+        StringBuilder? retained = null;
+        var offset = 0;
+        var anyRetained = false;
+        while (offset <= querySpan.Length)
         {
-            var key = GetKey(parts[index]);
-            if (SigningKeys.Contains(key)) return value;
-            if (IsRemovableKey(key))
+            var remaining = querySpan[offset..];
+            var ampIndex = remaining.IndexOf('&');
+            var partSpan = ampIndex >= 0 ? remaining[..ampIndex] : remaining;
+            var partLength = partSpan.Length;
+
+            if (IsSigningKeyPart(partSpan)) return value;
+
+            if (IsRemovableKeyPart(partSpan))
             {
-                if (retained is not null) continue;
-                retained = new List<string>(parts.Length - 1);
-                for (var retainedIndex = 0; retainedIndex < index; retainedIndex++)
+                if (retained is null)
                 {
-                    retained.Add(parts[retainedIndex]);
+                    retained = new StringBuilder(value.Length);
+                    retained.Append(value.AsSpan(0, queryStart));
+                    if (offset > 0)
+                    {
+                        retained.Append('?');
+                        retained.Append(querySpan[..(offset - 1)]);
+                        anyRetained = true;
+                    }
                 }
             }
-            else
+            else if (retained is not null)
             {
-                retained?.Add(parts[index]);
+                retained.Append(anyRetained ? '&' : '?');
+                retained.Append(partSpan);
+                anyRetained = true;
             }
+
+            if (ampIndex < 0) break;
+            offset += partLength + 1;
         }
         if (retained is null) return value;
 
-        var prefix = value[..queryStart];
-        var fragment = fragmentStart >= 0 ? value[fragmentStart..] : string.Empty;
-        if (retained.Count == 0) return prefix + fragment;
-        return prefix + "?" + string.Join("&", retained) + fragment;
+        if (fragmentStart >= 0)
+        {
+            retained.Append(value.AsSpan(fragmentStart));
+        }
+        return retained.ToString();
     }
 
     public static bool TryClean(string? value, out string cleaned)
@@ -296,11 +354,34 @@ internal static class CleanLinkPolicy
         return !string.Equals(cleaned, value ?? string.Empty, StringComparison.Ordinal);
     }
 
-    private static bool IsRemovableKey(string key)
+    private static bool IsSigningKeyPart(ReadOnlySpan<char> part)
+    {
+        var equalsIndex = part.IndexOf('=');
+        var rawKey = equalsIndex >= 0 ? part[..equalsIndex] : part;
+        return rawKey.IndexOfAny('%', '+') < 0
+            ? SigningKeysSpanLookup.Contains(rawKey)
+            : SigningKeys.Contains(GetKey(part.ToString()));
+    }
+
+    private static bool IsRemovableKeyPart(ReadOnlySpan<char> part)
+    {
+        var equalsIndex = part.IndexOf('=');
+        var rawKey = equalsIndex >= 0 ? part[..equalsIndex] : part;
+        return rawKey.IndexOfAny('%', '+') < 0
+            ? IsRemovableKeySpan(rawKey)
+            : IsRemovableKey(GetKey(part.ToString()));
+    }
+
+    private static bool IsRemovableKeySpan(ReadOnlySpan<char> key)
     {
         return key.StartsWith("utm_", StringComparison.OrdinalIgnoreCase)
-            || RemovableKeys.Contains(key);
+            || key.StartsWith("mtm_", StringComparison.OrdinalIgnoreCase)
+            || key.StartsWith("pk_", StringComparison.OrdinalIgnoreCase)
+            || key.StartsWith("hsa_", StringComparison.OrdinalIgnoreCase)
+            || RemovableKeysSpanLookup.Contains(key);
     }
+
+    private static bool IsRemovableKey(string key) => IsRemovableKeySpan(key.AsSpan());
 
     private static string GetKey(string part)
     {
