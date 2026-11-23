@@ -62,9 +62,11 @@ internal sealed class CommandPaletteForm : Form
 {
     private readonly TextBox queryBox = new();
     private readonly ListBox resultList = new();
+    private readonly Label emptyLabel = new();
     private readonly System.Windows.Forms.Timer queryTimer = new() { Interval = 35 };
     private readonly Func<string, IReadOnlyList<RankedCommand>> rowProvider;
     private IReadOnlyList<RankedCommand> rows = [];
+    private ModernListRowVisual[] rowVisuals = [];
 
     public CommandPaletteForm(
         Func<string, IReadOnlyList<RankedCommand>> rowProvider,
@@ -101,18 +103,33 @@ internal sealed class CommandPaletteForm : Form
         queryBox.PlaceholderText = "Type a command, tab, favorite, session, or closed tab";
         queryBox.AccessibleName = "Command palette search";
         queryBox.Font = NativeDialogLayout.QueryFont;
+
+        var resultHost = new Panel { Dock = DockStyle.Fill, Margin = Padding.Empty };
         resultList.Dock = DockStyle.Fill;
         resultList.IntegralHeight = false;
         resultList.Font = NativeDialogLayout.ListFont;
         resultList.AccessibleName = "Command palette results";
+        emptyLabel.Dock = DockStyle.Fill;
+        emptyLabel.TextAlign = ContentAlignment.MiddleCenter;
+        emptyLabel.Font = NativeDialogLayout.ListFont;
+        emptyLabel.Text = "No matching commands, tabs, or saved items.";
+        emptyLabel.Visible = false;
+        emptyLabel.AccessibleRole = AccessibleRole.StatusBar;
+        resultHost.Controls.Add(resultList);
+        resultHost.Controls.Add(emptyLabel);
+
         root.Controls.Add(queryBox, 0, 0);
-        root.Controls.Add(resultList, 0, 1);
+        root.Controls.Add(resultHost, 0, 1);
         Controls.Add(root);
         NativeUiTheme.Apply(this);
+        emptyLabel.ForeColor = NativeUiTheme.MutedText;
+        SystemColorsChanged += (_, _) => emptyLabel.ForeColor = NativeUiTheme.MutedText;
         NativeUiTheme.ConfigureModernListBox(
             resultList,
             50,
-            (index, _) => BuildPaletteVisual(index));
+            (index, _) => index >= 0 && index < rowVisuals.Length
+                ? rowVisuals[index]
+                : new ModernListRowVisual(string.Empty, string.Empty, string.Empty));
 
         queryBox.TextChanged += (_, _) => QueueRefresh();
         queryBox.KeyDown += OnKeyDown;
@@ -195,23 +212,33 @@ internal sealed class CommandPaletteForm : Form
     private void RefreshRows()
     {
         if (IsDisposed) return;
-        rows = rowProvider(queryBox.Text);
+        var query = queryBox.Text;
+        rows = rowProvider(query);
+        var visuals = rows.Count == 0 ? [] : new ModernListRowVisual[rows.Count];
         resultList.BeginUpdate();
         try
         {
             resultList.Items.Clear();
-            foreach (var row in rows)
+            for (var index = 0; index < rows.Count; index++)
             {
-                var candidate = row.Candidate;
-                var category = candidate.Source switch
+                var candidate = rows[index].Candidate;
+                var (category, statusLabel, glyph, accent) = candidate.Source switch
                 {
-                    CommandSource.BrowserCommand => "Command",
-                    CommandSource.OpenTab => "Open tab",
-                    CommandSource.Favorite => "Favorite",
-                    CommandSource.Session => "Session",
-                    CommandSource.RecentlyClosed => "Recently closed",
-                    _ => "History"
+                    CommandSource.BrowserCommand => ("Command", "Command", ">", NativeUiTheme.Accent),
+                    CommandSource.OpenTab => ("Open tab", "Open tab", "T", NativeUiTheme.Positive),
+                    CommandSource.Favorite => ("Favorite", "Favorite", "*", NativeUiTheme.BrandCoral),
+                    CommandSource.Session => ("Session", "Session", "S", NativeUiTheme.Lavender),
+                    CommandSource.RecentlyClosed => ("Recently closed", "Closed", "R", NativeUiTheme.Focus),
+                    _ => ("History", "History", "H", NativeUiTheme.Muted)
                 };
+                visuals[index] = new ModernListRowVisual(
+                    candidate.Title,
+                    candidate.Detail,
+                    glyph,
+                    accent,
+                    StatusText: statusLabel,
+                    StatusColor: accent,
+                    ShortcutText: string.IsNullOrWhiteSpace(candidate.Shortcut) ? null : candidate.Shortcut);
                 var shortcut = string.IsNullOrWhiteSpace(candidate.Shortcut)
                     ? string.Empty
                     : $"  [{candidate.Shortcut}]";
@@ -219,13 +246,24 @@ internal sealed class CommandPaletteForm : Form
                     $"{category}: {candidate.Title}  \u2014  {candidate.Detail}{shortcut}",
                     $"{category}: {candidate.Title}; {candidate.Detail}; shortcut {candidate.Shortcut}"));
             }
+            rowVisuals = visuals;
         }
         finally
         {
             resultList.EndUpdate();
         }
 
-        resultList.SelectedIndex = resultList.Items.Count > 0 ? 0 : -1;
+        var hasRows = resultList.Items.Count > 0;
+        resultList.Visible = hasRows;
+        emptyLabel.Visible = !hasRows;
+        if (!hasRows)
+        {
+            var trimmed = query.Trim();
+            emptyLabel.Text = trimmed.Length == 0
+                ? "No matching commands, tabs, or saved items."
+                : $"No commands, tabs, or saved items match \"{TextSafety.TruncateWithEllipsis(trimmed, 48)}\".";
+        }
+        resultList.SelectedIndex = hasRows ? 0 : -1;
     }
 
     private void OnKeyDown(object? sender, KeyEventArgs e)
@@ -233,17 +271,32 @@ internal sealed class CommandPaletteForm : Form
         if (e.KeyCode == Keys.Enter)
         {
             ActivateSelected();
+            e.Handled = true;
             e.SuppressKeyPress = true;
         }
         else if (e.KeyCode == Keys.Escape)
         {
             CloseWithoutActivation();
+            e.Handled = true;
             e.SuppressKeyPress = true;
         }
-        else if (e.KeyCode == Keys.Down && sender == queryBox)
+        else if (e.KeyCode is Keys.Down or Keys.Up or Keys.PageDown or Keys.PageUp)
         {
-            resultList.Focus();
-            if (resultList.Items.Count > 0) resultList.SelectedIndex = 0;
+            var count = resultList.Items.Count;
+            if (count > 0)
+            {
+                var current = resultList.SelectedIndex;
+                var pageStep = Math.Max(1, resultList.ClientSize.Height / Math.Max(1, resultList.ItemHeight));
+                resultList.SelectedIndex = e.KeyCode switch
+                {
+                    Keys.Down => current < 0 ? 0 : (current + 1) % count,
+                    Keys.Up => current < 0 ? count - 1 : (current - 1 + count) % count,
+                    Keys.PageDown => Math.Min(count - 1, Math.Max(0, current) + pageStep),
+                    _ => Math.Max(0, (current < 0 ? 0 : current) - pageStep)
+                };
+            }
+            if (!queryBox.Focused) queryBox.Focus();
+            e.Handled = true;
             e.SuppressKeyPress = true;
         }
     }
@@ -267,35 +320,9 @@ internal sealed class CommandPaletteForm : Form
         // again later in the session.
         queryTimer.Stop();
         rows = [];
+        rowVisuals = [];
         resultList.Items.Clear();
         queryBox.Clear();
-    }
-
-    private ModernListRowVisual BuildPaletteVisual(int index)
-    {
-        if (index < 0 || index >= rows.Count)
-        {
-            return new ModernListRowVisual(string.Empty, string.Empty, string.Empty);
-        }
-
-        var candidate = rows[index].Candidate;
-        var (category, glyph, accent) = candidate.Source switch
-        {
-            CommandSource.BrowserCommand => ("Command", ">", NativeUiTheme.Accent),
-            CommandSource.OpenTab => ("Open tab", "T", NativeUiTheme.Positive),
-            CommandSource.Favorite => ("Favorite", "*", NativeUiTheme.BrandCoral),
-            CommandSource.Session => ("Session", "S", NativeUiTheme.Lavender),
-            CommandSource.RecentlyClosed => ("Closed", "R", NativeUiTheme.Focus),
-            _ => ("History", "H", NativeUiTheme.Muted)
-        };
-        return new ModernListRowVisual(
-            candidate.Title,
-            candidate.Detail,
-            glyph,
-            accent,
-            StatusText: category,
-            StatusColor: accent,
-            ShortcutText: string.IsNullOrWhiteSpace(candidate.Shortcut) ? null : candidate.Shortcut);
     }
 
     private sealed record PaletteRowDisplay(string Text, string AccessibleName)
@@ -314,6 +341,7 @@ internal sealed class MruSwitcherForm : Form
 {
     private readonly ListBox itemList = new();
     private IReadOnlyList<string> labels = [];
+    private ModernListRowVisual[] rowVisuals = [];
     private bool suppressDeactivate;
 
     public MruSwitcherForm()
@@ -327,7 +355,7 @@ internal sealed class MruSwitcherForm : Form
         ShowInTaskbar = false;
         KeyPreview = true;
         ClientSize = new Size(460, 310);
-        MinimumSize = new Size(360, 220);
+        MinimumSize = new Size(360, 64);
         AccessibleRole = AccessibleRole.Dialog;
         AccessibleName = "Recent tabs";
 
@@ -340,20 +368,9 @@ internal sealed class MruSwitcherForm : Form
         NativeUiTheme.ConfigureModernListBox(
             itemList,
             46,
-            (index, _) =>
-            {
-                if (index < 0 || index >= labels.Count)
-                {
-                    return new ModernListRowVisual(string.Empty, string.Empty, string.Empty);
-                }
-                var raw = labels[index];
-                var parts = raw.Split(" \u2014 ", 2, StringSplitOptions.None);
-                return new ModernListRowVisual(
-                    parts[0],
-                    parts.Length > 1 ? parts[1] : "Recent browser tab",
-                    "T",
-                    NativeUiTheme.Accent);
-            });
+            (index, _) => index >= 0 && index < rowVisuals.Length
+                ? rowVisuals[index]
+                : new ModernListRowVisual(string.Empty, string.Empty, string.Empty));
         itemList.MouseClick += (_, e) =>
         {
             var index = itemList.IndexFromPoint(e.Location);
@@ -398,10 +415,42 @@ internal sealed class MruSwitcherForm : Form
 
     public void Open(IWin32Window owner, IReadOnlyList<string> rowLabels, int selectedIndex = 0)
     {
+        const string separator = " \u2014 ";
         labels = rowLabels.Take(8).ToArray();
-        itemList.Items.Clear();
-        itemList.Items.AddRange(labels.Cast<object>().ToArray());
+        var visuals = new ModernListRowVisual[labels.Count];
+        for (var i = 0; i < labels.Count; i++)
+        {
+            var raw = labels[i];
+            var splitIndex = raw.LastIndexOf(separator, StringComparison.Ordinal);
+            var title = splitIndex > 0 ? raw[..splitIndex] : raw;
+            var detail = splitIndex > 0 && splitIndex + separator.Length < raw.Length
+                ? raw[(splitIndex + separator.Length)..]
+                : "Recent browser tab";
+            visuals[i] = new ModernListRowVisual(
+                title,
+                detail,
+                "T",
+                NativeUiTheme.Accent);
+        }
+        rowVisuals = visuals;
+
+        itemList.BeginUpdate();
+        try
+        {
+            itemList.Items.Clear();
+            itemList.Items.AddRange(labels.Cast<object>().ToArray());
+        }
+        finally
+        {
+            itemList.EndUpdate();
+        }
         itemList.SelectedIndex = labels.Count == 0 ? -1 : Math.Clamp(selectedIndex, 0, labels.Count - 1);
+
+        var rowHeight = itemList.ItemHeight > 0 ? itemList.ItemHeight : Math.Max(36, LogicalToDeviceUnits(46));
+        var visibleCount = Math.Clamp(labels.Count, 1, 8);
+        var desiredHeight = (visibleCount * rowHeight) + LogicalToDeviceUnits(6);
+        ClientSize = new Size(ClientSize.Width, Math.Max(LogicalToDeviceUnits(54), desiredHeight));
+
         if (owner is Control control && control.IsHandleCreated)
         {
             var bounds = control.RectangleToScreen(control.ClientRectangle);
@@ -488,6 +537,7 @@ internal sealed record SessionManagerRequest(SessionManagerAction Action, SavedS
 internal sealed class SessionManagerForm : Form
 {
     private readonly ListBox sessionList = new();
+    private readonly Label emptyLabel = new();
     private readonly Button newButton = new();
     private readonly Button openButton = new();
     private readonly Button replaceButton = new();
@@ -496,6 +546,7 @@ internal sealed class SessionManagerForm : Form
     private readonly Button deleteButton = new();
     private readonly Button closeButton = new();
     private IReadOnlyList<SavedSessionEntry> sessions = [];
+    private ModernListRowVisual[] rowVisuals = [];
 
     public SessionManagerForm()
     {
@@ -520,11 +571,20 @@ internal sealed class SessionManagerForm : Form
         };
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, NativeDialogLayout.WrappedActionRowHeight));
+        var listHost = new Panel { Dock = DockStyle.Fill, Margin = Padding.Empty };
         sessionList.Dock = DockStyle.Fill;
         sessionList.IntegralHeight = false;
         sessionList.Font = NativeDialogLayout.ListFont;
         sessionList.AccessibleName = "Saved sessions list";
-        root.Controls.Add(sessionList, 0, 0);
+        emptyLabel.Dock = DockStyle.Fill;
+        emptyLabel.TextAlign = ContentAlignment.MiddleCenter;
+        emptyLabel.Font = NativeDialogLayout.ListFont;
+        emptyLabel.Text = "No saved sessions yet. Click \"New from current\" to save this window.";
+        emptyLabel.Visible = false;
+        emptyLabel.AccessibleRole = AccessibleRole.StatusBar;
+        listHost.Controls.Add(sessionList);
+        listHost.Controls.Add(emptyLabel);
+        root.Controls.Add(listHost, 0, 0);
 
         var actions = NativeDialogLayout.CreateActionBar(wrap: true);
         ConfigureButton(newButton, "New from current", "Save the current window as a new session");
@@ -540,28 +600,14 @@ internal sealed class SessionManagerForm : Form
         AcceptButton = openButton;
         CancelButton = closeButton;
         NativeUiTheme.Apply(this, openButton);
+        emptyLabel.ForeColor = NativeUiTheme.MutedText;
+        SystemColorsChanged += (_, _) => emptyLabel.ForeColor = NativeUiTheme.MutedText;
         NativeUiTheme.ConfigureModernListBox(
             sessionList,
             50,
-            (index, _) =>
-            {
-                if (index < 0 || index >= sessions.Count)
-                {
-                    return new ModernListRowVisual(string.Empty, string.Empty, string.Empty);
-                }
-                var session = sessions[index];
-                var age = session.UpdatedUtc == DateTimeOffset.UnixEpoch
-                    ? "not dated"
-                    : session.UpdatedUtc.ToLocalTime().ToString("g");
-                var tabCount = session.Tabs.Count;
-                return new ModernListRowVisual(
-                    session.Name,
-                    $"Updated {age}",
-                    "S",
-                    NativeUiTheme.Lavender,
-                    StatusText: tabCount == 1 ? "1 tab" : $"{tabCount} tabs",
-                    StatusColor: NativeUiTheme.Accent);
-            });
+            (index, _) => index >= 0 && index < rowVisuals.Length
+                ? rowVisuals[index]
+                : new ModernListRowVisual(string.Empty, string.Empty, string.Empty));
 
         sessionList.SelectedIndexChanged += (_, _) => UpdateButtons();
         sessionList.DoubleClick += (_, _) => Raise(SessionManagerAction.Open);
@@ -601,24 +647,38 @@ internal sealed class SessionManagerForm : Form
     public void SetSessions(IReadOnlyList<SavedSessionEntry> entries)
     {
         sessions = entries ?? [];
+        var visuals = sessions.Count == 0 ? [] : new ModernListRowVisual[sessions.Count];
         sessionList.BeginUpdate();
         try
         {
             sessionList.Items.Clear();
-            foreach (var session in sessions)
+            for (var index = 0; index < sessions.Count; index++)
             {
+                var session = sessions[index];
                 var age = session.UpdatedUtc == DateTimeOffset.UnixEpoch
                     ? "not dated"
                     : session.UpdatedUtc.ToLocalTime().ToString("g");
-                sessionList.Items.Add($"{session.Name} \u2014 {session.Tabs.Count} tabs \u2014 {age}");
+                var tabCount = session.Tabs.Count;
+                visuals[index] = new ModernListRowVisual(
+                    session.Name,
+                    $"Updated {age}",
+                    "S",
+                    NativeUiTheme.Lavender,
+                    StatusText: tabCount == 1 ? "1 tab" : $"{tabCount} tabs",
+                    StatusColor: NativeUiTheme.Accent);
+                sessionList.Items.Add($"{session.Name} \u2014 {tabCount} tabs \u2014 {age}");
             }
+            rowVisuals = visuals;
         }
         finally
         {
             sessionList.EndUpdate();
         }
 
-        if (sessionList.Items.Count > 0) sessionList.SelectedIndex = 0;
+        var hasSessions = sessionList.Items.Count > 0;
+        sessionList.Visible = hasSessions;
+        emptyLabel.Visible = !hasSessions;
+        if (hasSessions) sessionList.SelectedIndex = 0;
         UpdateButtons();
     }
 
@@ -653,6 +713,7 @@ internal sealed class SessionManagerForm : Form
         base.OnVisibleChanged(e);
         if (Visible) return;
         sessions = [];
+        rowVisuals = [];
         sessionList.Items.Clear();
         UpdateButtons();
     }
@@ -779,10 +840,12 @@ internal enum PermissionManagerAction
 internal sealed class PermissionManagerForm : Form
 {
     private readonly ListBox settingList = new();
+    private readonly Label emptyLabel = new();
     private readonly Button resetButton = new();
     private readonly Button resetAllButton = new();
     private readonly Button closeButton = new();
     private IReadOnlyList<PermissionSettingRow> rows = [];
+    private ModernListRowVisual[] rowVisuals = [];
 
     public PermissionManagerForm()
     {
@@ -807,11 +870,20 @@ internal sealed class PermissionManagerForm : Form
         };
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, NativeDialogLayout.ActionRowHeight));
+        var listHost = new Panel { Dock = DockStyle.Fill, Margin = Padding.Empty };
         settingList.Dock = DockStyle.Fill;
         settingList.IntegralHeight = false;
         settingList.Font = NativeDialogLayout.ListFont;
         settingList.AccessibleName = "Saved website permissions list";
-        root.Controls.Add(settingList, 0, 0);
+        emptyLabel.Dock = DockStyle.Fill;
+        emptyLabel.TextAlign = ContentAlignment.MiddleCenter;
+        emptyLabel.Font = NativeDialogLayout.ListFont;
+        emptyLabel.Text = "No custom website permissions saved.";
+        emptyLabel.Visible = false;
+        emptyLabel.AccessibleRole = AccessibleRole.StatusBar;
+        listHost.Controls.Add(settingList);
+        listHost.Controls.Add(emptyLabel);
+        root.Controls.Add(listHost, 0, 0);
         var actions = NativeDialogLayout.CreateActionBar();
         ConfigureButton(resetButton, "Reset selected", "Return the selected permission to its default");
         ConfigureButton(resetAllButton, "Reset all", "Return every saved permission to its default");
@@ -822,33 +894,14 @@ internal sealed class PermissionManagerForm : Form
         AcceptButton = resetButton;
         CancelButton = closeButton;
         NativeUiTheme.Apply(this);
+        emptyLabel.ForeColor = NativeUiTheme.MutedText;
+        SystemColorsChanged += (_, _) => emptyLabel.ForeColor = NativeUiTheme.MutedText;
         NativeUiTheme.ConfigureModernListBox(
             settingList,
             50,
-            (index, _) =>
-            {
-                if (index < 0 || index >= rows.Count)
-                {
-                    return new ModernListRowVisual(string.Empty, string.Empty, string.Empty);
-                }
-                var row = rows[index];
-                var statusColor = row.State.Contains("Allow", StringComparison.OrdinalIgnoreCase)
-                    ? NativeUiTheme.Positive
-                    : row.State.Contains("Block", StringComparison.OrdinalIgnoreCase)
-                        || row.State.Contains("Deny", StringComparison.OrdinalIgnoreCase)
-                        ? NativeUiTheme.Negative
-                        : NativeUiTheme.Muted;
-                var glyph = string.IsNullOrWhiteSpace(row.Permission)
-                    ? "P"
-                    : char.ToUpperInvariant(row.Permission.TrimStart()[0]).ToString();
-                return new ModernListRowVisual(
-                    row.Origin,
-                    row.Permission,
-                    glyph,
-                    statusColor,
-                    StatusText: row.State,
-                    StatusColor: statusColor);
-            });
+            (index, _) => index >= 0 && index < rowVisuals.Length
+                ? rowVisuals[index]
+                : new ModernListRowVisual(string.Empty, string.Empty, string.Empty));
         settingList.SelectedIndexChanged += (_, _) => UpdateButtons();
         resetButton.Click += (_, _) => Raise(PermissionManagerAction.ResetSelected);
         resetAllButton.Click += (_, _) => Raise(PermissionManagerAction.ResetAll);
@@ -877,20 +930,42 @@ internal sealed class PermissionManagerForm : Form
     public void SetRows(IReadOnlyList<PermissionSettingRow> entries)
     {
         rows = entries ?? [];
+        var visuals = rows.Count == 0 ? [] : new ModernListRowVisual[rows.Count];
         settingList.BeginUpdate();
         try
         {
             settingList.Items.Clear();
-            foreach (var row in rows)
+            for (var index = 0; index < rows.Count; index++)
             {
+                var row = rows[index];
+                var statusColor = row.State.Contains("Allow", StringComparison.OrdinalIgnoreCase)
+                    ? NativeUiTheme.Positive
+                    : row.State.Contains("Block", StringComparison.OrdinalIgnoreCase)
+                        || row.State.Contains("Deny", StringComparison.OrdinalIgnoreCase)
+                        ? NativeUiTheme.Negative
+                        : NativeUiTheme.Muted;
+                var glyph = string.IsNullOrWhiteSpace(row.Permission)
+                    ? "P"
+                    : char.ToUpperInvariant(row.Permission.TrimStart()[0]).ToString();
+                visuals[index] = new ModernListRowVisual(
+                    row.Origin,
+                    row.Permission,
+                    glyph,
+                    statusColor,
+                    StatusText: row.State,
+                    StatusColor: statusColor);
                 settingList.Items.Add($"{row.Origin} \u2014 {row.Permission} \u2014 {row.State}");
             }
+            rowVisuals = visuals;
             if (settingList.Items.Count > 0) settingList.SelectedIndex = 0;
         }
         finally
         {
             settingList.EndUpdate();
         }
+        var hasRows = settingList.Items.Count > 0;
+        settingList.Visible = hasRows;
+        emptyLabel.Visible = !hasRows;
         UpdateButtons();
     }
 
@@ -925,6 +1000,7 @@ internal sealed class PermissionManagerForm : Form
         // tokens. Release them as soon as the manager is hidden so an old
         // profile/environment can be reclaimed after a browser restart.
         rows = [];
+        rowVisuals = [];
         settingList.Items.Clear();
         UpdateButtons();
     }
@@ -958,6 +1034,7 @@ internal sealed class DownloadsPopupForm : Form
     private readonly Func<IReadOnlyList<DownloadPopupRow>> rowProvider;
     private readonly Action<DownloadPopupAction, object> action;
     private readonly ListBox downloadList = new();
+    private readonly Label emptyLabel = new();
     private readonly Button pauseButton = new();
     private readonly Button resumeButton = new();
     private readonly Button cancelButton = new();
@@ -966,6 +1043,7 @@ internal sealed class DownloadsPopupForm : Form
     private readonly Button copyButton = new();
     private readonly Button removeButton = new();
     private IReadOnlyList<DownloadPopupRow> rows = [];
+    private ModernListRowVisual[] rowVisuals = [];
 
     public DownloadsPopupForm(
         Func<IReadOnlyList<DownloadPopupRow>> rowProvider,
@@ -994,11 +1072,20 @@ internal sealed class DownloadsPopupForm : Form
         };
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, NativeDialogLayout.WrappedActionRowHeight));
+        var listHost = new Panel { Dock = DockStyle.Fill, Margin = Padding.Empty };
         downloadList.Dock = DockStyle.Fill;
         downloadList.IntegralHeight = false;
         downloadList.Font = NativeDialogLayout.CompactListFont;
         downloadList.AccessibleName = "Downloads list";
-        root.Controls.Add(downloadList, 0, 0);
+        emptyLabel.Dock = DockStyle.Fill;
+        emptyLabel.TextAlign = ContentAlignment.MiddleCenter;
+        emptyLabel.Font = NativeDialogLayout.ListFont;
+        emptyLabel.Text = "No downloads yet.";
+        emptyLabel.Visible = false;
+        emptyLabel.AccessibleRole = AccessibleRole.StatusBar;
+        listHost.Controls.Add(downloadList);
+        listHost.Controls.Add(emptyLabel);
+        root.Controls.Add(listHost, 0, 0);
         var actions = NativeDialogLayout.CreateActionBar(wrap: true);
         ConfigureButton(pauseButton, "Pause", "Pause the selected download");
         ConfigureButton(resumeButton, "Resume", "Resume the selected download");
@@ -1011,35 +1098,14 @@ internal sealed class DownloadsPopupForm : Form
         root.Controls.Add(actions, 0, 1);
         Controls.Add(root);
         NativeUiTheme.Apply(this, openButton);
+        emptyLabel.ForeColor = NativeUiTheme.MutedText;
+        SystemColorsChanged += (_, _) => emptyLabel.ForeColor = NativeUiTheme.MutedText;
         NativeUiTheme.ConfigureModernListBox(
             downloadList,
             52,
-            (index, _) =>
-            {
-                if (index < 0 || index >= rows.Count)
-                {
-                    return new ModernListRowVisual(string.Empty, string.Empty, string.Empty);
-                }
-                var row = rows[index];
-                var stateColor = row.State.Equals("Complete", StringComparison.OrdinalIgnoreCase)
-                    ? NativeUiTheme.Positive
-                    : row.State.Equals("Interrupted", StringComparison.OrdinalIgnoreCase)
-                        || row.State.Equals("Canceled", StringComparison.OrdinalIgnoreCase)
-                        ? NativeUiTheme.Negative
-                        : row.State.Equals("Paused", StringComparison.OrdinalIgnoreCase)
-                            ? NativeUiTheme.SecondaryText
-                            : NativeUiTheme.Accent;
-                var detail = string.IsNullOrWhiteSpace(row.Detail)
-                    ? row.Progress
-                    : $"{row.Progress} \u00B7 {row.Detail}";
-                return new ModernListRowVisual(
-                    row.FileName,
-                    detail,
-                    "D",
-                    stateColor,
-                    StatusText: row.State,
-                    StatusColor: stateColor);
-            });
+            (index, _) => index >= 0 && index < rowVisuals.Length
+                ? rowVisuals[index]
+                : new ModernListRowVisual(string.Empty, string.Empty, string.Empty));
 
         downloadList.SelectedIndexChanged += (_, _) => UpdateButtons();
         downloadList.DoubleClick += (_, _) => Raise(DownloadPopupAction.Open);
@@ -1086,20 +1152,44 @@ internal sealed class DownloadsPopupForm : Form
         var selectedToken = SelectedRow?.Token;
         var previousIndex = downloadList.SelectedIndex;
         rows = rowProvider();
+        var visuals = rows.Count == 0 ? [] : new ModernListRowVisual[rows.Count];
         downloadList.BeginUpdate();
         try
         {
             downloadList.Items.Clear();
-            foreach (var row in rows)
+            for (var index = 0; index < rows.Count; index++)
             {
+                var row = rows[index];
+                var stateColor = row.State.Equals("Complete", StringComparison.OrdinalIgnoreCase)
+                    ? NativeUiTheme.Positive
+                    : row.State.Equals("Interrupted", StringComparison.OrdinalIgnoreCase)
+                        || row.State.Equals("Canceled", StringComparison.OrdinalIgnoreCase)
+                        ? NativeUiTheme.Negative
+                        : row.State.Equals("Paused", StringComparison.OrdinalIgnoreCase)
+                            ? NativeUiTheme.SecondaryText
+                            : NativeUiTheme.Accent;
+                var detail = string.IsNullOrWhiteSpace(row.Detail)
+                    ? row.Progress
+                    : $"{row.Progress} \u00B7 {row.Detail}";
+                visuals[index] = new ModernListRowVisual(
+                    row.FileName,
+                    detail,
+                    "D",
+                    stateColor,
+                    StatusText: row.State,
+                    StatusColor: stateColor);
                 downloadList.Items.Add($"{row.State} \u2014 {row.FileName} \u2014 {row.Progress} \u2014 {row.Detail}");
             }
+            rowVisuals = visuals;
         }
         finally
         {
             downloadList.EndUpdate();
         }
-        if (rows.Count > 0)
+        var hasRows = rows.Count > 0;
+        downloadList.Visible = hasRows;
+        emptyLabel.Visible = !hasRows;
+        if (hasRows)
         {
             var restoredIndex = -1;
             if (selectedToken is not null)
@@ -1169,6 +1259,7 @@ internal sealed class DownloadsPopupForm : Form
         base.OnVisibleChanged(e);
         if (Visible) return;
         rows = [];
+        rowVisuals = [];
         downloadList.Items.Clear();
         UpdateButtons();
     }
@@ -1384,10 +1475,16 @@ internal sealed class DownloadNotificationForm : Form
     public void UpdateIfVisible(Control? anchor, DownloadNotificationState state)
     {
         ArgumentNullException.ThrowIfNull(state);
+        var previous = currentState;
         ApplyState(state);
         if (!Visible) return;
-        PositionNearAnchor(anchor);
-        UpdateAutoHideSchedule(state);
+        var scheduleChanged = previous is null
+            || previous.ActiveCount != state.ActiveCount
+            || !string.Equals(previous.State, state.State, StringComparison.OrdinalIgnoreCase);
+        if (scheduleChanged)
+        {
+            UpdateAutoHideSchedule(state);
+        }
     }
 
     public void Reposition(Control? anchor)
@@ -1482,25 +1579,67 @@ internal sealed class DownloadNotificationForm : Form
 
     private void ApplyState(DownloadNotificationState state)
     {
+        var previous = currentState;
         currentState = state;
-        statusLabel.Text = BuildHeaderText(state);
-        fileNameLabel.Text = state.FileName;
-        detailLabel.Text = string.IsNullOrWhiteSpace(state.DetailText)
+
+        var detail = string.IsNullOrWhiteSpace(state.DetailText)
             ? state.ProgressText
             : $"{state.ProgressText} \u00B7 {state.DetailText}";
-        AccessibleDescription = $"{statusLabel.Text}: {state.FileName}. {detailLabel.Text}";
+        var stateChanged = previous is null
+            || !string.Equals(previous.State, state.State, StringComparison.OrdinalIgnoreCase);
+        var headerChanged = stateChanged || previous!.ActiveCount != state.ActiveCount;
+        var fileChanged = previous is null
+            || !string.Equals(previous.FileName, state.FileName, StringComparison.Ordinal);
 
-        openButton.Visible = state.CanOpen;
-        openButton.Enabled = state.CanOpen;
-        folderButton.Visible = state.CanShowInFolder;
-        folderButton.Enabled = state.CanShowInFolder;
-        cancelButton.Visible = state.CanCancel;
-        cancelButton.Enabled = state.CanCancel;
-        allDownloadsButton.Visible = true;
-        allDownloadsButton.Enabled = true;
+        if (headerChanged)
+        {
+            statusLabel.Text = BuildHeaderText(state);
+        }
+        if (fileChanged)
+        {
+            fileNameLabel.Text = state.FileName;
+        }
+        if (!string.Equals(detailLabel.Text, detail, StringComparison.Ordinal))
+        {
+            detailLabel.Text = detail;
+        }
 
-        ApplySemanticColors();
-        progressTrack.Invalidate();
+        if (headerChanged || fileChanged || previous is null
+            || !string.Equals(previous.ProgressText, state.ProgressText, StringComparison.Ordinal)
+            || !string.Equals(previous.DetailText, state.DetailText, StringComparison.Ordinal))
+        {
+            AccessibleDescription = $"{statusLabel.Text}: {state.FileName}. {detailLabel.Text}";
+        }
+
+        if (previous is null || previous.CanOpen != state.CanOpen)
+        {
+            openButton.Visible = state.CanOpen;
+            openButton.Enabled = state.CanOpen;
+        }
+        if (previous is null || previous.CanShowInFolder != state.CanShowInFolder)
+        {
+            folderButton.Visible = state.CanShowInFolder;
+            folderButton.Enabled = state.CanShowInFolder;
+        }
+        if (previous is null || previous.CanCancel != state.CanCancel)
+        {
+            cancelButton.Visible = state.CanCancel;
+            cancelButton.Enabled = state.CanCancel;
+        }
+        if (previous is null)
+        {
+            allDownloadsButton.Visible = true;
+            allDownloadsButton.Enabled = true;
+        }
+
+        if (stateChanged)
+        {
+            ApplySemanticColors();
+        }
+        if (stateChanged || previous is null || previous.Percent != state.Percent)
+        {
+            progressTrack.Invalidate();
+        }
     }
 
     private void UpdateAutoHideSchedule(DownloadNotificationState state)

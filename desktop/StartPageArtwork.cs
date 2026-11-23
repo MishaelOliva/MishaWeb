@@ -1,5 +1,7 @@
+using System.Buffers;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
 
 namespace MishaWeb;
 
@@ -21,8 +23,9 @@ internal static class StartPageArtwork
     private static readonly Color Glyph = NativeUiTheme.Text;
     // Loaded inside BackdropFrameSync while backdropFrameLeases > 0 (released
     // together with cached frames when the last start-page tab closes/hides, or
-    // after a short cooldown on low-spec machines).
+    // after a short idle cooldown once the viewport frame cache is populated).
     private static Bitmap? backdropSource;
+    private static Size? backdropSourceSize;
     private static bool backdropSourceAttempted;
     private static long backdropSourceLastUsedTick;
 
@@ -36,7 +39,7 @@ internal static class StartPageArtwork
     private const int MaximumCachedFrames = 4;
     private const long NormalCacheByteBudget = 12L * 1024 * 1024;
     private const long LowSpecCacheByteBudget = 4L * 1024 * 1024;
-    private const long LowSpecSourceCooldownMs = 3_000;
+    private const long BackdropSourceCooldownMs = 3_000;
     private static readonly Lazy<bool> IsLowSpecProcess = new(() => SystemResourceInfo.CaptureMemory().IsLowSpecMachine);
     private static readonly object BackdropFrameSync = new();
     private static readonly List<BackdropCacheEntry> BackdropCache = new(MaximumCachedFrames);
@@ -126,20 +129,29 @@ internal static class StartPageArtwork
                 // blending on every start-page and child slice paint.
                 graphics.CompositingMode = CompositingMode.SourceCopy;
                 graphics.CompositingQuality = CompositingQuality.HighSpeed;
-                graphics.InterpolationMode = isUnscaledOneToOneCopy
-                    ? InterpolationMode.NearestNeighbor
-                    : InterpolationMode.HighQualityBilinear;
-                graphics.PixelOffsetMode = isUnscaledOneToOneCopy
-                    ? PixelOffsetMode.None
-                    : PixelOffsetMode.HighQuality;
-                graphics.DrawImage(
-                    entry.Frame,
-                    destRect,
-                    source.X,
-                    source.Y,
-                    source.Width,
-                    source.Height,
-                    GraphicsUnit.Pixel);
+                if (isUnscaledOneToOneCopy)
+                {
+                    graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+                    graphics.PixelOffsetMode = PixelOffsetMode.None;
+                    graphics.DrawImage(
+                        entry.Frame,
+                        destRect,
+                        clippedSlice,
+                        GraphicsUnit.Pixel);
+                }
+                else
+                {
+                    graphics.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                    graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    graphics.DrawImage(
+                        entry.Frame,
+                        destRect,
+                        source.X,
+                        source.Y,
+                        source.Width,
+                        source.Height,
+                        GraphicsUnit.Pixel);
+                }
             }
             finally
             {
@@ -180,6 +192,20 @@ internal static class StartPageArtwork
         lock (BackdropFrameSync)
         {
             backdropFrameLeases++;
+        }
+    }
+
+    internal static BackdropFrameLease AcquireBackdropFrameLease()
+    {
+        AcquireBackdropFrame();
+        return new BackdropFrameLease(active: true);
+    }
+
+    internal readonly struct BackdropFrameLease(bool active) : IDisposable
+    {
+        public void Dispose()
+        {
+            if (active) ReleaseBackdropFrame();
         }
     }
 
@@ -234,9 +260,8 @@ internal static class StartPageArtwork
                     BackdropCache.RemoveAt(i);
                     BackdropCache.Add(candidate);
                 }
-                if (isLowSpec
-                    && backdropSource is not null
-                    && Environment.TickCount64 - backdropSourceLastUsedTick >= LowSpecSourceCooldownMs)
+                if (backdropSource is not null
+                    && Environment.TickCount64 - backdropSourceLastUsedTick >= BackdropSourceCooldownMs)
                 {
                     backdropSource.Dispose();
                     backdropSource = null;
@@ -315,6 +340,7 @@ internal static class StartPageArtwork
             {
                 DrawBackdropDirect(frameGraphics, new Rectangle(Point.Empty, frameSize));
             }
+            ClampFrameEdges(targetBitmap, frameSize, targetCapacity);
         }
         catch
         {
@@ -354,10 +380,16 @@ internal static class StartPageArtwork
 
     private static Size GetFrameLimit()
     {
+        if (backdropSourceSize is { } cachedSize) return cachedSize;
+
         var backdrop = GetCachedBackdropSource();
-        return backdrop is null
-            ? new Size(FallbackFrameWidth, FallbackFrameHeight)
-            : backdrop.Size;
+        if (backdrop is not null)
+        {
+            backdropSourceSize = backdrop.Size;
+            return backdrop.Size;
+        }
+
+        return new Size(FallbackFrameWidth, FallbackFrameHeight);
     }
 
     private static Bitmap? GetCachedBackdropSource()
@@ -366,9 +398,61 @@ internal static class StartPageArtwork
         {
             backdropSourceAttempted = true;
             backdropSource = LoadBackdropImage();
+            if (backdropSource is not null)
+            {
+                backdropSourceSize = backdropSource.Size;
+            }
         }
         backdropSourceLastUsedTick = Environment.TickCount64;
         return backdropSource;
+    }
+
+    private static void ClampFrameEdges(Bitmap bitmap, Size frameSize, Size capacity)
+    {
+        var padRight = frameSize.Width > 0 && frameSize.Width < capacity.Width;
+        var padBottom = frameSize.Height > 0 && frameSize.Height < capacity.Height;
+        if (!padRight && !padBottom) return;
+
+        var lockWidth = padRight ? frameSize.Width + 1 : frameSize.Width;
+        var lockHeight = padBottom ? frameSize.Height + 1 : frameSize.Height;
+        var lockRect = new Rectangle(0, 0, lockWidth, lockHeight);
+        var data = bitmap.LockBits(lockRect, ImageLockMode.ReadWrite, PixelFormat.Format24bppRgb);
+        try
+        {
+            if (padRight)
+            {
+                var srcOffset = (frameSize.Width - 1) * 3;
+                var dstOffset = frameSize.Width * 3;
+                for (var y = 0; y < frameSize.Height; y++)
+                {
+                    var rowPtr = data.Scan0 + (y * data.Stride);
+                    Marshal.WriteByte(rowPtr, dstOffset, Marshal.ReadByte(rowPtr, srcOffset));
+                    Marshal.WriteByte(rowPtr, dstOffset + 1, Marshal.ReadByte(rowPtr, srcOffset + 1));
+                    Marshal.WriteByte(rowPtr, dstOffset + 2, Marshal.ReadByte(rowPtr, srcOffset + 2));
+                }
+            }
+
+            if (padBottom)
+            {
+                var rowBytes = lockWidth * 3;
+                var pooled = ArrayPool<byte>.Shared.Rent(rowBytes);
+                try
+                {
+                    var srcRowPtr = data.Scan0 + ((frameSize.Height - 1) * data.Stride);
+                    var dstRowPtr = data.Scan0 + (frameSize.Height * data.Stride);
+                    Marshal.Copy(srcRowPtr, pooled, 0, rowBytes);
+                    Marshal.Copy(pooled, 0, dstRowPtr, rowBytes);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(pooled);
+                }
+            }
+        }
+        finally
+        {
+            bitmap.UnlockBits(data);
+        }
     }
 
     private static int RoundUp(int value, int quantum)

@@ -1,4 +1,5 @@
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 
 namespace MishaWeb;
 
@@ -24,10 +25,12 @@ internal enum StartPageAction
 
 internal sealed class NativeStartPage : UserControl
 {
-    private const int MaximumQuickLinks = 3;
+    private const int MaximumQuickLinks = 6;
     private const int MaximumQuickLinkDisplayUrlCharacters = 512;
     private const int MaximumQuickLinkAccessibleDescriptionCharacters = 568;
     private const int MaximumQuickLinkDisplayHostCharacters = 120;
+    private const int WmPrint = 0x0317;
+    private const int WmPrintClient = 0x0318;
 
     private static readonly Color PageColor = NativeUiTheme.Window;
     private static readonly Color SurfaceColor = Color.FromArgb(180, NativeUiTheme.Surface);
@@ -234,6 +237,7 @@ internal sealed class NativeStartPage : UserControl
     }
 
     public event EventHandler<string>? NavigateRequested;
+    public event EventHandler<string>? OpenInNewTabRequested;
     public event EventHandler<StartPageAction>? ActionRequested;
     public event EventHandler<string>? SuggestionRequested;
     public event EventHandler<KeyEventArgs>? SearchKeyDown;
@@ -307,6 +311,10 @@ internal sealed class NativeStartPage : UserControl
         currentStatus = status;
         featureChips[0].SetText(status.ResourceMode);
         featureChips[1].SetText(status.Tabs);
+        if (!arranging && featureHost.Visible)
+        {
+            ArrangeFeatureChips();
+        }
     }
 
     public void SetQuickLinks(IEnumerable<StartPageLink> links)
@@ -333,20 +341,30 @@ internal sealed class NativeStartPage : UserControl
         var nextLinks = normalizedLinks.ToArray();
         if (QuickLinksMatch(currentQuickLinks, nextLinks)) return;
 
+        var countChanged = quickLinksHost.Controls.Count != nextLinks.Length;
         quickLinksHost.SuspendLayout();
         try
         {
-            while (quickLinksHost.Controls.Count > 0)
+            while (quickLinksHost.Controls.Count > nextLinks.Length)
             {
-                var control = quickLinksHost.Controls[0];
-                quickLinksHost.Controls.RemoveAt(0);
+                var lastIndex = quickLinksHost.Controls.Count - 1;
+                var control = quickLinksHost.Controls[lastIndex];
+                quickLinksHost.Controls.RemoveAt(lastIndex);
                 quickLinkToolTip.SetToolTip(control, string.Empty);
                 control.Dispose();
             }
 
             for (var index = 0; index < nextLinks.Length; index++)
             {
-                quickLinksHost.Controls.Add(CreateQuickLinkButton(nextLinks[index], index));
+                if (index < quickLinksHost.Controls.Count
+                    && quickLinksHost.Controls[index] is QuickLinkButton existing)
+                {
+                    ConfigureQuickLinkButton(existing, nextLinks[index], index);
+                }
+                else
+                {
+                    quickLinksHost.Controls.Add(CreateQuickLinkButton(nextLinks[index], index));
+                }
             }
 
             currentQuickLinks = nextLinks;
@@ -356,8 +374,10 @@ internal sealed class NativeStartPage : UserControl
             quickLinksHost.ResumeLayout(false);
         }
 
-        PerformLayout();
-        ArrangeQuickLinks();
+        if (countChanged)
+        {
+            PerformLayout();
+        }
         Invalidate();
     }
 
@@ -468,6 +488,18 @@ internal sealed class NativeStartPage : UserControl
         ApplySystemColorPalette();
     }
 
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg is WmPrint or WmPrintClient)
+        {
+            using var lease = StartPageArtwork.AcquireBackdropFrameLease();
+            base.WndProc(ref m);
+            return;
+        }
+
+        base.WndProc(ref m);
+    }
+
     protected override void OnLayout(LayoutEventArgs e)
     {
         base.OnLayout(e);
@@ -502,7 +534,7 @@ internal sealed class NativeStartPage : UserControl
             card.AutoScrollMinSize = new Size(contentWidth, desiredHeight);
             contentLayout.Bounds = new Rectangle(0, 0, contentWidth, desiredHeight);
             card.PerformLayout();
-            ArrangeFeatureChips();
+            if (featureHost.Visible) ArrangeFeatureChips();
             ArrangeQuickLinksHeader();
             ArrangeQuickLinks();
         }
@@ -564,22 +596,29 @@ internal sealed class NativeStartPage : UserControl
     {
         var button = new QuickLinkButton(link)
         {
-            Tag = link,
-            Cursor = Cursors.Hand,
-            TabIndex = index + 2,
-            AccessibleName = $"Open {link.Title}",
-            AccessibleDescription = FormatQuickLinkAccessibleDescription(link),
-            CornerRadius = ScaleLogical(14)
+            Cursor = Cursors.Hand
         };
         button.Click += QuickLinkClicked;
+        button.OpenInNewTabRequested += QuickLinkOpenInNewTab;
         button.ContextRequested += (_, args) => QuickLinkContextRequested?.Invoke(this, args);
+        ConfigureQuickLinkButton(button, link, index);
+        return button;
+    }
+
+    private void ConfigureQuickLinkButton(QuickLinkButton button, StartPageLink link, int index)
+    {
+        button.UpdateLink(link);
+        button.Tag = link;
+        button.TabIndex = index + 2;
+        button.AccessibleName = $"Open {link.Title}";
+        button.AccessibleDescription = FormatQuickLinkAccessibleDescription(link);
+        button.CornerRadius = ScaleLogical(14);
         var tooltipTitle = TextSafety.SanitizeSingleLine(link.Title, 96);
         if (tooltipTitle.Length == 0) tooltipTitle = "Quick link";
         var tooltipUrl = TextSafety.FormatUrlForDisplay(link.Url, 160);
         quickLinkToolTip.SetToolTip(
             button,
             tooltipUrl.Length > 0 ? $"{tooltipTitle} \u2014 {tooltipUrl}" : tooltipTitle);
-        return button;
     }
 
     internal static string FormatQuickLinkAccessibleDescription(StartPageLink link)
@@ -602,7 +641,24 @@ internal sealed class NativeStartPage : UserControl
     {
         if (sender is QuickLinkButton { Tag: StartPageLink link })
         {
+            if ((ModifierKeys & Keys.Control) != 0)
+            {
+                QuickLinkOpenInNewTab(sender, link.Url);
+                return;
+            }
             NavigateRequested?.Invoke(this, link.Url);
+        }
+    }
+
+    private void QuickLinkOpenInNewTab(object? sender, string url)
+    {
+        if (OpenInNewTabRequested is not null)
+        {
+            OpenInNewTabRequested.Invoke(this, url);
+        }
+        else
+        {
+            NavigateRequested?.Invoke(this, url);
         }
     }
 
@@ -648,10 +704,6 @@ internal sealed class NativeStartPage : UserControl
             ? SystemColors.WindowText
             : isPrivateModeActive ? Color.FromArgb(226, 185, 248) : SecondaryTextColor;
         quickLinksTitle.ForeColor = highContrast ? SystemColors.WindowText : FocusColor;
-        card.Invalidate(true);
-        foreach (var chip in featureChips) chip.Invalidate();
-        manageQuickLinksButton.Invalidate();
-        quickLinksHost.Invalidate(true);
         Invalidate(true);
     }
 
@@ -682,7 +734,8 @@ internal sealed class NativeStartPage : UserControl
         SetRowHeight(3, micro ? 48 : compact ? 58 : 66);
         SetRowHeight(4, micro ? 4 : compact ? 8 : 12);
         var contentWidth = Math.Max(1, cardWidth - contentLayout.Padding.Horizontal);
-        contentLayout.RowStyles[5].Height = 0;
+        var showFeatureBar = !micro && availableHeight >= ScaleLogical(420);
+        SetRowHeight(5, showFeatureBar ? 32 : 0);
 
         if (isPrivateModeActive)
         {
@@ -719,7 +772,13 @@ internal sealed class NativeStartPage : UserControl
             quickLinksHost.Visible = hasQuickLinks;
         }
 
-        featureHost.Visible = false;
+        featureHost.Visible = showFeatureBar;
+        featureHost.Enabled = showFeatureBar;
+        foreach (var chip in featureChips)
+        {
+            chip.Visible = showFeatureBar;
+            chip.TabStop = showFeatureBar;
+        }
     }
 
     private void SetRowHeight(int index, int logicalHeight)
@@ -741,32 +800,41 @@ internal sealed class NativeStartPage : UserControl
 
     private void ArrangeFeatureChips()
     {
-        if (featureHost.ClientSize.Width <= 0 || featureHost.ClientSize.Height <= 0) return;
+        if (!featureHost.Visible
+            || featureHost.ClientSize.Width <= 0
+            || featureHost.ClientSize.Height <= 0
+            || featureChips.Length == 0)
+        {
+            return;
+        }
 
-        var gap = ScaleLogical(compactLayout ? 8 : 12);
-        var columns = DetermineFeatureColumns(featureHost.ClientSize.Width);
-        var rows = (int)Math.Ceiling(featureChips.Length / (double)columns);
-        var width = Math.Max(1, (featureHost.ClientSize.Width - (gap * (columns - 1))) / columns);
-        var height = Math.Min(
-            ScaleLogical(compactLayout ? 58 : 70),
-            Math.Max(1, (featureHost.ClientSize.Height - (gap * (rows - 1))) / rows));
+        var availableWidth = featureHost.ClientSize.Width;
+        var availableHeight = featureHost.ClientSize.Height;
+        var gap = ScaleLogical(compactLayout ? 8 : 10);
+        var pillHeight = Math.Min(availableHeight, ScaleLogical(28));
+        var pillTop = Math.Max(0, (availableHeight - pillHeight) / 2);
+        var maxPillWidth = Math.Max(
+            1,
+            (availableWidth - (gap * Math.Max(0, featureChips.Length - 1))) / featureChips.Length);
+
+        var widths = new int[featureChips.Length];
+        var totalWidth = gap * Math.Max(0, featureChips.Length - 1);
         for (var index = 0; index < featureChips.Length; index++)
         {
-            var column = index % columns;
-            var row = index / columns;
-            featureChips[index].Bounds = new Rectangle(
-                column * (width + gap),
-                row * (height + gap),
-                width,
-                height);
+            var preferred = featureChips[index].MeasurePillWidth(pillHeight);
+            widths[index] = Math.Clamp(preferred, Math.Min(maxPillWidth, ScaleLogical(96)), maxPillWidth);
+            totalWidth += widths[index];
         }
-    }
 
-    private int DetermineFeatureColumns(int availableWidth)
-    {
-        if (availableWidth < ScaleLogical(430)) return 1;
-        if (availableWidth < ScaleLogical(660)) return 2;
-        return featureChips.Length;
+        var x = Math.Max(0, (availableWidth - totalWidth) / 2);
+        var radius = Math.Max(6, pillHeight / 2);
+        for (var index = 0; index < featureChips.Length; index++)
+        {
+            var chip = featureChips[index];
+            chip.CornerRadius = radius;
+            chip.Bounds = new Rectangle(x, pillTop, widths[index], pillHeight);
+            x += widths[index] + gap;
+        }
     }
 
     private void ArrangeQuickLinksHeader()
@@ -827,12 +895,13 @@ internal sealed class NativeStartPage : UserControl
         var count = quickLinksHost.Controls.Count;
         if (count == 0 || quickLinksHost.ClientSize.Width <= 0 || quickLinksHost.ClientSize.Height <= 0) return;
 
-        var gap = ScaleLogical(compactLayout ? 7 : 9);
+        var micro = ClientSize.Width < ScaleLogical(420) || ClientSize.Height < ScaleLogical(320);
+        var gap = ScaleLogical(micro ? 5 : compactLayout ? 6 : 8);
         var columns = DetermineQuickLinkColumns(count, quickLinksHost.ClientSize.Width);
         var width = Math.Max(1, (quickLinksHost.ClientSize.Width - (gap * (columns - 1))) / columns);
         var rows = (int)Math.Ceiling(count / (double)columns);
         var height = Math.Min(
-            ScaleLogical(compactLayout ? 58 : 68),
+            ScaleLogical(micro ? 48 : compactLayout ? 56 : 62),
             Math.Max(1, (quickLinksHost.ClientSize.Height - (gap * (rows - 1))) / rows));
 
         for (var index = 0; index < count; index++)
@@ -851,8 +920,9 @@ internal sealed class NativeStartPage : UserControl
     {
         if (count <= 1) return Math.Max(1, count);
         if (availableWidth < ScaleLogical(390)) return 1;
-        if (availableWidth < ScaleLogical(600)) return Math.Min(2, count);
-        return count <= 4 ? count : Math.Min(3, count);
+        if (availableWidth < ScaleLogical(560)) return Math.Min(2, count);
+        if (count == 4) return 2;
+        return Math.Min(3, count);
     }
 
     private int ScaleLogical(int logicalValue)
@@ -1040,6 +1110,12 @@ internal sealed class NativeStartPage : UserControl
                 && effectiveBorderColor.A == 0
                 && HighlightColor.A == 0)
             {
+                if (Controls.Count == 1
+                    && Controls[0].Visible
+                    && Controls[0].Bounds.Contains(e.ClipRectangle))
+                {
+                    return;
+                }
                 if (!PaintBackdropSlice(this, e)) base.OnPaintBackground(e);
                 return;
             }
@@ -1136,6 +1212,14 @@ internal sealed class NativeStartPage : UserControl
 
         protected override void OnPaintBackground(PaintEventArgs e)
         {
+            for (var index = 0; index < Controls.Count; index++)
+            {
+                var child = Controls[index];
+                if (child.Visible && child.Bounds.Contains(e.ClipRectangle))
+                {
+                    return;
+                }
+            }
             if (!PaintBackdropSlice(this, e)) base.OnPaintBackground(e);
         }
     }
@@ -1155,25 +1239,50 @@ internal sealed class NativeStartPage : UserControl
 
         protected override void OnPaintBackground(PaintEventArgs e)
         {
+            for (var index = 0; index < Controls.Count; index++)
+            {
+                var child = Controls[index];
+                if (child.Visible && child.Bounds.Contains(e.ClipRectangle))
+                {
+                    return;
+                }
+            }
             if (!PaintBackdropSlice(this, e)) base.OnPaintBackground(e);
         }
     }
 
     private sealed class QuickLinkButton : Control
     {
-        private readonly StartPageLink link;
-        private readonly SiteIconKind iconKind;
-        private readonly string monogram;
-        private readonly string detailText;
+        private const int MaximumCachedSiteIcons = 48;
+        private static readonly object SiteIconCacheSync = new();
+        private static readonly Dictionary<SiteIconCacheKey, Bitmap> SiteIconCache = new();
+        private static readonly LinkedList<SiteIconCacheKey> SiteIconLru = new();
+        private static readonly (Color Top, Color Bottom, Color Rim)[] GenericJewelPalettes =
+        [
+            (Color.FromArgb(238, 224, 78, 152), Color.FromArgb(242, 134, 62, 178), Color.FromArgb(185, 255, 198, 232)),
+            (Color.FromArgb(238, 156, 92, 232), Color.FromArgb(242, 92, 52, 176), Color.FromArgb(185, 222, 196, 255)),
+            (Color.FromArgb(238, 42, 168, 212), Color.FromArgb(242, 40, 98, 200), Color.FromArgb(185, 184, 234, 255)),
+            (Color.FromArgb(238, 36, 182, 122), Color.FromArgb(242, 20, 122, 108), Color.FromArgb(185, 178, 245, 216)),
+            (Color.FromArgb(238, 240, 136, 76), Color.FromArgb(242, 206, 68, 112), Color.FromArgb(185, 255, 214, 186))
+        ];
+
+        private StartPageLink link;
+        private SiteIconKind iconKind;
+        private string monogram;
+        private int hostHashBucket;
+        private string detailText;
         private bool hovered;
         private bool pressed;
+        private bool middlePressed;
 
         public QuickLinkButton(StartPageLink link)
         {
             this.link = link;
             iconKind = GetSiteIconKind(link.Url);
             monogram = GetMonogram(link.Title, link.Url);
-            detailText = $"{link.Category} \u00B7 {GetDisplayHost(link.Url)}";
+            var displayHost = GetDisplayHost(link.Url);
+            hostHashBucket = ComputeHostHashBucket(displayHost);
+            detailText = $"{link.Category} \u00B7 {displayHost}";
             SetStyle(
                 ControlStyles.AllPaintingInWmPaint
                 | ControlStyles.OptimizedDoubleBuffer
@@ -1190,6 +1299,19 @@ internal sealed class NativeStartPage : UserControl
 
         public int CornerRadius { get; set; } = 11;
         public event EventHandler<StartPageLinkContextEventArgs>? ContextRequested;
+        public event EventHandler<string>? OpenInNewTabRequested;
+
+        public void UpdateLink(StartPageLink nextLink)
+        {
+            if (link == nextLink) return;
+            link = nextLink;
+            iconKind = GetSiteIconKind(nextLink.Url);
+            monogram = GetMonogram(nextLink.Title, nextLink.Url);
+            var displayHost = GetDisplayHost(nextLink.Url);
+            hostHashBucket = ComputeHostHashBucket(displayHost);
+            detailText = $"{nextLink.Category} \u00B7 {displayHost}";
+            Invalidate();
+        }
 
         public void PerformClickForTesting()
         {
@@ -1207,6 +1329,7 @@ internal sealed class NativeStartPage : UserControl
         {
             hovered = false;
             pressed = false;
+            middlePressed = false;
             Invalidate();
             base.OnMouseLeave(e);
         }
@@ -1214,6 +1337,7 @@ internal sealed class NativeStartPage : UserControl
         protected override void OnMouseDown(MouseEventArgs e)
         {
             if (e.Button == MouseButtons.Left) pressed = true;
+            else if (e.Button == MouseButtons.Middle) middlePressed = true;
             Focus();
             Invalidate();
             base.OnMouseDown(e);
@@ -1221,9 +1345,15 @@ internal sealed class NativeStartPage : UserControl
 
         protected override void OnMouseUp(MouseEventArgs e)
         {
+            var wasMiddlePressed = middlePressed;
             pressed = false;
+            middlePressed = false;
             Invalidate();
-            if (e.Button == MouseButtons.Right)
+            if (e.Button == MouseButtons.Middle && wasMiddlePressed && ClientRectangle.Contains(e.Location))
+            {
+                OpenInNewTabRequested?.Invoke(this, link.Url);
+            }
+            else if (e.Button == MouseButtons.Right)
             {
                 ContextRequested?.Invoke(
                     this,
@@ -1244,6 +1374,7 @@ internal sealed class NativeStartPage : UserControl
         {
             base.OnLostFocus(e);
             pressed = false;
+            middlePressed = false;
             Invalidate();
         }
 
@@ -1251,7 +1382,8 @@ internal sealed class NativeStartPage : UserControl
         {
             if (e.KeyCode is Keys.Enter or Keys.Space)
             {
-                OnClick(EventArgs.Empty);
+                if (e.Control) OpenInNewTabRequested?.Invoke(this, link.Url);
+                else OnClick(EventArgs.Empty);
                 e.Handled = true;
                 e.SuppressKeyPress = true;
             }
@@ -1291,11 +1423,12 @@ internal sealed class NativeStartPage : UserControl
                 using var halo = new SolidBrush(Color.FromArgb(hovered ? 48 : 24, AccentColor));
                 e.Graphics.FillEllipse(halo, haloBounds);
             }
-            DrawSiteIcon(
+            DrawCachedSiteIcon(
                 e.Graphics,
                 badgeBounds,
                 iconKind,
                 monogram,
+                hostHashBucket,
                 scale);
 
             var textLeft = badgeBounds.Right + Math.Max(7, (int)Math.Round((dense ? 8 : 10) * scale));
@@ -1363,6 +1496,13 @@ internal sealed class NativeStartPage : UserControl
             return Math.Max(1, (value * DeviceDpi + 48) / 96);
         }
 
+        private readonly record struct SiteIconCacheKey(
+            SiteIconKind Kind,
+            string Monogram,
+            int HostHashBucket,
+            int BadgeSize,
+            bool HighContrast);
+
         private enum SiteIconKind
         {
             Generic,
@@ -1375,7 +1515,97 @@ internal sealed class NativeStartPage : UserControl
             Spotify,
             Twitch,
             X,
-            Anthropic
+            Anthropic,
+            GitHub,
+            ChatGpt,
+            Reddit,
+            Wikipedia,
+            LinkedIn,
+            Netflix
+        }
+
+        private static void DrawCachedSiteIcon(
+            Graphics graphics,
+            Rectangle bounds,
+            SiteIconKind kind,
+            string monogram,
+            int hostHashBucket,
+            float scale)
+        {
+            var badgeSize = Math.Max(1, Math.Min(bounds.Width, bounds.Height));
+            var highContrast = SystemInformation.HighContrast;
+            var key = new SiteIconCacheKey(
+                kind,
+                kind == SiteIconKind.Generic || highContrast ? monogram : string.Empty,
+                kind == SiteIconKind.Generic && !highContrast ? hostHashBucket : 0,
+                badgeSize,
+                highContrast);
+
+            lock (SiteIconCacheSync)
+            {
+                if (!SiteIconCache.TryGetValue(key, out var cached))
+                {
+                    cached = RenderSiteIconBitmap(key, scale, graphics.DpiX, graphics.DpiY);
+                    if (SiteIconCache.Count >= MaximumCachedSiteIcons && SiteIconLru.First is { } oldest)
+                    {
+                        SiteIconLru.RemoveFirst();
+                        if (SiteIconCache.Remove(oldest.Value, out var evicted))
+                        {
+                            evicted.Dispose();
+                        }
+                    }
+                    SiteIconCache[key] = cached;
+                    SiteIconLru.AddLast(key);
+                }
+                else if (Math.Abs(cached.HorizontalResolution - graphics.DpiX) > 0.5f
+                    || Math.Abs(cached.VerticalResolution - graphics.DpiY) > 0.5f)
+                {
+                    cached.SetResolution(graphics.DpiX, graphics.DpiY);
+                }
+
+                graphics.DrawImageUnscaled(cached, bounds.X, bounds.Y);
+            }
+        }
+
+        private static Bitmap RenderSiteIconBitmap(
+            SiteIconCacheKey key,
+            float scale,
+            float dpiX,
+            float dpiY)
+        {
+            var bitmap = new Bitmap(key.BadgeSize, key.BadgeSize, PixelFormat.Format32bppPArgb);
+            try
+            {
+                bitmap.SetResolution(Math.Max(48f, dpiX), Math.Max(48f, dpiY));
+                using var g = Graphics.FromImage(bitmap);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.CompositingQuality = CompositingQuality.HighQuality;
+                g.Clear(Color.Transparent);
+                var localBounds = new Rectangle(0, 0, key.BadgeSize - 1, key.BadgeSize - 1);
+                DrawSiteIcon(g, localBounds, key.Kind, key.Monogram, key.HostHashBucket, scale);
+                return bitmap;
+            }
+            catch
+            {
+                bitmap.Dispose();
+                throw;
+            }
+        }
+
+        private static int ComputeHostHashBucket(string host)
+        {
+            if (string.IsNullOrEmpty(host)) return 0;
+            unchecked
+            {
+                uint hash = 2166136261u;
+                for (var i = 0; i < host.Length; i++)
+                {
+                    hash ^= char.ToLowerInvariant(host[i]);
+                    hash *= 16777619u;
+                }
+                return (int)(hash % (uint)GenericJewelPalettes.Length);
+            }
         }
 
         private static void DrawSiteIcon(
@@ -1383,6 +1613,7 @@ internal sealed class NativeStartPage : UserControl
             Rectangle bounds,
             SiteIconKind kind,
             string monogram,
+            int hostHashBucket,
             float scale)
         {
             if (SystemInformation.HighContrast)
@@ -1434,17 +1665,34 @@ internal sealed class NativeStartPage : UserControl
                 case SiteIconKind.Anthropic:
                     DrawAnthropicIcon(graphics, bounds, scale);
                     return;
+                case SiteIconKind.GitHub:
+                    DrawGitHubIcon(graphics, bounds, scale);
+                    return;
+                case SiteIconKind.ChatGpt:
+                    DrawChatGptIcon(graphics, bounds, scale);
+                    return;
+                case SiteIconKind.Reddit:
+                    DrawRedditIcon(graphics, bounds, scale);
+                    return;
+                case SiteIconKind.Wikipedia:
+                    DrawWikipediaIcon(graphics, bounds, scale);
+                    return;
+                case SiteIconKind.LinkedIn:
+                    DrawLinkedInIcon(graphics, bounds, scale);
+                    return;
+                case SiteIconKind.Netflix:
+                    DrawNetflixIcon(graphics, bounds, scale);
+                    return;
             }
 
+            var jewel = GenericJewelPalettes[Math.Clamp(hostHashBucket, 0, GenericJewelPalettes.Length - 1)];
             using var path = NativeUiTheme.CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
             using var fill = new LinearGradientBrush(
                 bounds,
-                SystemInformation.HighContrast ? SystemColors.Highlight : Color.FromArgb(235, NativeUiTheme.Accent),
-                SystemInformation.HighContrast ? SystemColors.Highlight : Color.FromArgb(240, NativeUiTheme.Lavender),
+                jewel.Top,
+                jewel.Bottom,
                 LinearGradientMode.ForwardDiagonal);
-            using var border = new Pen(
-                SystemInformation.HighContrast ? SystemColors.WindowText : Color.FromArgb(180, NativeUiTheme.Focus),
-                Math.Max(1f, scale));
+            using var border = new Pen(jewel.Rim, Math.Max(1f, scale));
             graphics.FillPath(fill, path);
             graphics.DrawPath(border, path);
             TextRenderer.DrawText(
@@ -1452,7 +1700,7 @@ internal sealed class NativeStartPage : UserControl
                 monogram,
                 LinkMonogramFont,
                 bounds,
-                SystemInformation.HighContrast ? SystemColors.HighlightText : NativeUiTheme.AccentText,
+                NativeUiTheme.AccentText,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
         }
 
@@ -1663,6 +1911,225 @@ internal sealed class NativeStartPage : UserControl
             graphics.DrawLine(mark, bounds.Left + (bounds.Width * 0.39f), bounds.Top + (bounds.Height * 0.63f), bounds.Right - (bounds.Width * 0.39f), bounds.Top + (bounds.Height * 0.63f));
         }
 
+        private static void DrawGitHubIcon(Graphics graphics, Rectangle bounds, float scale)
+        {
+            using var path = NativeUiTheme.CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
+            using var fill = new LinearGradientBrush(
+                bounds,
+                Color.FromArgb(46, 52, 62),
+                Color.FromArgb(20, 24, 31),
+                LinearGradientMode.ForwardDiagonal);
+            using var border = new Pen(Color.FromArgb(170, 200, 210, 224), Math.Max(1f, scale));
+            graphics.FillPath(fill, path);
+            graphics.DrawPath(border, path);
+
+            using var white = new SolidBrush(Color.White);
+            var w = bounds.Width;
+            var h = bounds.Height;
+            var head = new RectangleF(bounds.Left + (w * 0.24f), bounds.Top + (h * 0.27f), w * 0.52f, h * 0.42f);
+            graphics.FillEllipse(white, head);
+            graphics.FillPolygon(
+                white,
+                [
+                    new PointF(bounds.Left + (w * 0.28f), bounds.Top + (h * 0.38f)),
+                    new PointF(bounds.Left + (w * 0.30f), bounds.Top + (h * 0.19f)),
+                    new PointF(bounds.Left + (w * 0.43f), bounds.Top + (h * 0.30f))
+                ]);
+            graphics.FillPolygon(
+                white,
+                [
+                    new PointF(bounds.Right - (w * 0.28f), bounds.Top + (h * 0.38f)),
+                    new PointF(bounds.Right - (w * 0.30f), bounds.Top + (h * 0.19f)),
+                    new PointF(bounds.Right - (w * 0.43f), bounds.Top + (h * 0.30f))
+                ]);
+            var shoulders = new RectangleF(bounds.Left + (w * 0.33f), bounds.Top + (h * 0.60f), w * 0.34f, h * 0.26f);
+            using var shoulderPath = NativeUiTheme.CreateRoundedPath(shoulders, w * 0.12f);
+            graphics.FillPath(white, shoulderPath);
+            using var tail = new Pen(Color.White, Math.Max(1.6f, 2f * scale))
+            {
+                StartCap = LineCap.Round,
+                EndCap = LineCap.Round
+            };
+            graphics.DrawArc(tail, bounds.Left + (w * 0.16f), bounds.Top + (h * 0.57f), w * 0.24f, h * 0.20f, 30f, 130f);
+        }
+
+        private static void DrawChatGptIcon(Graphics graphics, Rectangle bounds, float scale)
+        {
+            using var path = NativeUiTheme.CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
+            using var fill = new LinearGradientBrush(
+                bounds,
+                Color.FromArgb(25, 195, 125),
+                Color.FromArgb(14, 132, 88),
+                LinearGradientMode.ForwardDiagonal);
+            using var border = new Pen(Color.FromArgb(170, 180, 255, 224), Math.Max(1f, scale));
+            graphics.FillPath(fill, path);
+            graphics.DrawPath(border, path);
+
+            var cx = bounds.Left + (bounds.Width / 2f);
+            var cy = bounds.Top + (bounds.Height / 2f);
+            var orbit = bounds.Width * 0.17f;
+            var petalR = bounds.Width * 0.165f;
+            using var pen = new Pen(Color.White, Math.Max(1.4f, 1.8f * scale));
+            for (var i = 0; i < 6; i++)
+            {
+                var angle = (i * MathF.PI / 3f) - (MathF.PI / 6f);
+                var px = cx + (MathF.Cos(angle) * orbit);
+                var py = cy + (MathF.Sin(angle) * orbit);
+                graphics.DrawEllipse(pen, px - petalR, py - petalR, petalR * 2f, petalR * 2f);
+            }
+        }
+
+        private static void DrawRedditIcon(Graphics graphics, Rectangle bounds, float scale)
+        {
+            using var fill = new LinearGradientBrush(
+                bounds,
+                Color.FromArgb(255, 87, 34),
+                Color.FromArgb(217, 58, 0),
+                LinearGradientMode.ForwardDiagonal);
+            using var border = new Pen(Color.FromArgb(170, 255, 206, 188), Math.Max(1f, scale));
+            graphics.FillEllipse(fill, bounds);
+            graphics.DrawEllipse(border, bounds);
+
+            var w = bounds.Width;
+            var h = bounds.Height;
+            using var white = new SolidBrush(Color.White);
+            using var whitePen = new Pen(Color.White, Math.Max(1.4f, 1.7f * scale))
+            {
+                StartCap = LineCap.Round,
+                EndCap = LineCap.Round,
+                LineJoin = LineJoin.Round
+            };
+            // Antenna
+            graphics.DrawLines(
+                whitePen,
+                [
+                    new PointF(bounds.Left + (w * 0.50f), bounds.Top + (h * 0.39f)),
+                    new PointF(bounds.Left + (w * 0.57f), bounds.Top + (h * 0.21f)),
+                    new PointF(bounds.Left + (w * 0.72f), bounds.Top + (h * 0.25f))
+                ]);
+            var tipSize = w * 0.12f;
+            graphics.FillEllipse(white, bounds.Left + (w * 0.70f), bounds.Top + (h * 0.20f), tipSize, tipSize);
+            // Ears
+            var earSize = w * 0.16f;
+            graphics.FillEllipse(white, bounds.Left + (w * 0.17f), bounds.Top + (h * 0.45f), earSize, earSize);
+            graphics.FillEllipse(white, bounds.Right - (w * 0.17f) - earSize, bounds.Top + (h * 0.45f), earSize, earSize);
+            // Head
+            var face = new RectangleF(bounds.Left + (w * 0.23f), bounds.Top + (h * 0.39f), w * 0.54f, h * 0.37f);
+            graphics.FillEllipse(white, face);
+            // Eyes
+            using var eyeBrush = new SolidBrush(Color.FromArgb(232, 68, 12));
+            var eyeSize = Math.Max(2.2f, w * 0.105f);
+            graphics.FillEllipse(eyeBrush, face.Left + (face.Width * 0.23f), face.Top + (face.Height * 0.34f), eyeSize, eyeSize);
+            graphics.FillEllipse(eyeBrush, face.Right - (face.Width * 0.23f) - eyeSize, face.Top + (face.Height * 0.34f), eyeSize, eyeSize);
+        }
+
+        private static void DrawWikipediaIcon(Graphics graphics, Rectangle bounds, float scale)
+        {
+            using var fill = new LinearGradientBrush(
+                bounds,
+                Color.FromArgb(245, 247, 250),
+                Color.FromArgb(203, 211, 223),
+                LinearGradientMode.ForwardDiagonal);
+            using var border = new Pen(Color.FromArgb(180, 255, 255, 255), Math.Max(1f, scale));
+            graphics.FillEllipse(fill, bounds);
+            graphics.DrawEllipse(border, bounds);
+
+            var w = bounds.Width;
+            var h = bounds.Height;
+            using var pen = new Pen(Color.FromArgb(32, 36, 44), Math.Max(1.6f, 2f * scale))
+            {
+                StartCap = LineCap.Round,
+                EndCap = LineCap.Round,
+                LineJoin = LineJoin.Round
+            };
+            var topY = bounds.Top + (h * 0.31f);
+            var botY = bounds.Top + (h * 0.71f);
+            graphics.DrawLines(
+                pen,
+                [
+                    new PointF(bounds.Left + (w * 0.21f), topY),
+                    new PointF(bounds.Left + (w * 0.35f), botY),
+                    new PointF(bounds.Left + (w * 0.51f), topY + (h * 0.04f))
+                ]);
+            graphics.DrawLines(
+                pen,
+                [
+                    new PointF(bounds.Left + (w * 0.49f), topY + (h * 0.04f)),
+                    new PointF(bounds.Left + (w * 0.65f), botY),
+                    new PointF(bounds.Left + (w * 0.79f), topY)
+                ]);
+        }
+
+        private static void DrawLinkedInIcon(Graphics graphics, Rectangle bounds, float scale)
+        {
+            using var path = NativeUiTheme.CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
+            using var fill = new LinearGradientBrush(
+                bounds,
+                Color.FromArgb(14, 118, 212),
+                Color.FromArgb(0, 65, 130),
+                LinearGradientMode.ForwardDiagonal);
+            using var border = new Pen(Color.FromArgb(165, 180, 224, 255), Math.Max(1f, scale));
+            graphics.FillPath(fill, path);
+            graphics.DrawPath(border, path);
+
+            var w = bounds.Width;
+            var h = bounds.Height;
+            var stroke = Math.Max(2.2f, 2.7f * scale);
+            using var whiteBrush = new SolidBrush(Color.White);
+            using var whitePen = new Pen(Color.White, stroke)
+            {
+                StartCap = LineCap.Round,
+                EndCap = LineCap.Round,
+                LineJoin = LineJoin.Round
+            };
+            // "i" dot and stem
+            var dotSize = Math.Max(2.8f, w * 0.115f);
+            var iX = bounds.Left + (w * 0.30f);
+            graphics.FillEllipse(whiteBrush, iX - (dotSize / 2f), bounds.Top + (h * 0.25f), dotSize, dotSize);
+            graphics.DrawLine(whitePen, iX, bounds.Top + (h * 0.44f), iX, bounds.Top + (h * 0.73f));
+            // "n" stem and arch
+            var nLeft = bounds.Left + (w * 0.47f);
+            var nRight = bounds.Left + (w * 0.72f);
+            var nTop = bounds.Top + (h * 0.44f);
+            var nBot = bounds.Top + (h * 0.73f);
+            graphics.DrawLine(whitePen, nLeft, nTop, nLeft, nBot);
+            graphics.DrawArc(whitePen, nLeft, nTop - (h * 0.02f), nRight - nLeft, h * 0.24f, 180f, 180f);
+            graphics.DrawLine(whitePen, nRight, nTop + (h * 0.10f), nRight, nBot);
+        }
+
+        private static void DrawNetflixIcon(Graphics graphics, Rectangle bounds, float scale)
+        {
+            using var path = NativeUiTheme.CreateRoundedPath(bounds, Math.Max(8f, 11f * scale));
+            using var fill = new LinearGradientBrush(
+                bounds,
+                Color.FromArgb(26, 26, 32),
+                Color.FromArgb(10, 10, 14),
+                LinearGradientMode.ForwardDiagonal);
+            using var border = new Pen(Color.FromArgb(165, 240, 110, 120), Math.Max(1f, scale));
+            graphics.FillPath(fill, path);
+            graphics.DrawPath(border, path);
+
+            var w = bounds.Width;
+            var h = bounds.Height;
+            var barW = Math.Max(3.2f, w * 0.145f);
+            var leftX = bounds.Left + (w * 0.26f);
+            var rightX = bounds.Right - (w * 0.26f) - barW;
+            var topY = bounds.Top + (h * 0.20f);
+            var botY = bounds.Bottom - (h * 0.20f);
+            using var darkRed = new SolidBrush(Color.FromArgb(178, 7, 16));
+            using var brightRed = new SolidBrush(Color.FromArgb(229, 9, 20));
+            graphics.FillRectangle(darkRed, leftX, topY, barW, botY - topY);
+            graphics.FillRectangle(darkRed, rightX, topY, barW, botY - topY);
+            graphics.FillPolygon(
+                brightRed,
+                [
+                    new PointF(leftX, topY),
+                    new PointF(leftX + barW, topY),
+                    new PointF(rightX + barW, botY),
+                    new PointF(rightX, botY)
+                ]);
+        }
+
         private static SiteIconKind GetSiteIconKind(string url)
         {
             if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) return SiteIconKind.Generic;
@@ -1678,7 +2145,13 @@ internal sealed class NativeStartPage : UserControl
             if (IsHostOrSubdomain(host, "spotify.com")) return SiteIconKind.Spotify;
             if (IsHostOrSubdomain(host, "twitch.tv")) return SiteIconKind.Twitch;
             if (IsHostOrSubdomain(host, "x.com") || IsHostOrSubdomain(host, "twitter.com")) return SiteIconKind.X;
-            if (IsHostOrSubdomain(host, "anthropic.com")) return SiteIconKind.Anthropic;
+            if (IsHostOrSubdomain(host, "anthropic.com") || IsHostOrSubdomain(host, "claude.ai")) return SiteIconKind.Anthropic;
+            if (IsHostOrSubdomain(host, "github.com")) return SiteIconKind.GitHub;
+            if (IsHostOrSubdomain(host, "chatgpt.com") || IsHostOrSubdomain(host, "openai.com")) return SiteIconKind.ChatGpt;
+            if (IsHostOrSubdomain(host, "reddit.com")) return SiteIconKind.Reddit;
+            if (IsHostOrSubdomain(host, "wikipedia.org")) return SiteIconKind.Wikipedia;
+            if (IsHostOrSubdomain(host, "linkedin.com")) return SiteIconKind.LinkedIn;
+            if (IsHostOrSubdomain(host, "netflix.com")) return SiteIconKind.Netflix;
             return SiteIconKind.Generic;
         }
 
@@ -1750,6 +2223,20 @@ internal sealed class NativeStartPage : UserControl
             Invalidate();
         }
 
+        public int MeasurePillWidth(int pillHeight)
+        {
+            var scale = Math.Max(1f, DeviceDpi / 96f);
+            var iconSize = Math.Max(14, Math.Min(pillHeight - ScalePixels(8), (int)Math.Round(18f * scale)));
+            var padX = Math.Max(8, (int)Math.Round(11f * scale));
+            var gap = Math.Max(5, (int)Math.Round(6f * scale));
+            var measured = TextRenderer.MeasureText(
+                detail,
+                FeatureDetailFont,
+                Size.Empty,
+                TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+            return (padX * 2) + iconSize + gap + measured.Width + ScalePixels(4);
+        }
+
         public void PerformClickForTesting()
         {
             OnClick(EventArgs.Empty);
@@ -1818,23 +2305,59 @@ internal sealed class NativeStartPage : UserControl
         {
             var highContrastSelection = SystemInformation.HighContrast && (pressed || hovered || Focused);
             var cardBounds = new RectangleF(0.5f, 0.5f, Math.Max(1, Width - 1f), Math.Max(1, Height - 1f));
-            PaintLiquidGlassCard(e.Graphics, cardBounds, CornerRadius, hovered, pressed, Focused);
+            var pillMode = Height <= ScalePixels(42);
+            var radius = pillMode ? Math.Max(6f, (Height - 1f) / 2f) : CornerRadius;
+            PaintLiquidGlassCard(e.Graphics, cardBounds, radius, hovered, pressed, Focused);
 
             var scale = Math.Max(1f, DeviceDpi / 96f);
+            if (pillMode)
+            {
+                var iconSize = Math.Max(14, Math.Min(Height - ScalePixels(8), (int)Math.Round(18f * scale)));
+                var padLeft = Math.Max(8, (int)Math.Round(10f * scale));
+                var iconBounds = new Rectangle(padLeft, Math.Max(1, (Height - iconSize) / 2), iconSize, iconSize);
+                StartPageArtwork.DrawFeatureIcon(
+                    e.Graphics,
+                    iconBounds,
+                    Action,
+                    hovered || Focused);
+
+                var textLeft = iconBounds.Right + Math.Max(5, (int)Math.Round(6f * scale));
+                var textBounds = new Rectangle(
+                    textLeft,
+                    0,
+                    Math.Max(1, Width - textLeft - padLeft),
+                    Height);
+                TextRenderer.DrawText(
+                    e.Graphics,
+                    detail,
+                    FeatureDetailFont,
+                    textBounds,
+                    SystemInformation.HighContrast
+                        ? highContrastSelection ? SystemColors.HighlightText : SystemColors.WindowText
+                        : hovered || Focused ? PrimaryTextColor : SecondaryTextColor,
+                    TextFormatFlags.Left
+                    | TextFormatFlags.VerticalCenter
+                    | TextFormatFlags.EndEllipsis
+                    | TextFormatFlags.NoPadding
+                    | TextFormatFlags.NoPrefix
+                    | TextFormatFlags.SingleLine);
+                return;
+            }
+
             var dense = Height < ScalePixels(64);
-            var iconSize = Math.Max(30, (int)Math.Round((dense ? 36 : 44) * scale));
+            var fullIconSize = Math.Max(30, (int)Math.Round((dense ? 36 : 44) * scale));
             var iconLeft = Math.Max(8, (int)Math.Round((dense ? 9 : 12) * scale));
-            var iconBounds = new Rectangle(iconLeft, Math.Max(1, (Height - iconSize) / 2), iconSize, iconSize);
+            var fullIconBounds = new Rectangle(iconLeft, Math.Max(1, (Height - fullIconSize) / 2), fullIconSize, fullIconSize);
             StartPageArtwork.DrawFeatureIcon(
                 e.Graphics,
-                iconBounds,
+                fullIconBounds,
                 Action,
                 hovered || Focused);
 
-            var textLeft = iconBounds.Right + Math.Max(7, (int)Math.Round((dense ? 8 : 11) * scale));
-            var textWidth = Math.Max(1, Width - textLeft - iconLeft);
-            var headingBounds = new Rectangle(textLeft, Math.Max(2, Height / 2 - ScalePixels(18)), textWidth, ScalePixels(18));
-            var detailBounds = new Rectangle(textLeft, Height / 2 + ScalePixels(1), textWidth, ScalePixels(17));
+            var fullTextLeft = fullIconBounds.Right + Math.Max(7, (int)Math.Round((dense ? 8 : 11) * scale));
+            var textWidth = Math.Max(1, Width - fullTextLeft - iconLeft);
+            var headingBounds = new Rectangle(fullTextLeft, Math.Max(2, Height / 2 - ScalePixels(18)), textWidth, ScalePixels(18));
+            var detailBounds = new Rectangle(fullTextLeft, Height / 2 + ScalePixels(1), textWidth, ScalePixels(17));
             TextRenderer.DrawText(
                 e.Graphics,
                 heading,
@@ -1873,6 +2396,10 @@ internal sealed class NativeStartPage : UserControl
 
     private sealed class BrandTitleLabel : Label
     {
+        private string? cachedMeasureText;
+        private int cachedMeasureDpi;
+        private Size cachedMeasureSize;
+
         public bool IsPrivateMode { get; set; }
 
         public BrandTitleLabel()
@@ -1906,13 +2433,25 @@ internal sealed class NativeStartPage : UserControl
             if (!SystemInformation.HighContrast && !IsPrivateMode && ClientSize.Width > 40 && ClientSize.Height > 16)
             {
                 e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                var scale = Math.Max(1f, DeviceDpi / 96f);
-                var measured = TextRenderer.MeasureText(
-                    e.Graphics,
-                    text,
-                    Font,
-                    ClientSize,
-                    TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+                var dpi = Math.Max(96, DeviceDpi);
+                var scale = dpi / 96f;
+                Size measured;
+                if (cachedMeasureDpi == dpi && string.Equals(cachedMeasureText, text, StringComparison.Ordinal))
+                {
+                    measured = cachedMeasureSize;
+                }
+                else
+                {
+                    measured = TextRenderer.MeasureText(
+                        e.Graphics,
+                        text,
+                        Font,
+                        ClientSize,
+                        TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+                    cachedMeasureText = text;
+                    cachedMeasureDpi = dpi;
+                    cachedMeasureSize = measured;
+                }
                 var glowWidth = Math.Min(ClientSize.Width, Math.Max(80f, measured.Width + (38f * scale)));
                 var glowHeight = Math.Max(16f, ClientSize.Height * 0.78f);
                 var glowRect = new RectangleF(

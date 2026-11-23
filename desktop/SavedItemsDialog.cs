@@ -56,6 +56,7 @@ internal sealed class SavedItemsDialog : Form
     private readonly Button moveDownButton = new();
     private readonly Button closeButton = new();
     private IReadOnlyList<SavedItemRow> visibleItems = [];
+    private ModernListRowVisual[] rowVisuals = [];
 
     public SavedItemsDialog(Func<SavedItemsView, IReadOnlyList<SavedItemRow>> itemProvider)
     {
@@ -76,11 +77,10 @@ internal sealed class SavedItemsDialog : Form
         {
             Dock = DockStyle.Fill,
             Padding = new Padding(14),
-            ColumnCount = 2,
+            ColumnCount = 1,
             RowCount = 4
         };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        root.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 118));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
@@ -107,7 +107,6 @@ internal sealed class SavedItemsDialog : Form
         filterLayout.Controls.Add(viewPicker, 0, 0);
         filterLayout.Controls.Add(filterBox, 1, 0);
         root.Controls.Add(filterLayout, 0, 0);
-        root.SetColumnSpan(filterLayout, 2);
 
         itemList.Dock = DockStyle.Fill;
         itemList.IntegralHeight = false;
@@ -121,7 +120,6 @@ internal sealed class SavedItemsDialog : Form
             else if (e.KeyCode == Keys.Delete) RaiseAction(SavedItemActionKind.Remove);
         };
         root.Controls.Add(itemList, 0, 1);
-        root.SetColumnSpan(itemList, 2);
 
         emptyLabel.Dock = DockStyle.Fill;
         emptyLabel.TextAlign = ContentAlignment.MiddleLeft;
@@ -130,7 +128,6 @@ internal sealed class SavedItemsDialog : Form
         emptyLabel.Visible = false;
         emptyLabel.AccessibleRole = AccessibleRole.StatusBar;
         root.Controls.Add(emptyLabel, 0, 2);
-        root.SetColumnSpan(emptyLabel, 2);
 
         var actions = NativeDialogLayout.CreateActionBar(wrap: true);
         ConfigureButton(openButton, "Open", "Open the selected saved item");
@@ -148,13 +145,14 @@ internal sealed class SavedItemsDialog : Form
         actions.Controls.Add(moveDownButton);
         actions.Controls.Add(moveUpButton);
         root.Controls.Add(actions, 0, 3);
-        root.SetColumnSpan(actions, 2);
         Controls.Add(root);
         NativeUiTheme.Apply(this, openButton);
         NativeUiTheme.ConfigureModernListBox(
             itemList,
             50,
-            (index, _) => BuildRowVisual(index));
+            (index, _) => index >= 0 && index < rowVisuals.Length
+                ? rowVisuals[index]
+                : new ModernListRowVisual(string.Empty, string.Empty, string.Empty));
         emptyLabel.ForeColor = NativeUiTheme.MutedText;
         SystemColorsChanged += (_, _) => emptyLabel.ForeColor = NativeUiTheme.MutedText;
 
@@ -178,22 +176,49 @@ internal sealed class SavedItemsDialog : Form
 
     public void RefreshItems()
     {
+        var previousSelected = TryGetSelected(out var selectedRow) ? selectedRow : null;
+        var previousIndex = itemList.SelectedIndex;
+        var currentView = SelectedView;
         var query = filterBox.Text.Trim();
-        visibleItems = itemProvider(SelectedView)
+        visibleItems = itemProvider(currentView)
             .Where(item => query.Length == 0
                 || item.Title.Contains(query, StringComparison.OrdinalIgnoreCase)
                 || item.Url.Contains(query, StringComparison.OrdinalIgnoreCase)
                 || item.Detail.Contains(query, StringComparison.OrdinalIgnoreCase))
             .ToArray();
 
+        var (glyph, accent) = currentView switch
+        {
+            SavedItemsView.Favorites => ("*", NativeUiTheme.BrandCoral),
+            SavedItemsView.History => ("H", NativeUiTheme.Lavender),
+            SavedItemsView.QuickLinks => ("Q", NativeUiTheme.Accent),
+            _ => ("R", NativeUiTheme.Focus)
+        };
+        var visuals = visibleItems.Count == 0 ? [] : new ModernListRowVisual[visibleItems.Count];
+
         itemList.BeginUpdate();
         try
         {
             itemList.Items.Clear();
-            foreach (var item in visibleItems)
+            for (var index = 0; index < visibleItems.Count; index++)
             {
+                var item = visibleItems[index];
+                var title = TextSafety.SanitizeSingleLine(item.Title, MaximumDisplayTitleCharacters);
+                var detail = TextSafety.SanitizeSingleLine(item.Detail, MaximumDisplayDetailCharacters);
+                var displayUrl = TextSafety.FormatUrlForDisplay(item.Url, MaximumDisplayUrlCharacters);
+                var combinedDetail = string.IsNullOrWhiteSpace(detail)
+                    ? displayUrl
+                    : $"{detail} \u00B7 {displayUrl}";
+                visuals[index] = new ModernListRowVisual(
+                    title,
+                    combinedDetail,
+                    glyph,
+                    accent,
+                    StatusText: item.IsPinned ? "Pinned" : null,
+                    StatusColor: NativeUiTheme.Accent);
                 itemList.Items.Add(FormatRowForDisplay(item));
             }
+            rowVisuals = visuals;
         }
         finally
         {
@@ -202,7 +227,37 @@ internal sealed class SavedItemsDialog : Form
 
         emptyLabel.Visible = visibleItems.Count == 0;
         itemList.Visible = visibleItems.Count > 0;
-        if (visibleItems.Count > 0) itemList.SelectedIndex = 0;
+        if (visibleItems.Count > 0)
+        {
+            var restoredIndex = -1;
+            if (previousSelected is not null)
+            {
+                if (previousSelected.Token is not null)
+                {
+                    for (var index = 0; index < visibleItems.Count; index++)
+                    {
+                        if (!Equals(visibleItems[index].Token, previousSelected.Token)) continue;
+                        restoredIndex = index;
+                        break;
+                    }
+                }
+                if (restoredIndex < 0 && !string.IsNullOrEmpty(previousSelected.Url))
+                {
+                    for (var index = 0; index < visibleItems.Count; index++)
+                    {
+                        if (!BrowserPolicy.UrlEquals(visibleItems[index].Url, previousSelected.Url)) continue;
+                        restoredIndex = index;
+                        break;
+                    }
+                }
+            }
+
+            itemList.SelectedIndex = restoredIndex >= 0
+                ? restoredIndex
+                : previousIndex >= 0
+                    ? Math.Clamp(previousIndex, 0, visibleItems.Count - 1)
+                    : 0;
+        }
         UpdateButtons();
     }
 
@@ -216,36 +271,6 @@ internal sealed class SavedItemsDialog : Form
         return TextSafety.TruncateWithEllipsis(
             $"{title} \u2014 {detail}{pin} \u2014 {displayUrl}",
             MaximumDisplayRowCharacters);
-    }
-
-    private ModernListRowVisual BuildRowVisual(int index)
-    {
-        if (index < 0 || index >= visibleItems.Count)
-        {
-            return new ModernListRowVisual(string.Empty, string.Empty, string.Empty);
-        }
-
-        var item = visibleItems[index];
-        var title = TextSafety.SanitizeSingleLine(item.Title, MaximumDisplayTitleCharacters);
-        var detail = TextSafety.SanitizeSingleLine(item.Detail, MaximumDisplayDetailCharacters);
-        var displayUrl = TextSafety.FormatUrlForDisplay(item.Url, MaximumDisplayUrlCharacters);
-        var combinedDetail = string.IsNullOrWhiteSpace(detail)
-            ? displayUrl
-            : $"{detail} \u00B7 {displayUrl}";
-        var (glyph, accent) = SelectedView switch
-        {
-            SavedItemsView.Favorites => ("*", NativeUiTheme.BrandCoral),
-            SavedItemsView.History => ("H", NativeUiTheme.Lavender),
-            SavedItemsView.QuickLinks => ("Q", NativeUiTheme.Accent),
-            _ => ("R", NativeUiTheme.Focus)
-        };
-        return new ModernListRowVisual(
-            title,
-            combinedDetail,
-            glyph,
-            accent,
-            StatusText: item.IsPinned ? "Pinned" : null,
-            StatusColor: NativeUiTheme.Accent);
     }
 
     private void ConfigureButton(Button button, string text, string description)
@@ -283,8 +308,7 @@ internal sealed class SavedItemsDialog : Form
         var hasSelection = itemList.SelectedIndex >= 0 && itemList.SelectedIndex < visibleItems.Count;
         openButton.Enabled = hasSelection;
         renameButton.Enabled = hasSelection
-            && SelectedView is not SavedItemsView.QuickLinks
-            and not SavedItemsView.RecentlyClosed;
+            && SelectedView is not SavedItemsView.RecentlyClosed;
         removeButton.Enabled = hasSelection;
         pinButton.Enabled = hasSelection
             && SelectedView is not SavedItemsView.RecentlyClosed;
@@ -311,8 +335,8 @@ internal static class TextPromptDialog
         {
             Text = title,
             StartPosition = FormStartPosition.CenterParent,
-            ClientSize = new Size(420, 150),
-            MinimumSize = new Size(360, 180),
+            ClientSize = new Size(420, 144),
+            MinimumSize = new Size(360, 144),
             MinimizeBox = false,
             MaximizeBox = false,
             ShowInTaskbar = false,

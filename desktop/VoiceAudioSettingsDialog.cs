@@ -20,6 +20,14 @@ internal sealed class VoiceAudioSettingsDialog : Form
     private readonly string? currentHost;
     private readonly Action<VoiceAudioSettingsResult> saveCallback;
 
+    // Saved baseline for dirty-state tracking
+    private AudioOutputPolicy savedAudioOutputPolicy;
+    private string[] savedAllowedAudioHosts;
+    private string[] savedMutedHosts;
+    private AudioInputPolicy savedAudioInputPolicy;
+    private string[] savedAllowedMicrophoneHosts;
+    private string[] savedBlockedMicrophoneHosts;
+
     // Working copies of state
     private AudioOutputPolicy workingAudioOutputPolicy;
     private readonly List<string> workingAllowedAudioHosts;
@@ -28,6 +36,7 @@ internal sealed class VoiceAudioSettingsDialog : Form
     private AudioInputPolicy workingAudioInputPolicy;
     private readonly List<string> workingAllowedMicrophoneHosts;
     private readonly List<string> workingBlockedMicrophoneHosts;
+    private ModernListRowVisual[] hostRowVisuals = [];
     private bool updatingControls;
 
     // UI Controls
@@ -43,6 +52,7 @@ internal sealed class VoiceAudioSettingsDialog : Form
     private readonly Label listLabel = new();
     private readonly ComboBox listTypePicker = new();
     private readonly ListBox siteListBox = new();
+    private readonly Label emptyListLabel = new();
     private readonly Button addSiteButton = new();
     private readonly Button removeSiteButton = new();
     private readonly Button addCurrentSiteButton = new();
@@ -72,6 +82,13 @@ internal sealed class VoiceAudioSettingsDialog : Form
         workingAudioInputPolicy = state.AudioInputPolicy;
         workingAllowedMicrophoneHosts = new List<string>(state.AllowedMicrophoneHosts ?? []);
         workingBlockedMicrophoneHosts = new List<string>(state.BlockedMicrophoneHosts ?? []);
+
+        savedAudioOutputPolicy = workingAudioOutputPolicy;
+        savedAllowedAudioHosts = workingAllowedAudioHosts.ToArray();
+        savedMutedHosts = workingMutedHosts.ToArray();
+        savedAudioInputPolicy = workingAudioInputPolicy;
+        savedAllowedMicrophoneHosts = workingAllowedMicrophoneHosts.ToArray();
+        savedBlockedMicrophoneHosts = workingBlockedMicrophoneHosts.ToArray();
 
         NativeDialogLayout.EnableDpiScaling(this);
         Text = "Voice and audio settings";
@@ -175,7 +192,9 @@ internal sealed class VoiceAudioSettingsDialog : Form
             Margin = Padding.Empty
         };
         listAndButtons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        listAndButtons.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+        listAndButtons.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 162));
+
+        var siteListHost = new Panel { Dock = DockStyle.Fill, Margin = Padding.Empty };
         siteListBox.Dock = DockStyle.Fill;
         siteListBox.IntegralHeight = false;
         siteListBox.Font = SiteListFont;
@@ -190,26 +209,42 @@ internal sealed class VoiceAudioSettingsDialog : Form
                 e.SuppressKeyPress = true;
             }
         };
-        listAndButtons.Controls.Add(siteListBox, 0, 0);
+        emptyListLabel.Dock = DockStyle.Fill;
+        emptyListLabel.TextAlign = ContentAlignment.MiddleCenter;
+        emptyListLabel.Font = ExplanationFont;
+        emptyListLabel.Text = "No sites in this list yet. Use \"Add site\u2026\" to add a host.";
+        emptyListLabel.Visible = false;
+        emptyListLabel.AccessibleRole = AccessibleRole.StatusBar;
+        siteListHost.Controls.Add(siteListBox);
+        siteListHost.Controls.Add(emptyListLabel);
+        listAndButtons.Controls.Add(siteListHost, 0, 0);
 
-        var sideButtons = new FlowLayoutPanel
+        var sideButtons = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            FlowDirection = FlowDirection.TopDown,
-            WrapContents = false,
-            Margin = Padding.Empty
+            ColumnCount = 1,
+            RowCount = 5,
+            Margin = new Padding(8, 0, 0, 0),
+            Padding = Padding.Empty
         };
-        NativeDialogLayout.ConfigureButton(addSiteButton, "Add site…", "Add a website host to this list");
-        NativeDialogLayout.ConfigureButton(removeSiteButton, "Remove", "Remove selected website host");
-        NativeDialogLayout.ConfigureButton(addCurrentSiteButton, "Add current site", "Add the current tab's host to this list");
-        NativeDialogLayout.ConfigureButton(clearListButton, "Clear list", "Remove all hosts from this list");
+        sideButtons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        for (var i = 0; i < 4; i++) sideButtons.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+        sideButtons.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        ConfigureSideButton(addSiteButton, "Add site\u2026", "Add a website host to this list");
+        ConfigureSideButton(removeSiteButton, "Remove", "Remove selected website host");
+        ConfigureSideButton(addCurrentSiteButton, "Add current site", "Add the current tab's host to this list");
+        ConfigureSideButton(clearListButton, "Clear list", "Remove all hosts from this list");
 
         addSiteButton.Click += (_, _) => OnAddSite();
         removeSiteButton.Click += (_, _) => OnRemoveSite();
         addCurrentSiteButton.Click += (_, _) => OnAddCurrentSite();
         clearListButton.Click += (_, _) => OnClearList();
 
-        sideButtons.Controls.AddRange([addSiteButton, removeSiteButton, addCurrentSiteButton, clearListButton]);
+        sideButtons.Controls.Add(addSiteButton, 0, 0);
+        sideButtons.Controls.Add(removeSiteButton, 0, 1);
+        sideButtons.Controls.Add(addCurrentSiteButton, 0, 2);
+        sideButtons.Controls.Add(clearListButton, 0, 3);
         listAndButtons.Controls.Add(sideButtons, 1, 0);
         root.Controls.Add(listAndButtons, 0, 5);
 
@@ -238,9 +273,16 @@ internal sealed class VoiceAudioSettingsDialog : Form
         NativeUiTheme.ConfigureModernListBox(
             siteListBox,
             46,
-            (index, _) => BuildHostRowVisual(index));
+            (index, _) => index >= 0 && index < hostRowVisuals.Length
+                ? hostRowVisuals[index]
+                : new ModernListRowVisual(string.Empty, string.Empty, string.Empty));
         sectionDescription.ForeColor = NativeUiTheme.MutedText;
-        SystemColorsChanged += (_, _) => sectionDescription.ForeColor = NativeUiTheme.MutedText;
+        emptyListLabel.ForeColor = NativeUiTheme.MutedText;
+        SystemColorsChanged += (_, _) =>
+        {
+            sectionDescription.ForeColor = NativeUiTheme.MutedText;
+            emptyListLabel.ForeColor = NativeUiTheme.MutedText;
+        };
 
         OnSectionChanged();
         UpdateButtonStates();
@@ -371,16 +413,61 @@ internal sealed class VoiceAudioSettingsDialog : Form
         }
     }
 
+    private static void ConfigureSideButton(Button button, string text, string description)
+    {
+        button.Dock = DockStyle.Fill;
+        button.AutoSize = false;
+        button.AutoEllipsis = true;
+        button.MinimumSize = new Size(140, 30);
+        button.Margin = new Padding(0, 0, 0, 6);
+        button.Padding = new Padding(6, 0, 6, 0);
+        button.Text = text;
+        button.AccessibleName = text;
+        button.AccessibleDescription = description;
+    }
+
     private void PopulateSiteList()
     {
         var activeList = GetActiveHostList();
+        var isAllowedList = listTypePicker.SelectedIndex == 0;
+        var statusColor = isAllowedList ? NativeUiTheme.Positive : NativeUiTheme.Negative;
+        var statusText = isAllowedList
+            ? "Allowed"
+            : IsAudioOutputSection ? "Muted" : "Blocked";
+        var detail = IsAudioOutputSection
+            ? (isAllowedList ? "Sound output allowed" : "Sound output suppressed")
+            : (isAllowedList ? "Microphone access allowed" : "Microphone access blocked");
+        var visuals = activeList.Count == 0 ? [] : new ModernListRowVisual[activeList.Count];
+
         siteListBox.BeginUpdate();
-        siteListBox.Items.Clear();
-        foreach (var host in activeList)
+        try
         {
-            siteListBox.Items.Add(host);
+            siteListBox.Items.Clear();
+            for (var index = 0; index < activeList.Count; index++)
+            {
+                var host = activeList[index];
+                var glyph = string.IsNullOrWhiteSpace(host)
+                    ? "S"
+                    : char.ToUpperInvariant(host.TrimStart()[0]).ToString();
+                visuals[index] = new ModernListRowVisual(
+                    host,
+                    detail,
+                    glyph,
+                    statusColor,
+                    StatusText: statusText,
+                    StatusColor: statusColor);
+                siteListBox.Items.Add(host);
+            }
+            hostRowVisuals = visuals;
         }
-        siteListBox.EndUpdate();
+        finally
+        {
+            siteListBox.EndUpdate();
+        }
+
+        var hasSites = activeList.Count > 0;
+        siteListBox.Visible = hasSites;
+        emptyListLabel.Visible = !hasSites;
         UpdateButtonStates();
     }
 
@@ -400,10 +487,32 @@ internal sealed class VoiceAudioSettingsDialog : Form
         {
             var alreadyInList = activeList.Any(h => BrowserPolicy.IsExactHost(h, currentHost));
             addCurrentSiteButton.Enabled = !alreadyInList;
-            var displayHost = TextSafety.TruncateWithEllipsis(currentHost, 24);
+            var displayHost = TextSafety.TruncateWithEllipsis(currentHost, 18);
             addCurrentSiteButton.Text = $"Add {displayHost}";
             addCurrentSiteButton.AccessibleName = $"Add {currentHost}";
         }
+
+        applyButton.Enabled = HasPendingChanges();
+    }
+
+    private bool HasPendingChanges()
+    {
+        return workingAudioOutputPolicy != savedAudioOutputPolicy
+            || workingAudioInputPolicy != savedAudioInputPolicy
+            || !HostListsMatch(workingAllowedAudioHosts, savedAllowedAudioHosts)
+            || !HostListsMatch(workingMutedHosts, savedMutedHosts)
+            || !HostListsMatch(workingAllowedMicrophoneHosts, savedAllowedMicrophoneHosts)
+            || !HostListsMatch(workingBlockedMicrophoneHosts, savedBlockedMicrophoneHosts);
+    }
+
+    private static bool HostListsMatch(IReadOnlyList<string> left, IReadOnlyList<string> right)
+    {
+        if (left.Count != right.Count) return false;
+        for (var i = 0; i < left.Count; i++)
+        {
+            if (!BrowserPolicy.IsExactHost(left[i], right[i])) return false;
+        }
+        return true;
     }
 
     private void OnAddSite()
@@ -507,46 +616,27 @@ internal sealed class VoiceAudioSettingsDialog : Form
         }
     }
 
-    private ModernListRowVisual BuildHostRowVisual(int index)
-    {
-        var hosts = GetActiveHostList();
-        if (index < 0 || index >= hosts.Count)
-        {
-            return new ModernListRowVisual(string.Empty, string.Empty, string.Empty);
-        }
-
-        var host = hosts[index];
-        var isAllowedList = listTypePicker.SelectedIndex == 0;
-        var statusColor = isAllowedList ? NativeUiTheme.Positive : NativeUiTheme.Negative;
-        var statusText = isAllowedList
-            ? "Allowed"
-            : IsAudioOutputSection ? "Muted" : "Blocked";
-        var detail = IsAudioOutputSection
-            ? (isAllowedList ? "Sound output allowed" : "Sound output suppressed")
-            : (isAllowedList ? "Microphone access allowed" : "Microphone access blocked");
-        var glyph = string.IsNullOrWhiteSpace(host)
-            ? "S"
-            : char.ToUpperInvariant(host.TrimStart()[0]).ToString();
-        return new ModernListRowVisual(
-            host,
-            detail,
-            glyph,
-            statusColor,
-            StatusText: statusText,
-            StatusColor: statusColor);
-    }
-
     private void ApplyChanges(bool close)
     {
+        var allowedAudio = workingAllowedAudioHosts.ToArray();
+        var mutedAudio = workingMutedHosts.ToArray();
+        var allowedMic = workingAllowedMicrophoneHosts.ToArray();
+        var blockedMic = workingBlockedMicrophoneHosts.ToArray();
         var result = new VoiceAudioSettingsResult(
             workingAudioOutputPolicy,
-            workingAllowedAudioHosts.ToArray(),
-            workingMutedHosts.ToArray(),
+            allowedAudio,
+            mutedAudio,
             workingAudioInputPolicy,
-            workingAllowedMicrophoneHosts.ToArray(),
-            workingBlockedMicrophoneHosts.ToArray());
+            allowedMic,
+            blockedMic);
 
         saveCallback(result);
+        savedAudioOutputPolicy = workingAudioOutputPolicy;
+        savedAllowedAudioHosts = allowedAudio;
+        savedMutedHosts = mutedAudio;
+        savedAudioInputPolicy = workingAudioInputPolicy;
+        savedAllowedMicrophoneHosts = allowedMic;
+        savedBlockedMicrophoneHosts = blockedMic;
 
         if (close)
         {

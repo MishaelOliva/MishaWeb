@@ -16,6 +16,7 @@ internal sealed class AddressSuggestionPopup : Control
 
     private IReadOnlyList<AddressSuggestion> allSuggestions = Array.Empty<AddressSuggestion>();
     private IReadOnlyList<AddressSuggestion> suggestions = Array.Empty<AddressSuggestion>();
+    private readonly PointF[] starPoints = new PointF[10];
     private int selectedIndex = -1;
     private int hoverIndex = -1;
     private int removeHoverIndex = -1;
@@ -219,6 +220,7 @@ internal sealed class AddressSuggestionPopup : Control
         {
             var previousHover = hoverIndex;
             hoverIndex = nextHover;
+            Cursor = hoverIndex >= 0 ? Cursors.Hand : Cursors.Default;
             InvalidateRow(previousHover);
             InvalidateRow(nextHover);
         }
@@ -232,7 +234,6 @@ internal sealed class AddressSuggestionPopup : Control
         {
             var previousRemoveHover = removeHoverIndex;
             removeHoverIndex = nextRemoveHover;
-            Cursor = removeHoverIndex >= 0 ? Cursors.Hand : Cursors.Default;
             InvalidateRow(previousRemoveHover);
             InvalidateRow(nextRemoveHover);
         }
@@ -348,6 +349,12 @@ internal sealed class AddressSuggestionPopup : Control
 
             var rowHeight = ScaledRowHeight;
             var clip = e.ClipRectangle;
+            using var separator = suggestions.Count > 1
+                ? new Pen(
+                    highContrast
+                        ? SystemColors.WindowText
+                        : Color.FromArgb(46, BorderColor))
+                : null;
             for (var index = 0; index < suggestions.Count; index++)
             {
                 var row = new Rectangle(1, 1 + (index * rowHeight), Math.Max(0, Width - 2), rowHeight);
@@ -364,12 +371,8 @@ internal sealed class AddressSuggestionPopup : Control
                 if (CanRemoveSuggestion(suggestions[index])) DrawRemoveButton(g, index);
 
                 var nextHighlighted = (index + 1) == selectedIndex || (index + 1) == hoverIndex;
-                if (index < suggestions.Count - 1 && !highlighted && !nextHighlighted)
+                if (separator is not null && index < suggestions.Count - 1 && !highlighted && !nextHighlighted)
                 {
-                    using var separator = new Pen(
-                        highContrast
-                            ? SystemColors.WindowText
-                            : Color.FromArgb(46, BorderColor));
                     g.DrawLine(separator, Scale(55), row.Bottom - 1, Width - Scale(14), row.Bottom - 1);
                 }
             }
@@ -632,7 +635,7 @@ internal sealed class AddressSuggestionPopup : Control
         var badgeWidth = pillText is null
             ? 0
             : suggestion.Source == AddressSuggestionSource.OpenTab ? Scale(92) : Scale(74);
-        var rightMargin = Scale(42);
+        var rightMargin = CanRemoveSuggestion(suggestion) ? Scale(42) : Scale(12);
         var textLeft = iconBounds.Right + Scale(10);
         var textWidth = Math.Max(10, row.Right - textLeft - rightMargin - badgeWidth);
         var titleBounds = new Rectangle(textLeft, row.Top + Scale(7), textWidth, Scale(18));
@@ -725,22 +728,21 @@ internal sealed class AddressSuggestionPopup : Control
         }
     }
 
-    private static void DrawBookmarkStar(Graphics graphics, RectangleF area, Color color)
+    private void DrawBookmarkStar(Graphics graphics, RectangleF area, Color color)
     {
         var cx = area.X + (area.Width / 2f);
         var cy = area.Y + (area.Height / 2f);
         var outerR = Math.Min(area.Width, area.Height) * 0.52f;
         var innerR = outerR * 0.44f;
-        var points = new PointF[10];
         for (var i = 0; i < 10; i++)
         {
             var angle = (-MathF.PI / 2f) + (i * MathF.PI / 5f);
             var r = (i % 2 == 0) ? outerR : innerR;
-            points[i] = new PointF(cx + (r * MathF.Cos(angle)), cy + (r * MathF.Sin(angle)));
+            starPoints[i] = new PointF(cx + (r * MathF.Cos(angle)), cy + (r * MathF.Sin(angle)));
         }
 
         using var brush = new SolidBrush(color);
-        graphics.FillPolygon(brush, points);
+        graphics.FillPolygon(brush, starPoints);
     }
 
     private static void DrawHistoryArrow(Graphics graphics, RectangleF area, Color color, float strokeWidth)
@@ -820,18 +822,18 @@ internal sealed class AddressSuggestionPopup : Control
         if (index == removeHoverIndex)
         {
             using var hoverBrush = new SolidBrush(
-                highContrast ? SystemColors.Highlight : NativeUiTheme.Hover);
+                highContrast ? SystemColors.Highlight : Color.FromArgb(46, NativeUiTheme.Negative));
             graphics.FillEllipse(hoverBrush, bounds);
             if (!highContrast)
             {
-                using var hoverRim = new Pen(Color.FromArgb(140, BorderColor), 1f);
+                using var hoverRim = new Pen(Color.FromArgb(165, NativeUiTheme.Negative), 1f);
                 graphics.DrawEllipse(hoverRim, bounds);
             }
         }
 
         var color = highContrast
             ? (selected || index == removeHoverIndex ? SystemColors.HighlightText : SystemColors.WindowText)
-            : (index == removeHoverIndex ? PrimaryTextColor : SecondaryTextColor);
+            : (index == removeHoverIndex ? NativeUiTheme.Negative : SecondaryTextColor);
         var inset = Scale(8);
         var stroke = Math.Max(1.35f, Scale(13) / 10f);
         using var pen = new Pen(color, stroke)

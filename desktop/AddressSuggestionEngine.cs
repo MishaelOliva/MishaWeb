@@ -210,6 +210,16 @@ internal static class AddressSuggestionEngine
                 isSearchQuery: false);
             if (!match.IsMatch) continue;
 
+            if (topCandidateCount == topCandidateLimit)
+            {
+                var worst = topCandidates[topCandidateCount - 1];
+                if ((int)match.Kind > (int)worst.Match
+                    || (match.Kind == worst.Match && match.Quality >= worst.Quality))
+                {
+                    continue;
+                }
+            }
+
             if (!Uri.TryCreate(tab.Url, UriKind.Absolute, out var parsedUrl)
                 || (parsedUrl.Scheme != Uri.UriSchemeHttp && parsedUrl.Scheme != Uri.UriSchemeHttps))
             {
@@ -734,6 +744,7 @@ internal static class AddressSuggestionEngine
     {
         if (string.IsNullOrWhiteSpace(query) || query.Length > 64 || state is null) return null;
         var trimmed = query.Trim();
+        if (trimmed.Length == 0 || !CanBeHostPrefix(trimmed)) return null;
         var candidates = GetIndexedCandidates(state);
 
         IndexedCandidate? bestCandidate = null;
@@ -757,6 +768,23 @@ internal static class AddressSuggestionEngine
         }
 
         return bestCandidate?.Host;
+    }
+
+    private static bool CanBeHostPrefix(string value)
+    {
+        for (var index = 0; index < value.Length; index++)
+        {
+            var ch = value[index];
+            if (ch <= 0x20
+                || char.IsWhiteSpace(ch)
+                || ch is '/' or '\\' or '?' or '#' or '@' or ':' or '!' or '"' or '\''
+                    or '<' or '>' or '|' or '*' or '%' or ';' or ',' or '(' or ')'
+                    or '{' or '}' or '[' or ']' or '`' or '^' or '=' or '+' or '&')
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     public static IReadOnlyList<AddressSuggestion> MergeWithLiveSearch(
@@ -787,26 +815,31 @@ internal static class AddressSuggestionEngine
         var seenTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var seenUrls = new HashSet<string>(BrowserPolicy.UrlComparer);
 
-        // 1. If localSuggestions[0] is a strong match (TopMatch, Exact, Prefix, or OpenTab),
-        // preserve it at position 0; weak fuzzy matches yield to higher-relevance live queries.
-        var localIndex = 0;
-        if (localSuggestions.Count > 0 && !localSuggestions[0].IsSearch)
+        // 1. Preserve up to 3 strong local matches (OpenTab, Bookmark, Exact, or strong
+        // top-match Prefix) so user bookmarks and open tabs do not vanish when live search
+        // completions arrive; weak fuzzy/noisy history matches yield to live queries.
+        const int maxStrongLocalMatches = 3;
+        var strongSlotBudget = Math.Min(maxStrongLocalMatches, Math.Max(0, limit - 1));
+        uint consumedLocalMask = 0;
+        for (var i = 0; i < localSuggestions.Count && merged.Count < strongSlotBudget; i++)
         {
-            var first = localSuggestions[0];
-            var isStrongMatch = first.IsTopMatch
-                || first.Source == AddressSuggestionSource.OpenTab
-                || first.Match is AddressSuggestionMatch.Exact or AddressSuggestionMatch.Prefix;
-            if (isStrongMatch)
-            {
-                if (!string.IsNullOrEmpty(first.NavigationTarget))
-                {
-                    seenUrls.Add(first.NavigationTarget);
-                }
-                seenTargets.Add(first.AcceptText);
-                seenTargets.Add(first.Title);
-                merged.Add(first with { KeyboardIndex = 0 });
-                localIndex = 1;
-            }
+            var candidate = localSuggestions[i];
+            if (candidate.IsSearch) continue;
+
+            var isStrongMatch = i == 0
+                ? candidate.IsTopMatch
+                    || candidate.Source is AddressSuggestionSource.OpenTab or AddressSuggestionSource.Bookmark
+                    || (!candidate.IsSearchHistory && candidate.Match is AddressSuggestionMatch.Exact or AddressSuggestionMatch.Prefix)
+                : !candidate.IsSearchHistory
+                    && (candidate.Source is AddressSuggestionSource.OpenTab or AddressSuggestionSource.Bookmark
+                        || candidate.Match == AddressSuggestionMatch.Exact);
+            if (!isStrongMatch) continue;
+            if (!string.IsNullOrEmpty(candidate.NavigationTarget) && !seenUrls.Add(candidate.NavigationTarget)) continue;
+
+            seenTargets.Add(candidate.AcceptText);
+            seenTargets.Add(candidate.Title);
+            merged.Add(candidate with { KeyboardIndex = merged.Count });
+            if (i < 32) consumedLocalMask |= 1u << i;
         }
 
         // 2. Add high-quality live search suggestions
@@ -831,9 +864,10 @@ internal static class AddressSuggestionEngine
         }
 
         // 3. Add remaining local candidates if there's room
-        while (merged.Count < limit - 1 && localIndex < localSuggestions.Count)
+        for (var localIndex = 0; merged.Count < limit - 1 && localIndex < localSuggestions.Count; localIndex++)
         {
-            var local = localSuggestions[localIndex++];
+            if (localIndex < 32 && (consumedLocalMask & (1u << localIndex)) != 0) continue;
+            var local = localSuggestions[localIndex];
             if (local.IsSearch) continue;
             if (!string.IsNullOrEmpty(local.NavigationTarget) && !seenUrls.Add(local.NavigationTarget)) continue;
             if (seenTargets.Contains(local.AcceptText) || seenTargets.Contains(local.Title)) continue;
