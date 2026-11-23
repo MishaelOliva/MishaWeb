@@ -399,6 +399,11 @@ public sealed partial class MainForm
             ActivateTab(tab, focusPage: false);
             RunUiTask(() => NavigateActiveAsync(target), "Navigation could not start");
         };
+        startPageView.OpenInNewTabRequested += (_, target) =>
+        {
+            if (tab.IsClosed) return;
+            RunUiTask(() => OpenNewTabAsync(target, activate: false), "Could not open link in a new tab");
+        };
         startPageView.ActionRequested += (_, action) =>
         {
             if (tab.IsClosed) return;

@@ -10,7 +10,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, '..', 'desktop', 'AdBlockDocumentScript.cs'), 'utf8');
 
 function extractRawLiteral(text, name) {
-  const regex = new RegExp(`(?:public|private) const string ${name}\\s*=\\s*"""\\r?\\n([\\s\\S]*?)\\r?\\n\\s*""";`);
+  const regex = new RegExp(`(?:public|private) (?:const|static readonly) string ${name}\\s*=\\s*"""\\r?\\n([\\s\\S]*?)\\r?\\n\\s*""";`);
   const match = text.match(regex);
   assert.ok(match, `AdBlockDocumentScript.cs is missing ${name} raw string literal`);
   const lines = match[1].split(/\r?\n/);
@@ -21,7 +21,7 @@ function extractRawLiteral(text, name) {
 }
 
 function extractYouTubeHeaderSnippet(text) {
-  const regex = /public const string YouTubeRuntimeSource\s*=\s*"\(\(\) => \{\\n"\s*\+\s*SharedYouTubeBootstrapPrefix\s*\+\s*"\\n"\s*\+\s*"""\r?\n([\s\S]*?)\r?\n\s*"""/;
+  const regex = /public (?:const|static readonly) string YouTubeRuntimeSource\s*=\s*"\(\(\) => \{\\n"\s*\+\s*SharedYouTubeBootstrapPrefix\s*\+\s*"\\n"\s*\+\s*"""\r?\n([\s\S]*?)\r?\n\s*"""/;
   const match = text.match(regex);
   assert.ok(match, 'AdBlockDocumentScript.cs is missing YouTubeRuntimeSource header snippet');
   return match[1];

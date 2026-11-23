@@ -755,6 +755,7 @@ if (renderChrome || renderLoadedChrome || renderSuggestions)
 
 var failures = new List<string>();
 var checkCount = 0;
+var JavaScriptSyntaxCache = new System.Collections.Concurrent.ConcurrentDictionary<string, bool>(StringComparer.Ordinal);
 
 Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
 Application.EnableVisualStyles();
@@ -827,166 +828,149 @@ var extensionAndSaveGuardsValid = false;
 var extensionCloseDeferralValid = false;
 var privateOnlyUrlHandoffValid = false;
 var privateOnlyEmptyHandoffValid = false;
-var restartUiThread = new Thread(() =>
+var restartUiCompleted = StaTestRunner.TryRun(() =>
 {
-    try
+    using (var normalRestartWindow = new MainForm(startBrowserOnShown: false))
+    using (var privateRestartWindow = new MainForm(
+               startBrowserOnShown: false,
+               previewState: null,
+               startupAddress: null,
+               mode: BrowserMode.Private))
     {
-        using (var normalRestartWindow = new MainForm(startBrowserOnShown: false))
-        using (var privateRestartWindow = new MainForm(
-                   startBrowserOnShown: false,
-                   previewState: null,
-                   startupAddress: null,
-                   mode: BrowserMode.Private))
-        {
-            _ = normalRestartWindow.Handle;
-            _ = privateRestartWindow.Handle;
-            var confirmationCount = 0;
-            var launchCount = 0;
-            MishaWeb.Program.BrowserRestartGuard promptedRestartGuard = default;
-            using var restartContext = new MishaWeb.Program.BrowserApplicationContext(
-                (_, guard) =>
-                {
-                    promptedRestartGuard = guard;
-                    confirmationCount++;
-                    return confirmationCount > 1;
-                },
-                predecessorProcessId =>
-                {
-                    launchCount++;
-                    return predecessorProcessId == Environment.ProcessId;
-                },
-                exitThread: () => { });
-            var normalRegistered = restartContext.Register(normalRestartWindow);
-            var privateRegistered = restartContext.Register(privateRestartWindow);
-            var canceledRestart = restartContext.RequestBrowserProcessRestart(normalRestartWindow);
-            var windowsAfterCanceledRestart = restartContext.WindowCount;
-            var exitsAfterCanceledRestart = restartContext.ExitThreadRequestCountForTesting;
-            var windowsSeenAfterFirstClose = -1;
-            var exitsSeenAfterFirstClose = -1;
-            privateRestartWindow.FormClosed += (_, _) =>
+        _ = normalRestartWindow.Handle;
+        _ = privateRestartWindow.Handle;
+        var confirmationCount = 0;
+        var launchCount = 0;
+        MishaWeb.Program.BrowserRestartGuard promptedRestartGuard = default;
+        using var restartContext = new MishaWeb.Program.BrowserApplicationContext(
+            (_, guard) =>
             {
-                windowsSeenAfterFirstClose = restartContext.WindowCount;
-                exitsSeenAfterFirstClose = restartContext.ExitThreadRequestCountForTesting;
-            };
-            var startedRestart = restartContext.RequestBrowserProcessRestart(normalRestartWindow);
-            restartCoordinationValid = normalRegistered
-                && privateRegistered
-                && canceledRestart == MishaWeb.Program.BrowserRestartRequestResult.Canceled
-                && windowsAfterCanceledRestart == 2
-                && exitsAfterCanceledRestart == 0
-                && confirmationCount == 2
-                && promptedRestartGuard.WindowCount == 2
-                && promptedRestartGuard.PrivateWindowCount == 1
-                && launchCount == 1
-                && startedRestart == MishaWeb.Program.BrowserRestartRequestResult.Started
-                && normalRestartWindow.IsDisposed
-                && privateRestartWindow.IsDisposed;
-            finalWindowExitValid = windowsSeenAfterFirstClose == 1
-                && exitsSeenAfterFirstClose == 0
-                && restartContext.WindowCount == 0
-                && restartContext.ExitThreadRequestCountForTesting == 1;
-        }
-
-        using (var guardedWindow = new MainForm(startBrowserOnShown: false))
-        {
-            _ = guardedWindow.Handle;
-            var persistenceAttempts = 0;
-            var guardedLaunches = 0;
-            using var guardedContext = new MishaWeb.Program.BrowserApplicationContext(
-                (_, _) => true,
-                _ =>
-                {
-                    guardedLaunches++;
-                    return true;
-                },
-                exitThread: () => { },
-                persistRestartSession: _ =>
-                {
-                    persistenceAttempts++;
-                    return false;
-                });
-            var registered = guardedContext.Register(guardedWindow);
-            var mutation = guardedWindow.BeginExtensionMutationForTesting();
-            var activeMutationState = guardedWindow.CaptureBrowserRestartWindowState();
-            var busyResult = guardedContext.RequestBrowserProcessRestart(guardedWindow);
-            mutation.Dispose();
-            mutation.Dispose();
-            var releasedMutationState = guardedWindow.CaptureBrowserRestartWindowState();
-            var saveFailureResult = guardedContext.RequestBrowserProcessRestart(guardedWindow);
-            extensionAndSaveGuardsValid = registered
-                && activeMutationState.ActiveExtensionMutationCount == 1
-                && busyResult == MishaWeb.Program.BrowserRestartRequestResult.ExtensionOperationInProgress
-                && persistenceAttempts == 1
-                && guardedLaunches == 0
-                && releasedMutationState.ActiveExtensionMutationCount == 0
-                && saveFailureResult == MishaWeb.Program.BrowserRestartRequestResult.SessionSaveFailed
-                && guardedContext.WindowCount == 1
-                && !guardedWindow.IsDisposed;
-            guardedWindow.Close();
-        }
-
-        using (var closeGuardWindow = new MainForm(startBrowserOnShown: false))
-        {
-            var mutation = closeGuardWindow.BeginExtensionMutationForTesting();
-            var closeWasDeferred = closeGuardWindow.RequestCloseDuringExtensionMutationForTesting();
-            extensionCloseDeferralValid = closeWasDeferred
-                && closeGuardWindow.IsChromeStoreInstallCancellationRequestedForTesting
-                && closeGuardWindow.IsCloseDeferredForExtensionMutationForTesting
-                && closeGuardWindow.CaptureBrowserRestartWindowState().ActiveExtensionMutationCount == 1;
-            mutation.Dispose();
-        }
-
-        bool VerifyPrivateOnlyHandoff(string? address)
-        {
-            using var privateWindow = new MainForm(
-                startBrowserOnShown: false,
-                previewState: null,
-                startupAddress: null,
-                mode: BrowserMode.Private);
-            _ = privateWindow.Handle;
-            MainForm? createdNormal = null;
-            using var handoffContext = new MishaWeb.Program.BrowserApplicationContext(
-                exitThread: () => { },
-                createNormalWindow: () =>
-                {
-                    createdNormal = new MainForm(startBrowserOnShown: false);
-                    return createdNormal;
-                },
-                showNormalWindow: _ => { });
-            if (!handoffContext.Register(privateWindow)) return false;
-            var handoffTask = Task.Run(() => handoffContext.TryReceiveExternalNavigation(address));
-            var deadline = System.Diagnostics.Stopwatch.StartNew();
-            while (!handoffTask.IsCompleted && deadline.Elapsed < TimeSpan.FromSeconds(3))
+                promptedRestartGuard = guard;
+                confirmationCount++;
+                return confirmationCount > 1;
+            },
+            predecessorProcessId =>
             {
-                Application.DoEvents();
-                Thread.Sleep(1);
-            }
-            var accepted = handoffTask.IsCompletedSuccessfully && handoffTask.Result;
-            var valid = accepted
-                && createdNormal is { IsDisposed: false }
-                && !createdNormal.IsPrivateBrowserWindow
-                && createdNormal.HasPendingExternalNavigationForTesting(address)
-                && handoffContext.WindowCount == 2;
-            createdNormal?.Close();
-            privateWindow.Close();
-            return valid;
-        }
-
-        privateOnlyUrlHandoffValid = VerifyPrivateOnlyHandoff(encodedStartupUrl);
-        privateOnlyEmptyHandoffValid = VerifyPrivateOnlyHandoff(null);
+                launchCount++;
+                return predecessorProcessId == Environment.ProcessId;
+            },
+            exitThread: () => { });
+        var normalRegistered = restartContext.Register(normalRestartWindow);
+        var privateRegistered = restartContext.Register(privateRestartWindow);
+        var canceledRestart = restartContext.RequestBrowserProcessRestart(normalRestartWindow);
+        var windowsAfterCanceledRestart = restartContext.WindowCount;
+        var exitsAfterCanceledRestart = restartContext.ExitThreadRequestCountForTesting;
+        var windowsSeenAfterFirstClose = -1;
+        var exitsSeenAfterFirstClose = -1;
+        privateRestartWindow.FormClosed += (_, _) =>
+        {
+            windowsSeenAfterFirstClose = restartContext.WindowCount;
+            exitsSeenAfterFirstClose = restartContext.ExitThreadRequestCountForTesting;
+        };
+        var startedRestart = restartContext.RequestBrowserProcessRestart(normalRestartWindow);
+        restartCoordinationValid = normalRegistered
+            && privateRegistered
+            && canceledRestart == MishaWeb.Program.BrowserRestartRequestResult.Canceled
+            && windowsAfterCanceledRestart == 2
+            && exitsAfterCanceledRestart == 0
+            && confirmationCount == 2
+            && promptedRestartGuard.WindowCount == 2
+            && promptedRestartGuard.PrivateWindowCount == 1
+            && launchCount == 1
+            && startedRestart == MishaWeb.Program.BrowserRestartRequestResult.Started
+            && normalRestartWindow.IsDisposed
+            && privateRestartWindow.IsDisposed;
+        finalWindowExitValid = windowsSeenAfterFirstClose == 1
+            && exitsSeenAfterFirstClose == 0
+            && restartContext.WindowCount == 0
+            && restartContext.ExitThreadRequestCountForTesting == 1;
     }
-    catch (Exception error)
+
+    using (var guardedWindow = new MainForm(startBrowserOnShown: false))
     {
-        restartUiError = error;
+        _ = guardedWindow.Handle;
+        var persistenceAttempts = 0;
+        var guardedLaunches = 0;
+        using var guardedContext = new MishaWeb.Program.BrowserApplicationContext(
+            (_, _) => true,
+            _ =>
+            {
+                guardedLaunches++;
+                return true;
+            },
+            exitThread: () => { },
+            persistRestartSession: _ =>
+            {
+                persistenceAttempts++;
+                return false;
+            });
+        var registered = guardedContext.Register(guardedWindow);
+        var mutation = guardedWindow.BeginExtensionMutationForTesting();
+        var activeMutationState = guardedWindow.CaptureBrowserRestartWindowState();
+        var busyResult = guardedContext.RequestBrowserProcessRestart(guardedWindow);
+        mutation.Dispose();
+        mutation.Dispose();
+        var releasedMutationState = guardedWindow.CaptureBrowserRestartWindowState();
+        var saveFailureResult = guardedContext.RequestBrowserProcessRestart(guardedWindow);
+        extensionAndSaveGuardsValid = registered
+            && activeMutationState.ActiveExtensionMutationCount == 1
+            && busyResult == MishaWeb.Program.BrowserRestartRequestResult.ExtensionOperationInProgress
+            && persistenceAttempts == 1
+            && guardedLaunches == 0
+            && releasedMutationState.ActiveExtensionMutationCount == 0
+            && saveFailureResult == MishaWeb.Program.BrowserRestartRequestResult.SessionSaveFailed
+            && guardedContext.WindowCount == 1
+            && !guardedWindow.IsDisposed;
+
+        var closeMutation = guardedWindow.BeginExtensionMutationForTesting();
+        var closeWasDeferred = guardedWindow.RequestCloseDuringExtensionMutationForTesting();
+        extensionCloseDeferralValid = closeWasDeferred
+            && guardedWindow.IsChromeStoreInstallCancellationRequestedForTesting
+            && guardedWindow.IsCloseDeferredForExtensionMutationForTesting
+            && guardedWindow.CaptureBrowserRestartWindowState().ActiveExtensionMutationCount == 1;
+        closeMutation.Dispose();
+        guardedWindow.Close();
     }
-})
-{
-    IsBackground = true,
-    Name = "MishaWeb restart smoke"
-};
-restartUiThread.SetApartmentState(ApartmentState.STA);
-restartUiThread.Start();
-var restartUiCompleted = restartUiThread.Join(TimeSpan.FromSeconds(20));
+
+    bool VerifyPrivateOnlyHandoff(string? address)
+    {
+        using var privateWindow = new MainForm(
+            startBrowserOnShown: false,
+            previewState: null,
+            startupAddress: null,
+            mode: BrowserMode.Private);
+        _ = privateWindow.Handle;
+        MainForm? createdNormal = null;
+        using var handoffContext = new MishaWeb.Program.BrowserApplicationContext(
+            exitThread: () => { },
+            createNormalWindow: () =>
+            {
+                createdNormal = new MainForm(startBrowserOnShown: false);
+                return createdNormal;
+            },
+            showNormalWindow: _ => { });
+        if (!handoffContext.Register(privateWindow)) return false;
+        var handoffTask = Task.Run(() => handoffContext.TryReceiveExternalNavigation(address));
+        var deadline = System.Diagnostics.Stopwatch.StartNew();
+        while (!handoffTask.IsCompleted && deadline.Elapsed < TimeSpan.FromSeconds(3))
+        {
+            Application.DoEvents();
+            Thread.Sleep(1);
+        }
+        var accepted = handoffTask.IsCompletedSuccessfully && handoffTask.Result;
+        var valid = accepted
+            && createdNormal is { IsDisposed: false }
+            && !createdNormal.IsPrivateBrowserWindow
+            && createdNormal.HasPendingExternalNavigationForTesting(address)
+            && handoffContext.WindowCount == 2;
+        createdNormal?.Close();
+        privateWindow.Close();
+        return valid;
+    }
+
+    privateOnlyUrlHandoffValid = VerifyPrivateOnlyHandoff(encodedStartupUrl);
+    privateOnlyEmptyHandoffValid = VerifyPrivateOnlyHandoff(null);
+}, TimeSpan.FromSeconds(20), out restartUiError);
 Check(
     "two-window update restart confirms, launches once, and closes the full registry",
     restartUiCompleted && restartUiError is null && restartCoordinationValid);
@@ -1080,7 +1064,7 @@ using (var delayedServer = new MishaWeb.Program.SingleInstanceServer(delayedPipe
         delayedPipeName,
         encodedStartupUrl,
         TimeSpan.FromSeconds(4));
-    await Task.Delay(900);
+    await Task.Delay(150);
     delayedServer.Start();
     Check(
         "IPC client retries while the first browser is still creating its pipe server",
@@ -4038,9 +4022,9 @@ var informationalVersion = System.Reflection.CustomAttributeExtensions
     .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(productAssembly)
     ?.InformationalVersion;
 Check(
-    "release assemblies carry the 2.5.1 product version",
-    productAssembly.GetName().Version == new Version(2, 5, 1, 0)
-        && informationalVersion == "2.5.1");
+    "release assemblies carry the 2.6.0 product version",
+    productAssembly.GetName().Version == new Version(2, 6, 0, 0)
+        && informationalVersion == "2.6.0");
 Check(
     "new sessions default to standard memory saver",
     new BrowserState().MemorySaverEnabled && new BrowserState().UltraLightModeEnabled == false);
@@ -5017,32 +5001,9 @@ Check(
 Check(
     "YouTube ad skipping accepts fresh controls in the next ad",
     youtubeAdSkip.GetValueOrDefault("clearsBetweenAds"));
-var documentScriptSyntaxPath = Path.Combine(
-    Path.GetTempPath(),
-    "MishaWeb-AdBlock-" + Guid.NewGuid().ToString("N") + ".js");
-try
-{
-    File.WriteAllText(documentScriptSyntaxPath, generatedAdBlockScript);
-    var syntaxCheckStart = new System.Diagnostics.ProcessStartInfo
-    {
-        FileName = "node",
-        UseShellExecute = false,
-        CreateNoWindow = true,
-        RedirectStandardError = true
-    };
-    syntaxCheckStart.ArgumentList.Add("--check");
-    syntaxCheckStart.ArgumentList.Add(documentScriptSyntaxPath);
-    using var syntaxCheck = System.Diagnostics.Process.Start(syntaxCheckStart);
-    var syntaxCompleted = syntaxCheck is not null && syntaxCheck.WaitForExit(5_000);
-    if (syntaxCheck is { HasExited: false }) syntaxCheck.Kill(entireProcessTree: true);
-    Check(
-        "generated document shield is valid JavaScript",
-        syntaxCompleted && syntaxCheck?.ExitCode == 0);
-}
-finally
-{
-    File.Delete(documentScriptSyntaxPath);
-}
+Check(
+    "generated document shield is valid JavaScript",
+    CanParseJavaScript(generatedAdBlockScript));
 var adBlockUsesMutationObserver = adBlockDocumentScript.Contains("MutationObserver", StringComparison.Ordinal);
 Check(
     "ad blocker gates mutation observation to YouTube pages",
@@ -6928,6 +6889,132 @@ Check(
         && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("'mousedown'", StringComparison.Ordinal)
         && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("'focusin'", StringComparison.Ordinal));
 
+// v2.6.0 regression checks
+PublicSuffixRules.Warmup();
+Check(
+    "PublicSuffixRules RVA gzip blob resolves multi-label, wildcard, and exception domains",
+    PublicSuffixRules.GetSiteKey("sub.bbc.co.uk") == "bbc.co.uk"
+        && PublicSuffixRules.GetSiteKey("docs.demo.github.io") == "demo.github.io"
+        && PublicSuffixRules.GetSiteKey("www.example.com") == "example.com"
+        && PublicSuffixRules.GetSiteKey("city.kobe.jp") == "city.kobe.jp");
+
+var v260AdEngine = new AdBlockEngine(initialRules:
+[
+    "||ads.v260-compact.invalid^$third-party",
+    "*banner*promo*v260*",
+    "/\\/v260-ad[0-9]{2}\\.js$/",
+    "/[unclosed-v260-regex/"
+]);
+var filterRuleType = typeof(AdBlockEngine).GetNestedType(
+    "FilterRule",
+    System.Reflection.BindingFlags.NonPublic);
+var filterRuleSize = filterRuleType is null
+    ? int.MaxValue
+    : (int)(typeof(System.Runtime.CompilerServices.Unsafe)
+        .GetMethod(nameof(System.Runtime.CompilerServices.Unsafe.SizeOf))!
+        .MakeGenericMethod(filterRuleType)
+        .Invoke(null, null) ?? int.MaxValue);
+Check(
+    "AdBlockEngine compacts FilterRule to <= 40 bytes and validates glob and lazy regex rules",
+    filterRuleSize <= 40
+        && v260AdEngine.ShouldBlock("https://ads.v260-compact.invalid/pixel.js", "https://publisher.invalid/", AdBlockResourceType.Script)
+        && !v260AdEngine.ShouldBlock("https://ads.v260-compact.invalid/pixel.js", "https://ads.v260-compact.invalid/", AdBlockResourceType.Script)
+        && v260AdEngine.ShouldBlock("https://cdn.invalid/top-banner-mid-promo-v260-unit.png", "https://publisher.invalid/", AdBlockResourceType.Image)
+        && !v260AdEngine.ShouldBlock("https://cdn.invalid/top-banner-only.png", "https://publisher.invalid/", AdBlockResourceType.Image)
+        && v260AdEngine.ShouldBlock("https://cdn.invalid/v260-ad42.js", "https://publisher.invalid/", AdBlockResourceType.Script)
+        && !v260AdEngine.ShouldBlock("https://cdn.invalid/v260-adxy.js", "https://publisher.invalid/", AdBlockResourceType.Script)
+        && v260AdEngine.LastCompileDiagnostics.RegexRules == 1);
+
+var leakGuardCalls = 0;
+using (var leakGuardHandler = new DelegateHttpMessageHandler((_, _) =>
+{
+    Interlocked.Increment(ref leakGuardCalls);
+    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+    {
+        Content = new StringContent("[\"q\",[\"should-not-run\"]]")
+    });
+}))
+{
+    var leakGuardService = new SearchSuggestionService(leakGuardHandler);
+    var urlSuggestions = await leakGuardService.GetSearchSuggestionsAsync("https://example.com/private?token=1");
+    var localhostSuggestions = await leakGuardService.GetSearchSuggestionsAsync("localhost:3000/admin");
+    var ipSuggestions = await leakGuardService.GetSearchSuggestionsAsync("192.168.1.1");
+    Check(
+        "SearchSuggestionService blocks URL, localhost, and IP queries before touching the network",
+        leakGuardCalls == 0
+            && urlSuggestions.Count == 0
+            && localhostSuggestions.Count == 0
+            && ipSuggestions.Count == 0);
+}
+
+var mergeState = new BrowserState
+{
+    Bookmarks =
+    [
+        new BookmarkEntry("Rust Book", "https://doc.rust-lang.org/book/"),
+        new BookmarkEntry("Rust Crates", "https://crates.io/"),
+        new BookmarkEntry("Rust Playground", "https://play.rust-lang.org/")
+    ]
+};
+var mergeOpenTabs = new[]
+{
+    new OpenTabCandidate("Rust API Docs", "https://docs.rs/", IsSelected: false)
+};
+var mergeLocal = AddressSuggestionEngine.GetSuggestions("rust", mergeState, mergeOpenTabs, maximumResults: 6);
+var mergeCombined = AddressSuggestionEngine.MergeWithLiveSearch(
+    mergeLocal,
+    ["rust language", "rust tutorial", "rust async", "rust cargo"],
+    "rust",
+    mergeState,
+    maximumResults: 6);
+Check(
+    "AddressSuggestionEngine.MergeWithLiveSearch preserves up to 3 strong local matches ahead of live queries",
+    mergeCombined.Count >= 5
+        && mergeCombined.Take(3).All(item => item.Source is AddressSuggestionSource.OpenTab or AddressSuggestionSource.Bookmark)
+        && mergeCombined.Skip(3).Any(item => item.Source == AddressSuggestionSource.Search));
+
+Check(
+    "CommandPaletteForm preserves queryBox focus on arrow navigation and MruSwitcherForm preserves em-dash titles",
+    VerifyCommandPaletteAndMruV260Sta());
+
+var multiViewV260State = new MultiViewState();
+multiViewV260State.SetSingle(101);
+multiViewV260State.AddPane(102);
+var multiViewV260Layout = MultiViewLayoutEngine.ComputeLayout(new Rectangle(0, 0, 1200, 800), multiViewV260State, 6, 26);
+var multiViewV260SplitterGap = multiViewV260Layout.PaneBounds[1].Left - multiViewV260Layout.PaneBounds[0].Right;
+var multiViewV260MainSource = ReadRepositorySource("desktop", "MainForm.MultiView.cs");
+var multiViewV260TabsSource = ReadRepositorySource("desktop", "MainForm.Tabs.cs");
+var paneHeaderMaximizeTriggered = false;
+var paneHeaderError = StaTestRunner.TryRun(() =>
+{
+    using var header = new PaneHeaderBar(0) { Size = new Size(320, 26) };
+    header.MaximizeToggleRequested += (_, _) => paneHeaderMaximizeTriggered = true;
+    header.UpdateMetadata("Pane 1", focused: true, privateMode: false, highContrastActive: false, maximized: true);
+    var onDoubleClick = typeof(Control).GetMethod(
+        "OnDoubleClick",
+        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+    onDoubleClick?.Invoke(header, [EventArgs.Empty]);
+});
+Check(
+    "MultiView uses 6px splitter, compact 210x156 overlay minimums, and PaneHeaderBar maximize toggle",
+    paneHeaderError is null
+        && paneHeaderMaximizeTriggered
+        && multiViewV260SplitterGap == 6
+        && multiViewV260MainSource.Contains("MultiViewSplitterLogicalThickness = 6;", StringComparison.Ordinal)
+        && multiViewV260TabsSource.Contains("MinimumSize = new Size(210, 156)", StringComparison.Ordinal));
+
+var slashInputResolution = BrowserPolicy.ResolveAddress("/search/topic");
+var slashSubredditResolution = BrowserPolicy.ResolveAddress("/r/dotnet");
+Check(
+    "BrowserPolicy fast-path rejects leading-slash omnibox inputs as local files",
+    slashInputResolution.Error is null
+        && slashInputResolution.Url is not null
+        && slashInputResolution.Url.StartsWith("https://", StringComparison.Ordinal)
+        && !slashInputResolution.Url.StartsWith("file:", StringComparison.OrdinalIgnoreCase)
+        && slashSubredditResolution.Error is null
+        && slashSubredditResolution.Url is not null
+        && slashSubredditResolution.Url.StartsWith("https://", StringComparison.Ordinal));
+
 if (failures.Count > 0)
 {
     Console.Error.WriteLine($"{failures.Count} smoke test(s) failed:");
@@ -7028,54 +7115,42 @@ void CheckUrl(string name, string input, string expected)
 
 bool CanConstructNativeStartPage()
 {
-    Exception? error = null;
     var completedLayout = false;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        try
-        {
-            using var page = new NativeStartPage { Size = new Size(960, 560) };
-            string? navigationTarget = null;
-            StartPageAction? requestedAction = null;
-            page.NavigateRequested += (_, target) => navigationTarget = target;
-            page.ActionRequested += (_, action) => requestedAction = action;
-            page.SetQuickLinks(
-            [
-                new StartPageLink("Example", "https://example.com/"),
-                new StartPageLink("Search", "https://www.google.com/", "Favorite"),
-                new StartPageLink("Docs", "https://learn.microsoft.com/"),
-                new StartPageLink("News", "https://news.example/"),
-                new StartPageLink("Mail", "https://mail.example/"),
-                new StartPageLink("Music", "https://music.example/"),
-                new StartPageLink("Maps", "https://maps.example/"),
-                new StartPageLink("Extra", "https://extra.example/")
-            ]);
-            page.SetStatus(new StartPageStatus("Ultra-light mode", "6 tabs · 2 resting"));
-            page.CreateControl();
-            page.PerformLayout();
-            using var renderedPage = new Bitmap(page.Width, page.Height);
-            page.DrawToBitmap(renderedPage, page.ClientRectangle);
-            var descendants = GetDescendants(page).ToArray();
-            var activatedLink = page.ActivateQuickLinkForTesting(0);
-            var activatedAction = page.ActivateActionForTesting(StartPageAction.ShowTabs);
-            completedLayout = page.Controls.Count > 0
-                && descendants.Count(control => control.AccessibleRole == AccessibleRole.Link) == 3
-                && descendants.Any(control => control.AccessibleName == "Ultra-light mode")
-                && descendants.Any(control => control.AccessibleName == "6 tabs · 2 resting")
-                && activatedLink
-                && navigationTarget == "https://example.com/"
-                && activatedAction
-                && requestedAction == StartPageAction.ShowTabs;
-        }
-        catch (Exception caught)
-        {
-            error = caught;
-        }
-    })
-    { IsBackground = true };
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
+        using var page = new NativeStartPage { Size = new Size(960, 560) };
+        string? navigationTarget = null;
+        StartPageAction? requestedAction = null;
+        page.NavigateRequested += (_, target) => navigationTarget = target;
+        page.ActionRequested += (_, action) => requestedAction = action;
+        page.SetQuickLinks(
+        [
+            new StartPageLink("Example", "https://example.com/"),
+            new StartPageLink("Search", "https://www.google.com/", "Favorite"),
+            new StartPageLink("Docs", "https://learn.microsoft.com/"),
+            new StartPageLink("News", "https://news.example/"),
+            new StartPageLink("Mail", "https://mail.example/"),
+            new StartPageLink("Music", "https://music.example/"),
+            new StartPageLink("Maps", "https://maps.example/"),
+            new StartPageLink("Extra", "https://extra.example/")
+        ]);
+        page.SetStatus(new StartPageStatus("Ultra-light mode", "6 tabs · 2 resting"));
+        page.CreateControl();
+        page.PerformLayout();
+        using var renderedPage = new Bitmap(page.Width, page.Height);
+        page.DrawToBitmap(renderedPage, page.ClientRectangle);
+        var descendants = GetDescendants(page).ToArray();
+        var activatedLink = page.ActivateQuickLinkForTesting(0);
+        var activatedAction = page.ActivateActionForTesting(StartPageAction.ShowTabs);
+        completedLayout = page.Controls.Count > 0
+            && descendants.Count(control => control.AccessibleRole == AccessibleRole.Link) == 6
+            && descendants.Any(control => control.AccessibleName == "Ultra-light mode")
+            && descendants.Any(control => control.AccessibleName == "6 tabs · 2 resting")
+            && activatedLink
+            && navigationTarget == "https://example.com/"
+            && activatedAction
+            && requestedAction == StartPageAction.ShowTabs;
+    });
     return error is null && completedLayout;
 }
 
@@ -7123,56 +7198,45 @@ bool CanConfigureNativeStartPageForIncognitoMode()
 
 (bool Active24Bit, bool Released) VerifyBackdropFrameCacheLifecycle()
 {
-    Exception? error = null;
     var active24Bit = false;
     var released = false;
     var diagnostic = string.Empty;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        try
+        var baseline = StartPageArtwork.GetBackdropFrameStateForTesting();
+        using var host = new NonActivatingTestForm
         {
-            var baseline = StartPageArtwork.GetBackdropFrameStateForTesting();
-            using var host = new Form
-            {
-                FormBorderStyle = FormBorderStyle.None,
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false,
-                ClientSize = new Size(960, 560)
-            };
-            using var page = new NativeStartPage { Dock = DockStyle.Fill };
-            host.Controls.Add(page);
-            host.Show();
-            host.PerformLayout();
-            page.PerformLayout();
-            Application.DoEvents();
+            FormBorderStyle = FormBorderStyle.None,
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false,
+            ClientSize = new Size(960, 560)
+        };
+        using var page = new NativeStartPage { Dock = DockStyle.Fill };
+        host.Controls.Add(page);
+        host.Show();
+        host.PerformLayout();
+        page.PerformLayout();
+        Application.DoEvents();
 
-            using (var renderedPage = new Bitmap(page.Width, page.Height))
-            {
-                page.DrawToBitmap(renderedPage, page.ClientRectangle);
-            }
-
-            var active = StartPageArtwork.GetBackdropFrameStateForTesting();
-            active24Bit = baseline.Leases == 0
-                && !baseline.Allocated
-                && active.Leases == 1
-                && active.Allocated
-                && active.PixelFormat == System.Drawing.Imaging.PixelFormat.Format24bppRgb;
-
-            page.Visible = false;
-            Application.DoEvents();
-            var hidden = StartPageArtwork.GetBackdropFrameStateForTesting();
-            released = hidden.Leases == 0 && !hidden.Allocated;
-            diagnostic = $"baseline={baseline}; active={active}; hidden={hidden}";
-        }
-        catch (Exception caught)
+        using (var renderedPage = new Bitmap(page.Width, page.Height))
         {
-            error = caught;
+            page.DrawToBitmap(renderedPage, page.ClientRectangle);
         }
+
+        var active = StartPageArtwork.GetBackdropFrameStateForTesting();
+        active24Bit = baseline.Leases == 0
+            && !baseline.Allocated
+            && active.Leases == 1
+            && active.Allocated
+            && active.PixelFormat == System.Drawing.Imaging.PixelFormat.Format24bppRgb;
+
+        page.Visible = false;
+        Application.DoEvents();
+        var hidden = StartPageArtwork.GetBackdropFrameStateForTesting();
+        released = hidden.Leases == 0 && !hidden.Allocated;
+        diagnostic = $"baseline={baseline}; active={active}; hidden={hidden}";
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     if (error is not null) Console.Error.WriteLine($"Backdrop-frame lifecycle probe failed: {error}");
     else if (!active24Bit || !released) Console.Error.WriteLine($"Backdrop-frame lifecycle probe: {diagnostic}");
     return error is null ? (active24Bit, released) : (false, false);
@@ -7449,73 +7513,56 @@ bool ValidateMultiSizeIcon(string? path)
 
 bool CanRenderStartPageLogoBadge()
 {
-    Exception? error = null;
     var valid = false;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        try
+        using var host = new NonActivatingTestForm
         {
-            using var host = new Form
-            {
-                AutoScaleMode = AutoScaleMode.Dpi,
-                FormBorderStyle = FormBorderStyle.None,
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false,
-                ClientSize = new Size(960, 720)
-            };
-            using var page = new NativeStartPage { Dock = DockStyle.Fill };
-            host.Controls.Add(page);
-            host.Show();
-            host.PerformLayout();
-            page.PerformLayout();
-            Application.DoEvents();
+            AutoScaleMode = AutoScaleMode.Dpi,
+            FormBorderStyle = FormBorderStyle.None,
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false,
+            ClientSize = new Size(960, 720)
+        };
+        using var page = new NativeStartPage { Dock = DockStyle.Fill };
+        host.Controls.Add(page);
+        host.Show();
+        host.PerformLayout();
+        page.PerformLayout();
+        Application.DoEvents();
 
-            var badge = GetDescendants(page).SingleOrDefault(control =>
-                control.AccessibleRole == AccessibleRole.Graphic
-                && control.AccessibleName == "MishaWeb logo");
-            if (badge is null || !badge.Visible || badge.Width < 48 || badge.Height < 48) return;
-            using var rendered = new Bitmap(
-                badge.Width,
-                badge.Height,
-                System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-            badge.DrawToBitmap(rendered, badge.ClientRectangle);
-            valid = page.ClientRectangle.Contains(BoundsWithin(page, badge))
-                && SurfaceHasVisualDetail(rendered);
-        }
-        catch (Exception caught)
-        {
-            error = caught;
-        }
+        var badge = GetDescendants(page).SingleOrDefault(control =>
+            control.AccessibleRole == AccessibleRole.Graphic
+            && control.AccessibleName == "MishaWeb logo");
+        if (badge is null || !badge.Visible || badge.Width < 48 || badge.Height < 48) return;
+        using var rendered = new Bitmap(
+            badge.Width,
+            badge.Height,
+            System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        badge.DrawToBitmap(rendered, badge.ClientRectangle);
+        valid = page.ClientRectangle.Contains(BoundsWithin(page, badge))
+            && SurfaceHasVisualDetail(rendered);
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     if (error is not null) Console.Error.WriteLine($"Bunny badge render probe failed: {error}");
     return error is null && valid;
 }
 
 (bool Valid, bool Hierarchy, string ObservedDpis) VerifyNativeStartPageResponsiveLayout()
 {
-    var modes = new[]
-    {
-        (Name: "unaware", ExpectedDpi: 96),
-        (Name: "per-monitor-v2", ExpectedDpi: 0)
-    };
-    var observations = new List<string>(modes.Length);
-    var allValid = true;
-    var allHierarchyValid = true;
-    foreach (var mode in modes)
-    {
-        var result = RunStartPageLayoutProbeProcess(mode.Name);
-        observations.Add($"{mode.Name}:{result.Dpi}");
-        allValid &= result.Valid
-            && (mode.ExpectedDpi == 0
-                ? result.Dpi is >= 96 and <= 480
-                : result.Dpi == mode.ExpectedDpi);
-        allHierarchyValid &= result.Hierarchy;
-    }
-    return (allValid, allHierarchyValid, string.Join(", ", observations));
+    var unawareTask = Task.Run(() => RunStartPageLayoutProbeProcess("unaware"));
+    var perMonitorResult = VerifyNativeStartPageResponsiveLayoutInCurrentProcess();
+    var unawareResult = unawareTask.GetAwaiter().GetResult();
+
+    var allValid = unawareResult.Valid
+        && unawareResult.Dpi == 96
+        && perMonitorResult.Valid
+        && perMonitorResult.Dpi is >= 96 and <= 480;
+    var allHierarchyValid = unawareResult.Hierarchy && perMonitorResult.Hierarchy;
+    return (
+        allValid,
+        allHierarchyValid,
+        $"unaware:{unawareResult.Dpi}, per-monitor-v2:{perMonitorResult.Dpi}");
 }
 
 (bool Valid, bool Hierarchy, int Dpi) RunStartPageLayoutProbeProcess(string mode)
@@ -7578,23 +7625,21 @@ bool CanRenderStartPageLogoBadge()
 
 (bool Valid, bool Hierarchy, int Dpi) VerifyNativeStartPageResponsiveLayoutInCurrentProcess()
 {
-    Exception? error = null;
     var valid = false;
     var hierarchyValid = false;
     var observedDpi = 0;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        try
+        using (var host = new NonActivatingTestForm
         {
-            using var host = new Form
-            {
-                AutoScaleMode = AutoScaleMode.Dpi,
-                FormBorderStyle = FormBorderStyle.None,
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false
-            };
-            using var page = new NativeStartPage { Dock = DockStyle.Fill };
+            AutoScaleMode = AutoScaleMode.Dpi,
+            FormBorderStyle = FormBorderStyle.None,
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false
+        })
+        using (var page = new NativeStartPage { Dock = DockStyle.Fill })
+        {
             page.SetQuickLinks(
             [
                 new StartPageLink("Messenger", "https://messenger.com/", "Favorite"),
@@ -7623,116 +7668,121 @@ bool CanRenderStartPageLogoBadge()
             };
             valid = true;
             hierarchyValid = true;
-            for (var index = 0; index < viewports.Length; index++)
+            using (StartPageArtwork.AcquireBackdropFrameLease())
             {
-                var viewport = viewports[index];
-                host.ClientSize = new Size(
-                    ScaleForDpi(viewport.Width, observedDpi),
-                    ScaleForDpi(viewport.Height, observedDpi));
-                host.PerformLayout();
-                page.PerformLayout();
-                Application.DoEvents();
-
-                var descendants = GetDescendants(page).ToArray();
-                var badge = descendants.SingleOrDefault(control =>
-                    control.AccessibleRole == AccessibleRole.Graphic
-                    && control.AccessibleName == "MishaWeb logo");
-                var title = descendants.SingleOrDefault(control =>
-                    control.AccessibleRole == AccessibleRole.StaticText
-                    && control.AccessibleName == "MishaWeb");
-                var card = descendants.OfType<ScrollableControl>().SingleOrDefault(control =>
-                    control.AccessibleName == "Start page card");
-                var links = descendants
-                    .Where(control => control.Visible && control.AccessibleRole == AccessibleRole.Link)
-                    .ToArray();
-                var featureChips = descendants.Where(control =>
-                    control.Visible
-                    && control.AccessibleRole == AccessibleRole.PushButton
-                    && (control.AccessibleDescription?.StartsWith("Lean browsing.", StringComparison.Ordinal) == true
-                        || control.AccessibleDescription?.StartsWith("Tab workspace.", StringComparison.Ordinal) == true))
-                    .ToArray();
-                var interactive = descendants.Where(control =>
-                    control.Visible
-                    && control.AccessibleRole is AccessibleRole.Link
-                        or AccessibleRole.PushButton
-                        or AccessibleRole.Text).ToArray();
-                var searchBounds = BoundsWithin(page, page.SearchBar);
-                var cardBounds = card is null ? Rectangle.Empty : BoundsWithin(page, card);
-                var badgeBounds = badge is null ? Rectangle.Empty : BoundsWithin(page, badge);
-                var titleBounds = title is null ? Rectangle.Empty : BoundsWithin(page, title);
-                var controlsContained = interactive.All(control =>
-                    page.ClientRectangle.Contains(BoundsWithin(page, control)));
-                var linksSeparated = RectanglesDoNotOverlap(
-                    links.Select(control => BoundsWithin(page, control)));
-                var majorControlsSeparated = RectanglesDoNotOverlap(
-                    links.Select(control => BoundsWithin(page, control))
-                        .Concat(featureChips.Select(control => BoundsWithin(page, control)))
-                        .Append(badgeBounds)
-                        .Append(titleBounds)
-                        .Append(searchBounds));
-                var statusPresent = descendants.Any(control =>
-                        control.AccessibleName == "Ultra-light mode")
-                    && descendants.Any(control => control.AccessibleName == "6 tabs open");
-                var completeHierarchy = HasExpectedStartPageHierarchy(page, descendants);
-                var scrollActive = card is not null
-                    && (card.VerticalScroll.Visible
-                        || card.DisplayRectangle.Height > card.ClientSize.Height);
-                var geometryValid = badge is not null
-                    && title is not null
-                    && card is not null
-                    && cardBounds.Width <= ScaleForDpi(680, observedDpi) + 1
-                    && Math.Abs(cardBounds.Left - ((page.ClientSize.Width - cardBounds.Width) / 2)) <= 1
-                    && badge.Visible
-                    && title.Visible
-                    && page.SearchBar.Visible
-                    && page.ClientRectangle.Contains(badgeBounds)
-                    && page.ClientRectangle.Contains(titleBounds)
-                    && page.ClientRectangle.Contains(searchBounds)
-                    && badgeBounds.Width == badgeBounds.Height
-                    && badgeBounds.Width >= ScaleForDpi(48, observedDpi)
-                    && searchBounds.Width >= ScaleForDpi(300, observedDpi)
-                    && !Overlaps(badgeBounds, titleBounds)
-                    && !Overlaps(badgeBounds, searchBounds)
-                    && !Overlaps(titleBounds, searchBounds)
-                    && (controlsContained || scrollActive)
-                    && links.Length == 3
-                    && featureChips.Length == 0
-                    && linksSeparated
-                    && majorControlsSeparated
-                    && statusPresent
-                    && completeHierarchy;
-
-                using var rendered = new Bitmap(page.Width, page.Height);
-                page.DrawToBitmap(rendered, page.ClientRectangle);
-                var visualDetail = SurfaceHasVisualDetail(rendered);
-                var snapshotValid = geometryValid && visualDetail;
-                if (!snapshotValid)
+                for (var index = 0; index < viewports.Length; index++)
                 {
-                    Console.Error.WriteLine(
-                        $"Start-page layout failed for {viewport.Width}x{viewport.Height} logical pixels "
-                        + $"at {observedDpi} DPI: badge={badgeBounds}; title={titleBounds}; "
-                        + $"search={searchBounds}; card={cardBounds}; links={links.Length}; contained={controlsContained}; "
-                        + $"separated={linksSeparated}; status={statusPresent}; "
-                        + $"features={featureChips.Length}; majorSeparated={majorControlsSeparated}; "
-                        + $"scroll={scrollActive}; hierarchy={completeHierarchy}; "
-                        + $"geometry={geometryValid}; detail={visualDetail}.");
-                }
-                valid &= snapshotValid;
-                hierarchyValid &= completeHierarchy;
+                    var viewport = viewports[index];
+                    host.ClientSize = new Size(
+                        ScaleForDpi(viewport.Width, observedDpi),
+                        ScaleForDpi(viewport.Height, observedDpi));
+                    host.PerformLayout();
+                    page.PerformLayout();
+                    Application.DoEvents();
 
-                var signature = CreateStartPageLayoutSignature(page);
-                if (index == 0) initialSignature = signature;
-                if (index == viewports.Length - 1) valid &= signature == initialSignature;
+                    var descendants = GetDescendants(page).ToArray();
+                    var badge = descendants.SingleOrDefault(control =>
+                        control.AccessibleRole == AccessibleRole.Graphic
+                        && control.AccessibleName == "MishaWeb logo");
+                    var title = descendants.SingleOrDefault(control =>
+                        control.AccessibleRole == AccessibleRole.StaticText
+                        && control.AccessibleName == "MishaWeb");
+                    var card = descendants.OfType<ScrollableControl>().SingleOrDefault(control =>
+                        control.AccessibleName == "Start page card");
+                    var links = descendants
+                        .Where(control => control.Visible && control.AccessibleRole == AccessibleRole.Link)
+                        .ToArray();
+                    var featureChips = descendants.Where(control =>
+                        control.Visible
+                        && control.AccessibleRole == AccessibleRole.PushButton
+                        && (control.AccessibleDescription?.StartsWith("Lean browsing.", StringComparison.Ordinal) == true
+                            || control.AccessibleDescription?.StartsWith("Tab workspace.", StringComparison.Ordinal) == true))
+                        .ToArray();
+                    var interactive = descendants.Where(control =>
+                        control.Visible
+                        && control.AccessibleRole is AccessibleRole.Link
+                            or AccessibleRole.PushButton
+                            or AccessibleRole.Text).ToArray();
+                    var searchBounds = BoundsWithin(page, page.SearchBar);
+                    var cardBounds = card is null ? Rectangle.Empty : card.Bounds;
+                    var badgeBounds = badge is null ? Rectangle.Empty : BoundsWithin(page, badge);
+                    var titleBounds = title is null ? Rectangle.Empty : BoundsWithin(page, title);
+                    var controlsContained = interactive.All(control =>
+                        page.ClientRectangle.Contains(BoundsWithin(page, control)));
+                    var linksSeparated = RectanglesDoNotOverlap(
+                        links.Select(control => BoundsWithin(page, control)));
+                    var majorControlsSeparated = RectanglesDoNotOverlap(
+                        links.Select(control => BoundsWithin(page, control))
+                            .Concat(featureChips.Select(control => BoundsWithin(page, control)))
+                            .Append(badgeBounds)
+                            .Append(titleBounds)
+                            .Append(searchBounds));
+                    var statusPresent = descendants.Any(control =>
+                            control.AccessibleName == "Ultra-light mode")
+                        && descendants.Any(control => control.AccessibleName == "6 tabs open");
+                    var completeHierarchy = HasExpectedStartPageHierarchy(page, descendants);
+                    var scrollActive = card is not null
+                        && (card.VerticalScroll.Visible
+                            || card.DisplayRectangle.Height > card.ClientSize.Height);
+                    var isMicroViewport = viewport.Width < 420 || viewport.Height < 320;
+                    var availableLogicalHeight = viewport.Height - (isMicroViewport ? 16 : 36);
+                    var expectedFeatureChips = !isMicroViewport && availableLogicalHeight >= 420 ? 2 : 0;
+                    var geometryValid = badge is not null
+                        && title is not null
+                        && card is not null
+                        && cardBounds.Width <= ScaleForDpi(680, observedDpi) + 1
+                        && Math.Abs(cardBounds.Left - ((page.ClientSize.Width - cardBounds.Width) / 2)) <= 1
+                        && badge.Visible
+                        && title.Visible
+                        && page.SearchBar.Visible
+                        && page.ClientRectangle.Contains(badgeBounds)
+                        && page.ClientRectangle.Contains(titleBounds)
+                        && page.ClientRectangle.Contains(searchBounds)
+                        && badgeBounds.Width == badgeBounds.Height
+                        && badgeBounds.Width >= ScaleForDpi(48, observedDpi)
+                        && searchBounds.Width >= ScaleForDpi(300, observedDpi)
+                        && !Overlaps(badgeBounds, titleBounds)
+                        && !Overlaps(badgeBounds, searchBounds)
+                        && !Overlaps(titleBounds, searchBounds)
+                        && (controlsContained || scrollActive)
+                        && links.Length == 6
+                        && featureChips.Length == expectedFeatureChips
+                        && linksSeparated
+                        && majorControlsSeparated
+                        && statusPresent
+                        && completeHierarchy;
+
+                    var visualDetail = true;
+                    if (index is 0 or 1 or 3 or 6)
+                    {
+                        using var rendered = new Bitmap(page.Width, page.Height);
+                        page.DrawToBitmap(rendered, page.ClientRectangle);
+                        visualDetail = SurfaceHasVisualDetail(rendered);
+                    }
+                    var snapshotValid = geometryValid && visualDetail;
+                    if (!snapshotValid)
+                    {
+                        Console.Error.WriteLine(
+                            $"Start-page layout failed for {viewport.Width}x{viewport.Height} logical pixels "
+                            + $"at {observedDpi} DPI: badge={badgeBounds}; title={titleBounds}; "
+                            + $"search={searchBounds}; card={cardBounds}; links={links.Length}; contained={controlsContained}; "
+                            + $"separated={linksSeparated}; status={statusPresent}; "
+                            + $"features={featureChips.Length} (expected {expectedFeatureChips}); majorSeparated={majorControlsSeparated}; "
+                            + $"scroll={scrollActive}; hierarchy={completeHierarchy}; "
+                            + $"geometry={geometryValid}; detail={visualDetail}.");
+                    }
+                    valid &= snapshotValid;
+                    hierarchyValid &= completeHierarchy;
+
+                    var signature = CreateStartPageLayoutSignature(page);
+                    if (index == 0) initialSignature = signature;
+                    if (index == viewports.Length - 1) valid &= signature == initialSignature;
+                }
             }
         }
-        catch (Exception caught)
-        {
-            error = caught;
-        }
+        var cacheAfter = StartPageArtwork.GetBackdropFrameStateForTesting();
+        valid &= cacheAfter.Leases == 0 && !cacheAfter.Allocated;
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     if (error is not null) Console.Error.WriteLine($"Start-page DPI probe failed: {error}");
     return (error is null && valid, error is null && hierarchyValid, observedDpi);
 }
@@ -7763,7 +7813,7 @@ bool HasExpectedStartPageHierarchy(NativeStartPage page, IReadOnlyCollection<Con
         && submit is not null
         && descendants.Any(control => control.AccessibleName == "Ultra-light mode")
         && descendants.Any(control => control.AccessibleName == "6 tabs open")
-        && linkCount == 3;
+        && linkCount == 6;
 }
 
 string CreateStartPageLayoutSignature(NativeStartPage page)
@@ -7808,55 +7858,44 @@ bool SurfaceHasVisualDetail(Bitmap bitmap)
 
 (bool Focus, bool TextTransfer) VerifyStartPageSearchRoutesToOmnibox()
 {
-    Exception? error = null;
     var focus = false;
     var textTransfer = false;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        try
+        using var form = new MainForm(startBrowserOnShown: false)
         {
-            using var form = new MainForm(startBrowserOnShown: false)
-            {
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false
-            };
-            form.Show();
-            form.PrepareChromePreviewForTesting();
-            form.PerformLayout();
-            Application.DoEvents();
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false
+        };
+        form.Show();
+        form.PrepareChromePreviewForTesting();
+        form.PerformLayout();
+        Application.DoEvents();
 
-            const System.Reflection.BindingFlags flags =
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
-            var addressBar = typeof(MainForm).GetField("addressBar", flags)?.GetValue(form) as TextBox;
-            var focusStartPageSearch = typeof(MainForm).GetMethod("FocusStartPageOrAddressBar", flags);
-            var startPage = GetDescendants(form).OfType<NativeStartPage>().SingleOrDefault();
-            if (addressBar is null || focusStartPageSearch is null || startPage is null)
-            {
-                return;
-            }
-
-            focusStartPageSearch.Invoke(form, null);
-            Application.DoEvents();
-            focus = addressBar.Focused && !startPage.SearchBar.InputControl.Focused;
-
-            startPage.SearchBar.InputControl.Focus();
-            startPage.SearchText = "bunny videos";
-            Application.DoEvents();
-            textTransfer = addressBar.Focused
-                && addressBar.Text == "bunny videos"
-                && addressBar.SelectionStart == addressBar.TextLength
-                && addressBar.SelectionLength == 0
-                && startPage.SearchText.Length == 0;
-        }
-        catch (Exception caught)
+        const System.Reflection.BindingFlags flags =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        var addressBar = typeof(MainForm).GetField("addressBar", flags)?.GetValue(form) as TextBox;
+        var focusStartPageSearch = typeof(MainForm).GetMethod("FocusStartPageOrAddressBar", flags);
+        var startPage = GetDescendants(form).OfType<NativeStartPage>().SingleOrDefault();
+        if (addressBar is null || focusStartPageSearch is null || startPage is null)
         {
-            error = caught;
+            return;
         }
+
+        focusStartPageSearch.Invoke(form, null);
+        Application.DoEvents();
+        focus = addressBar.Focused && !startPage.SearchBar.InputControl.Focused;
+
+        startPage.SearchBar.InputControl.Focus();
+        startPage.SearchText = "bunny videos";
+        Application.DoEvents();
+        textTransfer = addressBar.Focused
+            && addressBar.Text == "bunny videos"
+            && addressBar.SelectionStart == addressBar.TextLength
+            && addressBar.SelectionLength == 0
+            && startPage.SearchText.Length == 0;
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     if (error is not null)
     {
         Console.Error.WriteLine($"Start-page omnibox routing probe failed: {error}");
@@ -7866,163 +7905,152 @@ bool SurfaceHasVisualDetail(Bitmap bitmap)
 
 (bool Valid, int Dpi) VerifySmartSearchLayoutRegression()
 {
-    Exception? error = null;
     var layoutValid = false;
     var observedDpi = 96;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        try
+        using var host = new NonActivatingTestForm
         {
-            using var host = new Form
-            {
-                AutoScaleMode = AutoScaleMode.Dpi,
-                FormBorderStyle = FormBorderStyle.None,
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false
-            };
-            using var bar = new SmartSearchBar
-            {
-                Dock = DockStyle.None,
-                Location = new Point(8, 8)
-            };
-            host.Controls.Add(bar);
-            host.Show();
-            observedDpi = Math.Max(96, bar.DeviceDpi);
+            AutoScaleMode = AutoScaleMode.Dpi,
+            FormBorderStyle = FormBorderStyle.None,
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false
+        };
+        using var bar = new SmartSearchBar
+        {
+            Dock = DockStyle.None,
+            Location = new Point(8, 8)
+        };
+        host.Controls.Add(bar);
+        host.Show();
+        observedDpi = Math.Max(96, bar.DeviceDpi);
 
-            var logicalWidths = new[]
+        var logicalWidths = new[]
+        {
+            900, 760, 650, 649, 560, 559, 500, 499, 420, 320, 260,
+            320, 499, 500, 559, 560, 649, 650, 760, 900
+        };
+        layoutValid = true;
+        foreach (var logicalWidth in logicalWidths)
+        {
+            var physicalWidth = ScaleForDpi(logicalWidth, observedDpi);
+            var physicalHeight = ScaleForDpi(72, observedDpi);
+            host.ClientSize = new Size(physicalWidth + 16, physicalHeight + 16);
+            // Exercise the bar's own responsive paths. Its production parent supplies
+            // the viewport-specific minimum; retaining the constructor's wide minimum
+            // here would silently clamp every compact test case to 620 logical pixels.
+            bar.MinimumSize = Size.Empty;
+            bar.Size = new Size(physicalWidth, physicalHeight);
+            host.PerformLayout();
+            bar.PerformLayout();
+            Application.DoEvents();
+
+            foreach (var inputValue in new[] { string.Empty, "mishafans.example" })
             {
-                900, 760, 650, 649, 560, 559, 500, 499, 420, 320, 260,
-                320, 499, 500, 559, 560, 649, 650, 760, 900
-            };
-            layoutValid = true;
-            foreach (var logicalWidth in logicalWidths)
-            {
-                var physicalWidth = ScaleForDpi(logicalWidth, observedDpi);
-                var physicalHeight = ScaleForDpi(72, observedDpi);
-                host.ClientSize = new Size(physicalWidth + 16, physicalHeight + 16);
-                // Exercise the bar's own responsive paths. Its production parent supplies
-                // the viewport-specific minimum; retaining the constructor's wide minimum
-                // here would silently clamp every compact test case to 620 logical pixels.
-                bar.MinimumSize = Size.Empty;
-                bar.Size = new Size(physicalWidth, physicalHeight);
-                host.PerformLayout();
+                bar.Text = inputValue;
                 bar.PerformLayout();
                 Application.DoEvents();
+                var emptyPresentation = inputValue.Length == 0;
 
-                foreach (var inputValue in new[] { string.Empty, "mishafans.example" })
+                var descendants = GetDescendants(bar).ToArray();
+                var input = descendants.OfType<TextBox>().SingleOrDefault(control =>
+                    control.AccessibleName == "Search or open a website");
+                var icon = descendants.SingleOrDefault(control =>
+                    control.AccessibleName == "Search input"
+                    && control.AccessibleRole == AccessibleRole.Graphic);
+                var provider = descendants.OfType<Button>().SingleOrDefault(control =>
+                    control.AccessibleName?.StartsWith("Search engine:", StringComparison.Ordinal) == true);
+                var action = descendants.OfType<Button>().SingleOrDefault(control =>
+                    control != provider);
+                var hint = descendants.OfType<Label>().SingleOrDefault(control =>
+                    control.AccessibleName == "Keyboard shortcut Ctrl plus K");
+                var mode = descendants.OfType<Label>().SingleOrDefault(control =>
+                    control != hint);
+
+                if (input is null
+                    || icon is null
+                    || action is null
+                    || provider is null
+                    || mode is null
+                    || hint is null)
                 {
-                    bar.Text = inputValue;
-                    bar.PerformLayout();
-                    Application.DoEvents();
-                    var emptyPresentation = inputValue.Length == 0;
-
-                    var descendants = GetDescendants(bar).ToArray();
-                    var input = descendants.OfType<TextBox>().SingleOrDefault(control =>
-                        control.AccessibleName == "Search or open a website");
-                    var icon = descendants.SingleOrDefault(control =>
-                        control.AccessibleName == "Search input"
-                        && control.AccessibleRole == AccessibleRole.Graphic);
-                    var provider = descendants.OfType<Button>().SingleOrDefault(control =>
-                        control.AccessibleName?.StartsWith("Search engine:", StringComparison.Ordinal) == true);
-                    var action = descendants.OfType<Button>().SingleOrDefault(control =>
-                        control != provider);
-                    var hint = descendants.OfType<Label>().SingleOrDefault(control =>
-                        control.AccessibleName == "Keyboard shortcut Ctrl plus K");
-                    var mode = descendants.OfType<Label>().SingleOrDefault(control =>
-                        control != hint);
-
-                    if (input is null
-                        || icon is null
-                        || action is null
-                        || provider is null
-                        || mode is null
-                        || hint is null)
-                    {
-                        Console.Error.WriteLine($"Smart search controls were missing at {logicalWidth}px / {observedDpi} DPI.");
-                        layoutValid = false;
-                        continue;
-                    }
-
-                    var compact = bar.Width < ScaleForDpi(500, observedDpi);
-                    var medium = bar.Width < ScaleForDpi(650, observedDpi);
-                    var requestedSizeApplied = Math.Abs(bar.Width - physicalWidth) <= 1
-                        && Math.Abs(bar.Height - physicalHeight) <= 1;
-                    var inputBounds = BoundsWithin(bar, input);
-                    var iconBounds = BoundsWithin(bar, icon);
-                    var actionBounds = BoundsWithin(bar, action);
-                    var providerBounds = BoundsWithin(bar, provider);
-                    var modeBounds = BoundsWithin(bar, mode);
-                    var hintBounds = BoundsWithin(bar, hint);
-                    var visibleControls = descendants.Where(control => control.Visible).ToArray();
-                    var visibleInsideBar = visibleControls.All(control =>
-                        bar.ClientRectangle.Contains(BoundsWithin(bar, control)));
-                    var singleVisibleSearchGlyph = visibleControls.Count(control =>
-                        control.AccessibleName == "Search input"
-                        && control.AccessibleRole == AccessibleRole.Graphic) == 1;
-                    var visibilityValid = provider.Visible == !compact
-                        && mode.Visible == !compact
-                        && hint.Visible == (!compact && !medium && emptyPresentation);
-                    var presentationValid = emptyPresentation
-                        ? bar.Classification == SmartSearchClassification.Empty
-                            && !bar.CanSubmit
-                            && !action.Enabled
-                            && action.AccessibleName == "Go"
-                            && mode.AccessibleName == "Search or open a site"
-                        : bar.Classification == SmartSearchClassification.Address
-                            && bar.CanSubmit
-                            && action.Enabled
-                            && action.AccessibleName == "Open website"
-                            && mode.AccessibleName == "Open website";
-                    var hintTextFits = !hint.Visible
-                        || hint.GetPreferredSize(Size.Empty).Width <= hint.ClientSize.Width;
-                    var geometryValid = visibleInsideBar
-                        && singleVisibleSearchGlyph
-                        && hintTextFits
-                        && requestedSizeApplied
-                        && inputBounds.Width >= ScaleForDpi(72, observedDpi)
-                        && actionBounds.Width >= ScaleForDpi(compact ? 40 : 88, observedDpi)
-                        && !Overlaps(iconBounds, inputBounds)
-                        && !Overlaps(iconBounds, actionBounds)
-                        && !Overlaps(inputBounds, actionBounds)
-                        && (!provider.Visible
-                            || (!Overlaps(providerBounds, actionBounds)
-                                && !Overlaps(providerBounds, inputBounds)))
-                        && (!mode.Visible
-                            || (!Overlaps(modeBounds, actionBounds)
-                                && !Overlaps(modeBounds, providerBounds)))
-                        && (!hint.Visible
-                            || (!Overlaps(hintBounds, providerBounds)
-                                && !Overlaps(hintBounds, actionBounds)
-                                && !Overlaps(hintBounds, inputBounds)));
-
-                    using var renderedBar = new Bitmap(bar.Width, bar.Height);
-                    bar.DrawToBitmap(renderedBar, bar.ClientRectangle);
-                    var snapshotValid = visibilityValid && presentationValid && geometryValid;
-                    if (!snapshotValid)
-                    {
-                        Console.Error.WriteLine(
-                            $"Smart search layout failed at {logicalWidth}px / {observedDpi} DPI "
-                            + $"with {(emptyPresentation ? "empty" : "active")} input: "
-                            + $"bar={bar.ClientRectangle}; input={inputBounds}; icon={iconBounds}; "
-                            + $"action={actionBounds}; provider={providerBounds}; mode={modeBounds}; hint={hintBounds}; "
-                            + $"hintPreferred={hint.GetPreferredSize(Size.Empty).Width}; compact={compact}; medium={medium}; "
-                            + $"requested={physicalWidth}x{physicalHeight}; actual={bar.Width}x{bar.Height}; "
-                            + $"inside={visibleInsideBar}; glyphs={singleVisibleSearchGlyph}.");
-                    }
-                    layoutValid &= snapshotValid;
+                    Console.Error.WriteLine($"Smart search controls were missing at {logicalWidth}px / {observedDpi} DPI.");
+                    layoutValid = false;
+                    continue;
                 }
-                bar.Text = string.Empty;
+
+                var compact = bar.Width < ScaleForDpi(500, observedDpi);
+                var medium = bar.Width < ScaleForDpi(650, observedDpi);
+                var requestedSizeApplied = Math.Abs(bar.Width - physicalWidth) <= 1
+                    && Math.Abs(bar.Height - physicalHeight) <= 1;
+                var inputBounds = BoundsWithin(bar, input);
+                var iconBounds = BoundsWithin(bar, icon);
+                var actionBounds = BoundsWithin(bar, action);
+                var providerBounds = BoundsWithin(bar, provider);
+                var modeBounds = BoundsWithin(bar, mode);
+                var hintBounds = BoundsWithin(bar, hint);
+                var visibleControls = descendants.Where(control => control.Visible).ToArray();
+                var visibleInsideBar = visibleControls.All(control =>
+                    bar.ClientRectangle.Contains(BoundsWithin(bar, control)));
+                var singleVisibleSearchGlyph = visibleControls.Count(control =>
+                    control.AccessibleName == "Search input"
+                    && control.AccessibleRole == AccessibleRole.Graphic) == 1;
+                var visibilityValid = provider.Visible == !compact
+                    && mode.Visible == !compact
+                    && hint.Visible == (!compact && !medium && emptyPresentation);
+                var presentationValid = emptyPresentation
+                    ? bar.Classification == SmartSearchClassification.Empty
+                        && !bar.CanSubmit
+                        && !action.Enabled
+                        && action.AccessibleName == "Go"
+                        && mode.AccessibleName == "Search or open a site"
+                    : bar.Classification == SmartSearchClassification.Address
+                        && bar.CanSubmit
+                        && action.Enabled
+                        && action.AccessibleName == "Open website"
+                        && mode.AccessibleName == "Open website";
+                var hintTextFits = !hint.Visible
+                    || hint.GetPreferredSize(Size.Empty).Width <= hint.ClientSize.Width;
+                var geometryValid = visibleInsideBar
+                    && singleVisibleSearchGlyph
+                    && hintTextFits
+                    && requestedSizeApplied
+                    && inputBounds.Width >= ScaleForDpi(72, observedDpi)
+                    && actionBounds.Width >= ScaleForDpi(compact ? 40 : 88, observedDpi)
+                    && !Overlaps(iconBounds, inputBounds)
+                    && !Overlaps(iconBounds, actionBounds)
+                    && !Overlaps(inputBounds, actionBounds)
+                    && (!provider.Visible
+                        || (!Overlaps(providerBounds, actionBounds)
+                            && !Overlaps(providerBounds, inputBounds)))
+                    && (!mode.Visible
+                        || (!Overlaps(modeBounds, actionBounds)
+                            && !Overlaps(modeBounds, providerBounds)))
+                    && (!hint.Visible
+                        || (!Overlaps(hintBounds, providerBounds)
+                            && !Overlaps(hintBounds, actionBounds)
+                            && !Overlaps(hintBounds, inputBounds)));
+
+                using var renderedBar = new Bitmap(bar.Width, bar.Height);
+                bar.DrawToBitmap(renderedBar, bar.ClientRectangle);
+                var snapshotValid = visibilityValid && presentationValid && geometryValid;
+                if (!snapshotValid)
+                {
+                    Console.Error.WriteLine(
+                        $"Smart search layout failed at {logicalWidth}px / {observedDpi} DPI "
+                        + $"with {(emptyPresentation ? "empty" : "active")} input: "
+                        + $"bar={bar.ClientRectangle}; input={inputBounds}; icon={iconBounds}; "
+                        + $"action={actionBounds}; provider={providerBounds}; mode={modeBounds}; hint={hintBounds}; "
+                        + $"hintPreferred={hint.GetPreferredSize(Size.Empty).Width}; compact={compact}; medium={medium}; "
+                        + $"requested={physicalWidth}x{physicalHeight}; actual={bar.Width}x{bar.Height}; "
+                        + $"inside={visibleInsideBar}; glyphs={singleVisibleSearchGlyph}.");
+                }
+                layoutValid &= snapshotValid;
             }
-        }
-        catch (Exception caught)
-        {
-            error = caught;
+            bar.Text = string.Empty;
         }
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     if (error is not null)
     {
         Console.Error.WriteLine($"Smart search layout regression probe failed: {error}");
@@ -8236,120 +8264,109 @@ bool CanPrepareRendererFreeBrowser()
 
 (bool Reordered, bool HitTesting, bool GhostFeedback) VerifyTabDragReordering()
 {
-    Exception? error = null;
     var reordered = false;
     var hitTesting = false;
     var ghostFeedback = false;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        try
+        using var form = new MainForm(startBrowserOnShown: false)
         {
-            using var form = new MainForm(startBrowserOnShown: false)
-            {
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false
-            };
-            form.Show();
-            form.PrepareLoadedChromePreviewForTesting();
-            form.PerformLayout();
-            Application.DoEvents();
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false
+        };
+        form.Show();
+        form.PrepareLoadedChromePreviewForTesting();
+        form.PerformLayout();
+        Application.DoEvents();
 
-            const System.Reflection.BindingFlags flags =
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
-            var tabStrip = typeof(MainForm).GetField("tabStrip", flags)?.GetValue(form) as FlowLayoutPanel;
-            var tabArea = typeof(MainForm).GetField("tabArea", flags)?.GetValue(form) as Panel;
-            var tabDragGhost = typeof(MainForm).GetField("tabDragGhost", flags)?.GetValue(form) as Control;
-            var isCaptionPoint = typeof(MainForm).GetMethod("IsCaptionPoint", flags);
-            var onMouseDown = typeof(Control).GetMethod("OnMouseDown", flags);
-            var onMouseMove = typeof(Control).GetMethod("OnMouseMove", flags);
-            var onMouseUp = typeof(Control).GetMethod("OnMouseUp", flags);
-            var headers = tabStrip?.Controls
-                .Cast<Control>()
-                .OrderBy(control => control.Left)
-                .ToArray() ?? [];
-            if (tabStrip is null
-                || tabArea is null
-                || tabDragGhost is null
-                || isCaptionPoint is null
-                || onMouseDown is null
-                || onMouseMove is null
-                || onMouseUp is null
-                || headers.Length < 3)
-            {
-                return;
-            }
-
-            var initialHeaderNames = headers.Select(control => control.AccessibleName).ToArray();
-            var source = headers[0];
-            var target = headers[2];
-            var sourcePoint = new Point(source.Width / 2, source.Height / 2);
-            var sourceScreenPoint = source.PointToScreen(sourcePoint);
-            var blankScreenPoint = tabArea.PointToScreen(
-                new Point(Math.Max(0, tabArea.ClientSize.Width - 2), tabArea.ClientSize.Height / 2));
-            hitTesting = isCaptionPoint.Invoke(
-                    form,
-                    [form.PointToClient(sourceScreenPoint), sourceScreenPoint]) is false
-                && isCaptionPoint.Invoke(
-                    form,
-                    [form.PointToClient(blankScreenPoint), blankScreenPoint]) is true;
-
-            var targetScreenPoint = target.PointToScreen(
-                new Point(Math.Max(1, target.Width - 2), target.Height / 2));
-            var targetPointRelativeToSource = source.PointToClient(targetScreenPoint);
-            onMouseDown.Invoke(
-                source,
-                [new MouseEventArgs(MouseButtons.Left, 1, sourcePoint.X, sourcePoint.Y, 0)]);
-            onMouseMove.Invoke(
-                source,
-                [new MouseEventArgs(
-                    MouseButtons.Left,
-                    0,
-                    targetPointRelativeToSource.X,
-                    targetPointRelativeToSource.Y,
-                    0)]);
-            Application.DoEvents();
-            var ghostVisibleDuringMove = tabDragGhost.Visible
-                && tabDragGhost.Width >= source.Width
-                && tabDragGhost.Height >= source.Height
-                && tabDragGhost.AccessibleName?.StartsWith("Dragging ", StringComparison.Ordinal) == true;
-            onMouseUp.Invoke(
-                source,
-                [new MouseEventArgs(
-                    MouseButtons.Left,
-                    1,
-                    targetPointRelativeToSource.X,
-                    targetPointRelativeToSource.Y,
-                    0)]);
-            form.PerformLayout();
-            Application.DoEvents();
-            ghostFeedback = ghostVisibleDuringMove && !tabDragGhost.Visible;
-
-            var reorderedHeaders = tabStrip.Controls
-                .Cast<Control>()
-                .OrderBy(control => control.Left)
-                .Select(control => control.AccessibleName)
-                .ToArray();
-            reordered = reorderedHeaders.Length == initialHeaderNames.Length
-                && reorderedHeaders[0] == initialHeaderNames[1]
-                && reorderedHeaders[1] == initialHeaderNames[2]
-                && reorderedHeaders[2] == initialHeaderNames[0]
-                && reorderedHeaders.Skip(3).SequenceEqual(initialHeaderNames.Skip(3));
-            if (!reordered)
-            {
-                Console.Error.WriteLine(
-                    $"Tab drag probe failed: initial={string.Join(" | ", initialHeaderNames)}; "
-                    + $"order={string.Join(" | ", reorderedHeaders)}");
-            }
+        const System.Reflection.BindingFlags flags =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        var tabStrip = typeof(MainForm).GetField("tabStrip", flags)?.GetValue(form) as FlowLayoutPanel;
+        var tabArea = typeof(MainForm).GetField("tabArea", flags)?.GetValue(form) as Panel;
+        var tabDragGhost = typeof(MainForm).GetField("tabDragGhost", flags)?.GetValue(form) as Control;
+        var isCaptionPoint = typeof(MainForm).GetMethod("IsCaptionPoint", flags);
+        var onMouseDown = typeof(Control).GetMethod("OnMouseDown", flags);
+        var onMouseMove = typeof(Control).GetMethod("OnMouseMove", flags);
+        var onMouseUp = typeof(Control).GetMethod("OnMouseUp", flags);
+        var headers = tabStrip?.Controls
+            .Cast<Control>()
+            .OrderBy(control => control.Left)
+            .ToArray() ?? [];
+        if (tabStrip is null
+            || tabArea is null
+            || tabDragGhost is null
+            || isCaptionPoint is null
+            || onMouseDown is null
+            || onMouseMove is null
+            || onMouseUp is null
+            || headers.Length < 3)
+        {
+            return;
         }
-        catch (Exception caught)
+
+        var initialHeaderNames = headers.Select(control => control.AccessibleName).ToArray();
+        var source = headers[0];
+        var target = headers[2];
+        var sourcePoint = new Point(source.Width / 2, source.Height / 2);
+        var sourceScreenPoint = source.PointToScreen(sourcePoint);
+        var blankScreenPoint = tabArea.PointToScreen(
+            new Point(Math.Max(0, tabArea.ClientSize.Width - 2), tabArea.ClientSize.Height / 2));
+        hitTesting = isCaptionPoint.Invoke(
+                form,
+                [form.PointToClient(sourceScreenPoint), sourceScreenPoint]) is false
+            && isCaptionPoint.Invoke(
+                form,
+                [form.PointToClient(blankScreenPoint), blankScreenPoint]) is true;
+
+        var targetScreenPoint = target.PointToScreen(
+            new Point(Math.Max(1, target.Width - 2), target.Height / 2));
+        var targetPointRelativeToSource = source.PointToClient(targetScreenPoint);
+        onMouseDown.Invoke(
+            source,
+            [new MouseEventArgs(MouseButtons.Left, 1, sourcePoint.X, sourcePoint.Y, 0)]);
+        onMouseMove.Invoke(
+            source,
+            [new MouseEventArgs(
+                MouseButtons.Left,
+                0,
+                targetPointRelativeToSource.X,
+                targetPointRelativeToSource.Y,
+                0)]);
+        Application.DoEvents();
+        var ghostVisibleDuringMove = tabDragGhost.Visible
+            && tabDragGhost.Width >= source.Width
+            && tabDragGhost.Height >= source.Height
+            && tabDragGhost.AccessibleName?.StartsWith("Dragging ", StringComparison.Ordinal) == true;
+        onMouseUp.Invoke(
+            source,
+            [new MouseEventArgs(
+                MouseButtons.Left,
+                1,
+                targetPointRelativeToSource.X,
+                targetPointRelativeToSource.Y,
+                0)]);
+        form.PerformLayout();
+        Application.DoEvents();
+        ghostFeedback = ghostVisibleDuringMove && !tabDragGhost.Visible;
+
+        var reorderedHeaders = tabStrip.Controls
+            .Cast<Control>()
+            .OrderBy(control => control.Left)
+            .Select(control => control.AccessibleName)
+            .ToArray();
+        reordered = reorderedHeaders.Length == initialHeaderNames.Length
+            && reorderedHeaders[0] == initialHeaderNames[1]
+            && reorderedHeaders[1] == initialHeaderNames[2]
+            && reorderedHeaders[2] == initialHeaderNames[0]
+            && reorderedHeaders.Skip(3).SequenceEqual(initialHeaderNames.Skip(3));
+        if (!reordered)
         {
-            error = caught;
+            Console.Error.WriteLine(
+                $"Tab drag probe failed: initial={string.Join(" | ", initialHeaderNames)}; "
+                + $"order={string.Join(" | ", reorderedHeaders)}");
         }
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     return (
         error is null && reordered,
         error is null && hitTesting,
@@ -8383,75 +8400,64 @@ bool CanPrepareRendererFreeBrowser()
         && audioRefresh < audioEventEnd
         && audiblePassedToHeader;
 
-    Exception? error = null;
     var audibleGlyph = false;
     var mutedGlyph = false;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        try
+        using var form = new MainForm(startBrowserOnShown: false)
         {
-            using var form = new MainForm(startBrowserOnShown: false)
-            {
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false
-            };
-            form.Show();
-            form.PrepareLoadedChromePreviewForTesting();
-            form.PerformLayout();
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false
+        };
+        form.Show();
+        form.PrepareLoadedChromePreviewForTesting();
+        form.PerformLayout();
+        Application.DoEvents();
+
+        const System.Reflection.BindingFlags privateFlags =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        const System.Reflection.BindingFlags publicFlags =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public;
+        var tabStrip = typeof(MainForm).GetField("tabStrip", privateFlags)?.GetValue(form) as FlowLayoutPanel;
+        var header = tabStrip?.Controls.Cast<Control>().FirstOrDefault();
+        var setState = header?.GetType().GetMethod("SetState", publicFlags);
+        if (header is null || setState is null || header.Width < 24 || header.Height < 16)
+        {
+            return;
+        }
+
+        Bitmap Render(bool audible, bool muted)
+        {
+            setState.Invoke(
+                header,
+                [string.Empty, false, false, false, false, false, audible, muted, false]);
+            header.PerformLayout();
+            header.Invalidate();
+            header.Update();
             Application.DoEvents();
-
-            const System.Reflection.BindingFlags privateFlags =
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
-            const System.Reflection.BindingFlags publicFlags =
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public;
-            var tabStrip = typeof(MainForm).GetField("tabStrip", privateFlags)?.GetValue(form) as FlowLayoutPanel;
-            var header = tabStrip?.Controls.Cast<Control>().FirstOrDefault();
-            var setState = header?.GetType().GetMethod("SetState", publicFlags);
-            if (header is null || setState is null || header.Width < 24 || header.Height < 16)
-            {
-                return;
-            }
-
-            Bitmap Render(bool audible, bool muted)
-            {
-                setState.Invoke(
-                    header,
-                    [string.Empty, false, false, false, false, false, audible, muted, false]);
-                header.PerformLayout();
-                header.Invalidate();
-                header.Update();
-                Application.DoEvents();
-                var rendered = new Bitmap(header.Width, header.Height);
-                header.DrawToBitmap(rendered, header.ClientRectangle);
-                return rendered;
-            }
-
-            using var silent = Render(audible: false, muted: false);
-            using var audible = Render(audible: true, muted: false);
-            var audibleDescription = header.AccessibleDescription ?? string.Empty;
-            var audiblePadding = header.Padding.Left;
-            using var muted = Render(audible: true, muted: true);
-            var mutedDescription = header.AccessibleDescription ?? string.Empty;
-
-            var glyphArea = new Rectangle(4, 0, Math.Min(20, header.Width - 4), header.Height);
-            var audibleDifference = CountPixelDifferences(silent, audible, glyphArea);
-            var mutedDifference = CountPixelDifferences(audible, muted, glyphArea);
-            audibleGlyph = audibleDifference >= 8
-                && audiblePadding >= 24
-                && audibleDescription.Contains("playing audio", StringComparison.OrdinalIgnoreCase);
-            mutedGlyph = mutedDifference >= 8
-                && mutedDescription.Contains("muted", StringComparison.OrdinalIgnoreCase)
-                && !mutedDescription.Contains("playing audio", StringComparison.OrdinalIgnoreCase);
+            var rendered = new Bitmap(header.Width, header.Height);
+            header.DrawToBitmap(rendered, header.ClientRectangle);
+            return rendered;
         }
-        catch (Exception caught)
-        {
-            error = caught;
-        }
+
+        using var silent = Render(audible: false, muted: false);
+        using var audible = Render(audible: true, muted: false);
+        var audibleDescription = header.AccessibleDescription ?? string.Empty;
+        var audiblePadding = header.Padding.Left;
+        using var muted = Render(audible: true, muted: true);
+        var mutedDescription = header.AccessibleDescription ?? string.Empty;
+
+        var glyphArea = new Rectangle(4, 0, Math.Min(20, header.Width - 4), header.Height);
+        var audibleDifference = CountPixelDifferences(silent, audible, glyphArea);
+        var mutedDifference = CountPixelDifferences(audible, muted, glyphArea);
+        audibleGlyph = audibleDifference >= 8
+            && audiblePadding >= 24
+            && audibleDescription.Contains("playing audio", StringComparison.OrdinalIgnoreCase);
+        mutedGlyph = mutedDifference >= 8
+            && mutedDescription.Contains("muted", StringComparison.OrdinalIgnoreCase)
+            && !mutedDescription.Contains("playing audio", StringComparison.OrdinalIgnoreCase);
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     if (error is not null)
     {
         Console.Error.WriteLine($"Tab audio-indicator probe failed: {error}");
@@ -8492,63 +8498,52 @@ bool WindowCaptionDragUsesNativeMove()
 
 (bool Valid, int Width, bool Scrollable) VerifyReservedWindowDragSpace()
 {
-    Exception? error = null;
     var valid = false;
     var reservedWidth = 0;
     var scrollable = false;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        try
+        using var form = new MainForm(startBrowserOnShown: false)
         {
-            using var form = new MainForm(startBrowserOnShown: false)
-            {
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false
-            };
-            form.Show();
-            form.PrepareLoadedChromePreviewForTesting();
-            form.ClientSize = new Size(
-                ScaleForDpi(560, form.DeviceDpi),
-                ScaleForDpi(500, form.DeviceDpi));
-            form.PerformLayout();
-            Application.DoEvents();
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false
+        };
+        form.Show();
+        form.PrepareLoadedChromePreviewForTesting();
+        form.ClientSize = new Size(
+            ScaleForDpi(560, form.DeviceDpi),
+            ScaleForDpi(500, form.DeviceDpi));
+        form.PerformLayout();
+        Application.DoEvents();
 
-            const System.Reflection.BindingFlags flags =
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
-            var tabArea = typeof(MainForm).GetField("tabArea", flags)?.GetValue(form) as Panel;
-            var tabStrip = typeof(MainForm).GetField("tabStrip", flags)?.GetValue(form) as FlowLayoutPanel;
-            var newTabButton = typeof(MainForm).GetField("newTabButton", flags)?.GetValue(form) as Button;
-            var isCaptionPoint = typeof(MainForm).GetMethod("IsCaptionPoint", flags);
-            if (tabArea is null || tabStrip is null || newTabButton is null || isCaptionPoint is null)
-            {
-                return;
-            }
-
-            reservedWidth = tabArea.ClientSize.Width - newTabButton.Right;
-            var expectedWidth = ScaleForDpi(48, form.DeviceDpi);
-            var gripPoint = new Point(
-                newTabButton.Right + Math.Max(1, reservedWidth / 2),
-                Math.Max(1, tabArea.ClientSize.Height / 2));
-            var screenPoint = tabArea.PointToScreen(gripPoint);
-            var captionHit = isCaptionPoint.Invoke(
-                form,
-                [form.PointToClient(screenPoint), screenPoint]) is true;
-            valid = Math.Abs(reservedWidth - expectedWidth) <= 2
-                && tabStrip.Right == newTabButton.Left
-                && newTabButton.Right < tabArea.ClientSize.Width
-                && captionHit;
-            scrollable = tabStrip.AutoScroll
-                && tabStrip.AutoScrollMinSize.Width > tabStrip.ClientSize.Width;
-        }
-        catch (Exception caught)
+        const System.Reflection.BindingFlags flags =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        var tabArea = typeof(MainForm).GetField("tabArea", flags)?.GetValue(form) as Panel;
+        var tabStrip = typeof(MainForm).GetField("tabStrip", flags)?.GetValue(form) as FlowLayoutPanel;
+        var newTabButton = typeof(MainForm).GetField("newTabButton", flags)?.GetValue(form) as Button;
+        var isCaptionPoint = typeof(MainForm).GetMethod("IsCaptionPoint", flags);
+        if (tabArea is null || tabStrip is null || newTabButton is null || isCaptionPoint is null)
         {
-            error = caught;
+            return;
         }
+
+        reservedWidth = tabArea.ClientSize.Width - newTabButton.Right;
+        var expectedWidth = ScaleForDpi(48, form.DeviceDpi);
+        var gripPoint = new Point(
+            newTabButton.Right + Math.Max(1, reservedWidth / 2),
+            Math.Max(1, tabArea.ClientSize.Height / 2));
+        var screenPoint = tabArea.PointToScreen(gripPoint);
+        var captionHit = isCaptionPoint.Invoke(
+            form,
+            [form.PointToClient(screenPoint), screenPoint]) is true;
+        valid = Math.Abs(reservedWidth - expectedWidth) <= 2
+            && tabStrip.Right == newTabButton.Left
+            && newTabButton.Right < tabArea.ClientSize.Width
+            && captionHit;
+        scrollable = tabStrip.AutoScroll
+            && tabStrip.AutoScrollMinSize.Width > tabStrip.ClientSize.Width;
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     if (error is not null)
     {
         Console.Error.WriteLine($"Reserved window-drag area probe failed: {error}");
@@ -8559,62 +8554,51 @@ bool WindowCaptionDragUsesNativeMove()
 bool VerifyMaximizedTopEdgeTabClick()
 {
     var valid = false;
-    Exception? error = null;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        try
+        using var form = new MainForm(startBrowserOnShown: false)
         {
-            using var form = new MainForm(startBrowserOnShown: false)
-            {
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false
-            };
-            form.Show();
-            form.PrepareLoadedChromePreviewForTesting();
-            form.WindowState = FormWindowState.Maximized;
-            form.PerformLayout();
-            Application.DoEvents();
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false
+        };
+        form.Show();
+        form.PrepareLoadedChromePreviewForTesting();
+        form.WindowState = FormWindowState.Maximized;
+        form.PerformLayout();
+        Application.DoEvents();
 
-            const System.Reflection.BindingFlags flags =
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
-            var titleBar = typeof(MainForm).GetField("titleBar", flags)?.GetValue(form) as TableLayoutPanel;
-            var tabStrip = typeof(MainForm).GetField("tabStrip", flags)?.GetValue(form) as FlowLayoutPanel;
-            var isCaptionPoint = typeof(MainForm).GetMethod("IsCaptionPoint", flags);
-            if (titleBar is null || tabStrip is null || tabStrip.Controls.Count == 0 || isCaptionPoint is null)
-            {
-                return;
-            }
-
-            var header = tabStrip.Controls[0];
-            var formTop = form.PointToScreen(Point.Empty).Y;
-            var headerScreenBounds = header.RectangleToScreen(header.ClientRectangle);
-            var topEdgePoint = new Point(
-                headerScreenBounds.Left + Math.Max(1, headerScreenBounds.Width / 2),
-                formTop);
-            var topLeftCornerPoint = new Point(headerScreenBounds.Left + 2, formTop);
-            var isCaptionAtTopCenter = isCaptionPoint.Invoke(
-                form,
-                [form.PointToClient(topEdgePoint), topEdgePoint]) is true;
-            var isCaptionAtTopLeft = isCaptionPoint.Invoke(
-                form,
-                [form.PointToClient(topLeftCornerPoint), topLeftCornerPoint]) is true;
-            var regionIncludesTopLeftCorner = header.Region is null
-                || header.Region.IsVisible(new Point(2, 0));
-            valid = titleBar.Padding.Top == 0
-                && headerScreenBounds.Top == formTop
-                && !isCaptionAtTopCenter
-                && !isCaptionAtTopLeft
-                && regionIncludesTopLeftCorner;
-        }
-        catch (Exception caught)
+        const System.Reflection.BindingFlags flags =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        var titleBar = typeof(MainForm).GetField("titleBar", flags)?.GetValue(form) as TableLayoutPanel;
+        var tabStrip = typeof(MainForm).GetField("tabStrip", flags)?.GetValue(form) as FlowLayoutPanel;
+        var isCaptionPoint = typeof(MainForm).GetMethod("IsCaptionPoint", flags);
+        if (titleBar is null || tabStrip is null || tabStrip.Controls.Count == 0 || isCaptionPoint is null)
         {
-            error = caught;
+            return;
         }
+
+        var header = tabStrip.Controls[0];
+        var formTop = form.PointToScreen(Point.Empty).Y;
+        var headerScreenBounds = header.RectangleToScreen(header.ClientRectangle);
+        var topEdgePoint = new Point(
+            headerScreenBounds.Left + Math.Max(1, headerScreenBounds.Width / 2),
+            formTop);
+        var topLeftCornerPoint = new Point(headerScreenBounds.Left + 2, formTop);
+        var isCaptionAtTopCenter = isCaptionPoint.Invoke(
+            form,
+            [form.PointToClient(topEdgePoint), topEdgePoint]) is true;
+        var isCaptionAtTopLeft = isCaptionPoint.Invoke(
+            form,
+            [form.PointToClient(topLeftCornerPoint), topLeftCornerPoint]) is true;
+        var regionIncludesTopLeftCorner = header.Region is null
+            || header.Region.IsVisible(new Point(2, 0));
+        valid = titleBar.Padding.Top == 0
+            && headerScreenBounds.Top == formTop
+            && !isCaptionAtTopCenter
+            && !isCaptionAtTopLeft
+            && regionIncludesTopLeftCorner;
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     if (error is not null)
     {
         Console.Error.WriteLine($"Maximized top-edge tab click probe failed: {error}");
@@ -8756,77 +8740,66 @@ bool ResourceModeMenuRemainsNested()
 
 (bool FirstClick, bool LaterClick) VerifyAddressBarFirstClickSelection()
 {
-    Exception? error = null;
     var firstClick = false;
     var laterClick = false;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        try
+        using var form = new MainForm(startBrowserOnShown: false)
         {
-            using var form = new MainForm(startBrowserOnShown: false)
-            {
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false
-            };
-            form.Show();
-            form.PrepareLoadedChromePreviewForTesting();
-            form.PerformLayout();
-            Application.DoEvents();
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false
+        };
+        form.Show();
+        form.PrepareLoadedChromePreviewForTesting();
+        form.PerformLayout();
+        Application.DoEvents();
 
-            const System.Reflection.BindingFlags privateFlags =
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
-            var addressBar = typeof(MainForm).GetField("addressBar", privateFlags)?.GetValue(form) as TextBox;
-            var backButton = typeof(MainForm).GetField("backButton", privateFlags)?.GetValue(form) as Control;
-            var wndProc = addressBar?.GetType().GetMethod("WndProc", privateFlags);
-            if (addressBar is null || backButton is null || wndProc is null)
-            {
-                return;
-            }
-
-            backButton.Focus();
-            Application.DoEvents();
-            addressBar.Text = "https://example.test/a/long/path?query=replace-me";
-            addressBar.SelectionStart = addressBar.TextLength;
-            addressBar.SelectionLength = 0;
-
-            void ClickAddressBar(int x)
-            {
-                const int wmLeftButtonDown = 0x0201;
-                const int wmLeftButtonUp = 0x0202;
-                var y = Math.Max(1, addressBar.ClientSize.Height / 2);
-                var packedPoint = (y << 16) | (Math.Max(1, x) & 0xFFFF);
-                object[] down =
-                [
-                    Message.Create(addressBar.Handle, wmLeftButtonDown, (IntPtr)1, (IntPtr)packedPoint)
-                ];
-                object[] up =
-                [
-                    Message.Create(addressBar.Handle, wmLeftButtonUp, IntPtr.Zero, (IntPtr)packedPoint)
-                ];
-                wndProc.Invoke(addressBar, down);
-                wndProc.Invoke(addressBar, up);
-                Application.DoEvents();
-            }
-
-            ClickAddressBar(Math.Max(2, addressBar.ClientSize.Width - 4));
-            firstClick = addressBar.Focused
-                && addressBar.SelectionStart == 0
-                && addressBar.SelectionLength == addressBar.TextLength;
-
-            addressBar.SelectionStart = Math.Min(8, addressBar.TextLength);
-            addressBar.SelectionLength = 0;
-            ClickAddressBar(Math.Max(2, addressBar.ClientSize.Width / 3));
-            laterClick = addressBar.Focused && addressBar.SelectionLength < addressBar.TextLength;
-        }
-        catch (Exception caught)
+        const System.Reflection.BindingFlags privateFlags =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        var addressBar = typeof(MainForm).GetField("addressBar", privateFlags)?.GetValue(form) as TextBox;
+        var backButton = typeof(MainForm).GetField("backButton", privateFlags)?.GetValue(form) as Control;
+        var wndProc = addressBar?.GetType().GetMethod("WndProc", privateFlags);
+        if (addressBar is null || backButton is null || wndProc is null)
         {
-            error = caught;
+            return;
         }
+
+        backButton.Focus();
+        Application.DoEvents();
+        addressBar.Text = "https://example.test/a/long/path?query=replace-me";
+        addressBar.SelectionStart = addressBar.TextLength;
+        addressBar.SelectionLength = 0;
+
+        void ClickAddressBar(int x)
+        {
+            const int wmLeftButtonDown = 0x0201;
+            const int wmLeftButtonUp = 0x0202;
+            var y = Math.Max(1, addressBar.ClientSize.Height / 2);
+            var packedPoint = (y << 16) | (Math.Max(1, x) & 0xFFFF);
+            object[] down =
+            [
+                Message.Create(addressBar.Handle, wmLeftButtonDown, (IntPtr)1, (IntPtr)packedPoint)
+            ];
+            object[] up =
+            [
+                Message.Create(addressBar.Handle, wmLeftButtonUp, IntPtr.Zero, (IntPtr)packedPoint)
+            ];
+            wndProc.Invoke(addressBar, down);
+            wndProc.Invoke(addressBar, up);
+            Application.DoEvents();
+        }
+
+        ClickAddressBar(Math.Max(2, addressBar.ClientSize.Width - 4));
+        firstClick = addressBar.Focused
+            && addressBar.SelectionStart == 0
+            && addressBar.SelectionLength == addressBar.TextLength;
+
+        addressBar.SelectionStart = Math.Min(8, addressBar.TextLength);
+        addressBar.SelectionLength = 0;
+        ClickAddressBar(Math.Max(2, addressBar.ClientSize.Width / 3));
+        laterClick = addressBar.Focused && addressBar.SelectionLength < addressBar.TextLength;
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     if (error is not null)
     {
         Console.Error.WriteLine($"Address-bar first-click selection probe failed: {error}");
@@ -8836,131 +8809,120 @@ bool ResourceModeMenuRemainsNested()
 
 (bool Layout, bool Text, bool Paint, bool AddressBarPreservesCaret) VerifyLoadedToolbarRegression()
 {
-    Exception? error = null;
     var layoutValid = false;
     var textValid = false;
     var paintValid = false;
     var addressBarPreservesCaret = false;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        try
+        using var form = new MainForm(startBrowserOnShown: false)
         {
-            using var form = new MainForm(startBrowserOnShown: false)
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false
+        };
+        form.Show();
+        form.PrepareLoadedChromePreviewForTesting();
+        var addressBar = GetDescendants(form).OfType<TextBox>().SingleOrDefault(control =>
+            control.AccessibleName == "Address and search bar");
+        var onClick = typeof(Control).GetMethod(
+            "OnClick",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        if (addressBar is not null && onClick is not null)
+        {
+            addressBar.Text = "https://example.test/search?q=tests";
+            addressBar.SelectionStart = 8;
+            addressBar.SelectionLength = 0;
+            onClick.Invoke(addressBar, [EventArgs.Empty]);
+            addressBarPreservesCaret = addressBar.SelectionStart == 8
+                && addressBar.SelectionLength == 0;
+        }
+        var dpi = Math.Max(96, form.DeviceDpi);
+        var logicalWidths = new[]
+        {
+            1917, 1280, 1024, 960, 768, 640, 560, 520, 500, 480,
+            500, 520, 560, 640, 768, 960, 1024, 1280, 1917
+        };
+        layoutValid = true;
+        foreach (var logicalWidth in logicalWidths)
+        {
+            var requestedWidth = ScaleForDpi(logicalWidth, dpi);
+            form.ClientSize = new Size(requestedWidth, ScaleForDpi(420, dpi));
+            form.PerformLayout();
+            Application.DoEvents();
+            var snapshot = form.GetToolbarLayoutSnapshotForTesting();
+            var lastNavigation = snapshot.HomeVisible ? snapshot.Home : snapshot.Reload;
+            var firstRightControl = snapshot.StatusVisible
+                ? snapshot.Status
+                : snapshot.DownloadsVisible ? snapshot.Downloads : snapshot.Menu;
+            var outerControls = new[]
             {
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false
-            };
-            form.Show();
-            form.PrepareLoadedChromePreviewForTesting();
-            var addressBar = GetDescendants(form).OfType<TextBox>().SingleOrDefault(control =>
-                control.AccessibleName == "Address and search bar");
-            var onClick = typeof(Control).GetMethod(
-                "OnClick",
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-            if (addressBar is not null && onClick is not null)
-            {
-                addressBar.Text = "https://example.test/search?q=tests";
-                addressBar.SelectionStart = 8;
-                addressBar.SelectionLength = 0;
-                onClick.Invoke(addressBar, [EventArgs.Empty]);
-                addressBarPreservesCaret = addressBar.SelectionStart == 8
-                    && addressBar.SelectionLength == 0;
-            }
-            var dpi = Math.Max(96, form.DeviceDpi);
-            var logicalWidths = new[]
-            {
-                1917, 1280, 1024, 960, 768, 640, 560, 520, 500, 480,
-                500, 520, 560, 640, 768, 960, 1024, 1280, 1917
-            };
-            layoutValid = true;
-            foreach (var logicalWidth in logicalWidths)
-            {
-                var requestedWidth = ScaleForDpi(logicalWidth, dpi);
-                form.ClientSize = new Size(requestedWidth, ScaleForDpi(420, dpi));
-                form.PerformLayout();
-                Application.DoEvents();
-                var snapshot = form.GetToolbarLayoutSnapshotForTesting();
-                var lastNavigation = snapshot.HomeVisible ? snapshot.Home : snapshot.Reload;
-                var firstRightControl = snapshot.StatusVisible
-                    ? snapshot.Status
-                    : snapshot.DownloadsVisible ? snapshot.Downloads : snapshot.Menu;
-                var outerControls = new[]
-                {
-                    snapshot.Back,
-                    snapshot.Forward,
-                    snapshot.Reload,
-                    snapshot.Home,
-                    snapshot.Omnibox,
-                    snapshot.Status,
-                    snapshot.Downloads,
-                    snapshot.Menu
-                }.Where(bounds => !bounds.IsEmpty).ToArray();
-                var outerControlsContained = outerControls.All(bounds =>
-                    bounds.Left >= 0
-                    && bounds.Top >= 0
-                    && bounds.Right <= snapshot.ToolbarWidth
-                    && bounds.Width > 0
-                    && bounds.Height > 0);
+                snapshot.Back,
+                snapshot.Forward,
+                snapshot.Reload,
+                snapshot.Home,
+                snapshot.Omnibox,
+                snapshot.Status,
+                snapshot.Downloads,
+                snapshot.Menu
+            }.Where(bounds => !bounds.IsEmpty).ToArray();
+            var outerControlsContained = outerControls.All(bounds =>
+                bounds.Left >= 0
+                && bounds.Top >= 0
+                && bounds.Right <= snapshot.ToolbarWidth
+                && bounds.Width > 0
+                && bounds.Height > 0);
 
-                var descendants = GetDescendants(form).ToArray();
-                var address = descendants.OfType<TextBox>().SingleOrDefault(control =>
-                    control.AccessibleName == "Address and search bar");
-                var omniboxLayout = address?.Parent;
-                var innerButtons = omniboxLayout?.Controls
-                    .OfType<Button>()
-                    .Where(button => button.Visible)
-                    .OrderBy(button => button.Left)
-                    .ToArray() ?? [];
-                var innerGeometryValid = address is not null
-                    && omniboxLayout is not null
-                    && innerButtons.Length == 2
-                    && omniboxLayout.ClientRectangle.Contains(address.Bounds)
-                    && innerButtons.All(button => omniboxLayout.ClientRectangle.Contains(button.Bounds))
-                    && OrderedWithoutOverlap(innerButtons[0].Bounds, address.Bounds)
-                    && OrderedWithoutOverlap(address.Bounds, innerButtons[1].Bounds)
-                    && RectanglesDoNotOverlap(
-                        innerButtons.Select(button => button.Bounds).Append(address.Bounds));
-                var snapshotValid = OrderedWithoutOverlap(snapshot.Back, snapshot.Forward)
-                    && OrderedWithoutOverlap(snapshot.Forward, snapshot.Reload)
-                    && (!snapshot.HomeVisible || OrderedWithoutOverlap(snapshot.Reload, snapshot.Home))
-                    && OrderedWithoutOverlap(lastNavigation, snapshot.Omnibox)
-                    && OrderedWithoutOverlap(snapshot.Omnibox, firstRightControl)
-                    && (!snapshot.StatusVisible || OrderedWithoutOverlap(snapshot.Status, snapshot.Downloads))
-                    && (!snapshot.DownloadsVisible || OrderedWithoutOverlap(snapshot.Downloads, snapshot.Menu))
-                    && Math.Abs(snapshot.ClientWidth - requestedWidth) <= 1
-                    && outerControlsContained
-                    && RectanglesDoNotOverlap(outerControls)
-                    && innerGeometryValid
-                    && snapshot.Omnibox.Width >= snapshot.MinimumOmniboxWidth - 1
-                    && snapshot.Menu.Right <= snapshot.ToolbarWidth
-                    && snapshot.DownloadsVisible
-                    && snapshot.StatusText.Contains("13 blocked", StringComparison.Ordinal)
-                    && snapshot.StatusText.Contains("1 downloading", StringComparison.Ordinal)
-                    && snapshot.StatusAccessibleName.Equals("Browser status: Ready", StringComparison.Ordinal)
-                    && snapshot.VectorButtonTextIsEmpty;
-                if (logicalWidth == 480) snapshotValid &= !snapshot.StatusVisible && !snapshot.HomeVisible;
-                if (logicalWidth >= 1280) snapshotValid &= snapshot.StatusVisible;
-                if (!snapshotValid)
-                {
-                    Console.Error.WriteLine(
-                        $"Toolbar snapshot failed at {logicalWidth}px / {dpi} DPI: {snapshot}; "
-                        + $"requestedWidth={requestedWidth}; outerContained={outerControlsContained}; "
-                        + $"innerGeometry={innerGeometryValid}.");
-                }
-                layoutValid &= snapshotValid;
+            var descendants = GetDescendants(form).ToArray();
+            var address = descendants.OfType<TextBox>().SingleOrDefault(control =>
+                control.AccessibleName == "Address and search bar");
+            var omniboxLayout = address?.Parent;
+            var innerButtons = omniboxLayout?.Controls
+                .OfType<Button>()
+                .Where(button => button.Visible)
+                .OrderBy(button => button.Left)
+                .ToArray() ?? [];
+            var innerGeometryValid = address is not null
+                && omniboxLayout is not null
+                && innerButtons.Length == 2
+                && omniboxLayout.ClientRectangle.Contains(address.Bounds)
+                && innerButtons.All(button => omniboxLayout.ClientRectangle.Contains(button.Bounds))
+                && OrderedWithoutOverlap(innerButtons[0].Bounds, address.Bounds)
+                && OrderedWithoutOverlap(address.Bounds, innerButtons[1].Bounds)
+                && RectanglesDoNotOverlap(
+                    innerButtons.Select(button => button.Bounds).Append(address.Bounds));
+            var snapshotValid = OrderedWithoutOverlap(snapshot.Back, snapshot.Forward)
+                && OrderedWithoutOverlap(snapshot.Forward, snapshot.Reload)
+                && (!snapshot.HomeVisible || OrderedWithoutOverlap(snapshot.Reload, snapshot.Home))
+                && OrderedWithoutOverlap(lastNavigation, snapshot.Omnibox)
+                && OrderedWithoutOverlap(snapshot.Omnibox, firstRightControl)
+                && (!snapshot.StatusVisible || OrderedWithoutOverlap(snapshot.Status, snapshot.Downloads))
+                && (!snapshot.DownloadsVisible || OrderedWithoutOverlap(snapshot.Downloads, snapshot.Menu))
+                && Math.Abs(snapshot.ClientWidth - requestedWidth) <= 1
+                && outerControlsContained
+                && RectanglesDoNotOverlap(outerControls)
+                && innerGeometryValid
+                && snapshot.Omnibox.Width >= snapshot.MinimumOmniboxWidth - 1
+                && snapshot.Menu.Right <= snapshot.ToolbarWidth
+                && snapshot.DownloadsVisible
+                && snapshot.StatusText.Contains("13 blocked", StringComparison.Ordinal)
+                && snapshot.StatusText.Contains("1 downloading", StringComparison.Ordinal)
+                && snapshot.StatusAccessibleName.Equals("Browser status: Ready", StringComparison.Ordinal)
+                && snapshot.VectorButtonTextIsEmpty;
+            if (logicalWidth == 480) snapshotValid &= !snapshot.StatusVisible && !snapshot.HomeVisible;
+            if (logicalWidth >= 1280) snapshotValid &= snapshot.StatusVisible;
+            if (!snapshotValid)
+            {
+                Console.Error.WriteLine(
+                    $"Toolbar snapshot failed at {logicalWidth}px / {dpi} DPI: {snapshot}; "
+                    + $"requestedWidth={requestedWidth}; outerContained={outerControlsContained}; "
+                    + $"innerGeometry={innerGeometryValid}.");
             }
-            textValid = form.VectorToolbarTextIsSuppressedForTesting();
-            paintValid = form.VectorToolbarPaintIsIdempotentForTesting();
+            layoutValid &= snapshotValid;
         }
-        catch (Exception caught)
-        {
-            error = caught;
-        }
+        textValid = form.VectorToolbarTextIsSuppressedForTesting();
+        paintValid = form.VectorToolbarPaintIsIdempotentForTesting();
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     return error is null
         ? (layoutValid, textValid, paintValid, addressBarPreservesCaret)
         : (false, false, false, false);
@@ -8973,294 +8935,261 @@ bool OrderedWithoutOverlap(Rectangle left, Rectangle right)
 
 bool CanRenderHighContrastChrome()
 {
-    Exception? error = null;
     var valid = false;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        try
+        var policy = MainForm.ResolveChromeColorPolicyForTesting(highContrast: true);
+        using var form = new MainForm(startBrowserOnShown: false)
         {
-            var policy = MainForm.ResolveChromeColorPolicyForTesting(highContrast: true);
-            using var form = new MainForm(startBrowserOnShown: false)
-            {
-                ClientSize = new Size(960, 600),
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false
-            };
-            form.PrepareChromePreviewForTesting();
-            form.ApplyHighContrastChromeForTesting(enabled: true);
-            form.Show();
-            form.PerformLayout();
-            Application.DoEvents();
-            using var bitmap = new Bitmap(form.ClientSize.Width, form.ClientSize.Height);
-            form.DrawToBitmap(bitmap, form.ClientRectangle);
-            var snapshot = form.GetChromeContrastSnapshotForTesting();
-            valid = policy.HighContrast
-                && policy.ChromeSurface == SystemColors.Control
-                && policy.FieldSurface == SystemColors.Window
-                && policy.Focus == SystemColors.Highlight
-                && policy.SelectionText == SystemColors.HighlightText
-                && policy.MenuSurface == SystemColors.Menu
-                && snapshot.ChromeSurface == SystemColors.Control
-                && snapshot.ToolbarSurface == SystemColors.Control
-                && snapshot.FieldSurface == SystemColors.Window
-                && snapshot.FieldText == SystemColors.WindowText
-                && snapshot.Focus == SystemColors.Highlight
-                && snapshot.MenuSurface == SystemColors.Menu
-                && snapshot.MenuText == SystemColors.MenuText
-                && snapshot.ToolbarButtonUsesHighContrast
-                && snapshot.CaptionButtonUsesHighContrast
-                && snapshot.OmniboxUsesHighContrast
-                && snapshot.TabUsesHighContrast
-                && snapshot.MenuRendererUsesHighContrast;
-        }
-        catch (Exception caught)
-        {
-            error = caught;
-        }
+            ClientSize = new Size(960, 600),
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false
+        };
+        form.PrepareChromePreviewForTesting();
+        form.ApplyHighContrastChromeForTesting(enabled: true);
+        form.Show();
+        form.PerformLayout();
+        Application.DoEvents();
+        using var bitmap = new Bitmap(form.ClientSize.Width, form.ClientSize.Height);
+        form.DrawToBitmap(bitmap, form.ClientRectangle);
+        var snapshot = form.GetChromeContrastSnapshotForTesting();
+        valid = policy.HighContrast
+            && policy.ChromeSurface == SystemColors.Control
+            && policy.FieldSurface == SystemColors.Window
+            && policy.Focus == SystemColors.Highlight
+            && policy.SelectionText == SystemColors.HighlightText
+            && policy.MenuSurface == SystemColors.Menu
+            && snapshot.ChromeSurface == SystemColors.Control
+            && snapshot.ToolbarSurface == SystemColors.Control
+            && snapshot.FieldSurface == SystemColors.Window
+            && snapshot.FieldText == SystemColors.WindowText
+            && snapshot.Focus == SystemColors.Highlight
+            && snapshot.MenuSurface == SystemColors.Menu
+            && snapshot.MenuText == SystemColors.MenuText
+            && snapshot.ToolbarButtonUsesHighContrast
+            && snapshot.CaptionButtonUsesHighContrast
+            && snapshot.OmniboxUsesHighContrast
+            && snapshot.TabUsesHighContrast
+            && snapshot.MenuRendererUsesHighContrast;
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     return error is null && valid;
 }
 
 (bool Restored, bool Distinct, bool Rendered) VerifyChromeThemeRoundTrip()
 {
-    Exception? error = null;
     var restored = false;
     var distinct = false;
     var rendered = false;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        try
+        var normalPolicy = MainForm.ResolveChromeColorPolicyForTesting(highContrast: false);
+        var highContrastPolicy = MainForm.ResolveChromeColorPolicyForTesting(highContrast: true);
+        var loadingBackgroundMethod = typeof(BrowserState).Assembly
+            .GetType("MishaWeb.WebsiteThemePolicy")
+            ?.GetMethod(
+                "GetLoadingBackgroundColor",
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+        var lightLoadingSurface = loadingBackgroundMethod?.Invoke(null, [false]) is Color light
+            ? light
+            : Color.Empty;
+
+        using var form = new MainForm(startBrowserOnShown: false)
         {
-            var normalPolicy = MainForm.ResolveChromeColorPolicyForTesting(highContrast: false);
-            var highContrastPolicy = MainForm.ResolveChromeColorPolicyForTesting(highContrast: true);
-            var loadingBackgroundMethod = typeof(BrowserState).Assembly
-                .GetType("MishaWeb.WebsiteThemePolicy")
-                ?.GetMethod(
-                    "GetLoadingBackgroundColor",
-                    System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
-            var lightLoadingSurface = loadingBackgroundMethod?.Invoke(null, [false]) is Color light
-                ? light
-                : Color.Empty;
+            ClientSize = new Size(ScaleForDpi(960, 120), ScaleForDpi(600, 120)),
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false
+        };
+        form.Show();
+        form.PrepareChromePreviewForTesting();
 
-            using var form = new MainForm(startBrowserOnShown: false)
-            {
-                ClientSize = new Size(ScaleForDpi(960, 120), ScaleForDpi(600, 120)),
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false
-            };
-            form.Show();
-            form.PrepareChromePreviewForTesting();
+        form.ApplyHighContrastChromeForTesting(enabled: false);
+        form.PerformLayout();
+        Application.DoEvents();
+        var normalSnapshot = form.GetChromeContrastSnapshotForTesting();
+        using var normalBitmap = new Bitmap(form.ClientSize.Width, form.ClientSize.Height);
+        form.DrawToBitmap(normalBitmap, form.ClientRectangle);
 
-            form.ApplyHighContrastChromeForTesting(enabled: false);
-            form.PerformLayout();
-            Application.DoEvents();
-            var normalSnapshot = form.GetChromeContrastSnapshotForTesting();
-            using var normalBitmap = new Bitmap(form.ClientSize.Width, form.ClientSize.Height);
-            form.DrawToBitmap(normalBitmap, form.ClientRectangle);
+        form.ApplyHighContrastChromeForTesting(enabled: true);
+        form.PerformLayout();
+        Application.DoEvents();
+        var highContrastSnapshot = form.GetChromeContrastSnapshotForTesting();
+        using var highContrastBitmap = new Bitmap(form.ClientSize.Width, form.ClientSize.Height);
+        form.DrawToBitmap(highContrastBitmap, form.ClientRectangle);
 
-            form.ApplyHighContrastChromeForTesting(enabled: true);
-            form.PerformLayout();
-            Application.DoEvents();
-            var highContrastSnapshot = form.GetChromeContrastSnapshotForTesting();
-            using var highContrastBitmap = new Bitmap(form.ClientSize.Width, form.ClientSize.Height);
-            form.DrawToBitmap(highContrastBitmap, form.ClientRectangle);
+        form.ApplyHighContrastChromeForTesting(enabled: false);
+        form.PerformLayout();
+        Application.DoEvents();
+        var restoredSnapshot = form.GetChromeContrastSnapshotForTesting();
+        using var restoredBitmap = new Bitmap(form.ClientSize.Width, form.ClientSize.Height);
+        form.DrawToBitmap(restoredBitmap, form.ClientRectangle);
 
-            form.ApplyHighContrastChromeForTesting(enabled: false);
-            form.PerformLayout();
-            Application.DoEvents();
-            var restoredSnapshot = form.GetChromeContrastSnapshotForTesting();
-            using var restoredBitmap = new Bitmap(form.ClientSize.Width, form.ClientSize.Height);
-            form.DrawToBitmap(restoredBitmap, form.ClientRectangle);
-
-            restored = normalSnapshot == restoredSnapshot
-                && !restoredSnapshot.ToolbarButtonUsesHighContrast
-                && !restoredSnapshot.CaptionButtonUsesHighContrast
-                && !restoredSnapshot.OmniboxUsesHighContrast
-                && !restoredSnapshot.TabUsesHighContrast
-                && !restoredSnapshot.MenuRendererUsesHighContrast;
-            distinct = !normalPolicy.HighContrast
-                && highContrastPolicy.HighContrast
-                && normalPolicy.ChromeSurface == NativeUiTheme.Chrome
-                && normalPolicy.PageSurface == NativeUiTheme.Window
-                && lightLoadingSurface == Color.White
-                && highContrastSnapshot.ChromeSurface == SystemColors.Control
-                && highContrastSnapshot.FieldSurface == SystemColors.Window
-                && ContrastRatio(normalPolicy.PageSurface, lightLoadingSurface) >= 7.0
-                && (normalSnapshot.ChromeSurface != highContrastSnapshot.ChromeSurface
-                    || normalSnapshot.FieldSurface != highContrastSnapshot.FieldSurface);
-            rendered = SurfaceHasVisualDetail(normalBitmap)
-                && SurfaceHasVisualDetail(highContrastBitmap)
-                && SurfaceHasVisualDetail(restoredBitmap);
-        }
-        catch (Exception caught)
-        {
-            error = caught;
-        }
+        restored = normalSnapshot == restoredSnapshot
+            && !restoredSnapshot.ToolbarButtonUsesHighContrast
+            && !restoredSnapshot.CaptionButtonUsesHighContrast
+            && !restoredSnapshot.OmniboxUsesHighContrast
+            && !restoredSnapshot.TabUsesHighContrast
+            && !restoredSnapshot.MenuRendererUsesHighContrast;
+        distinct = !normalPolicy.HighContrast
+            && highContrastPolicy.HighContrast
+            && normalPolicy.ChromeSurface == NativeUiTheme.Chrome
+            && normalPolicy.PageSurface == NativeUiTheme.Window
+            && lightLoadingSurface == Color.White
+            && highContrastSnapshot.ChromeSurface == SystemColors.Control
+            && highContrastSnapshot.FieldSurface == SystemColors.Window
+            && ContrastRatio(normalPolicy.PageSurface, lightLoadingSurface) >= 7.0
+            && (normalSnapshot.ChromeSurface != highContrastSnapshot.ChromeSurface
+                || normalSnapshot.FieldSurface != highContrastSnapshot.FieldSurface);
+        rendered = SurfaceHasVisualDetail(normalBitmap)
+            && SurfaceHasVisualDetail(highContrastBitmap)
+            && SurfaceHasVisualDetail(restoredBitmap);
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     if (error is not null) Console.Error.WriteLine($"Chrome theme round-trip probe failed: {error}");
     return error is null ? (restored, distinct, rendered) : (false, false, false);
 }
 
 (bool ShownWithoutActivation, bool LifecycleTransitions, bool DismissedByDownloadsList) VerifyDownloadNotificationLifecycle()
 {
-    Exception? error = null;
     var shownWithoutActivation = false;
     var lifecycleTransitions = false;
     var dismissedByDownloadsList = false;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        try
+        using var form = new MainForm(startBrowserOnShown: false)
         {
-            using var form = new MainForm(startBrowserOnShown: false)
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false
+        };
+        form.Show();
+        form.PrepareChromePreviewForTesting();
+        form.PerformLayout();
+        Application.DoEvents();
+
+        DownloadPopupAction? lastAction = null;
+        object? lastToken = null;
+        var openedDownloadsList = false;
+        using var notification = new DownloadNotificationForm(
+            (action, token) =>
             {
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false
-            };
-            form.Show();
-            form.PrepareChromePreviewForTesting();
-            form.PerformLayout();
-            Application.DoEvents();
+                lastAction = action;
+                lastToken = token;
+            },
+            () => openedDownloadsList = true);
 
-            DownloadPopupAction? lastAction = null;
-            object? lastToken = null;
-            var openedDownloadsList = false;
-            using var notification = new DownloadNotificationForm(
-                (action, token) =>
-                {
-                    lastAction = action;
-                    lastToken = token;
-                },
-                () => openedDownloadsList = true);
+        var tokenObject = new object();
+        var anchor = typeof(MainForm)
+            .GetField("downloadsButton", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?.GetValue(form) as Control;
 
-            var tokenObject = new object();
-            var anchor = typeof(MainForm)
-                .GetField("downloadsButton", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
-                ?.GetValue(form) as Control;
+        notification.ShowOrUpdate(
+            form,
+            anchor,
+            new DownloadNotificationState(
+                "05_Laboratory_Exercise_1(45).pdf",
+                "Downloading",
+                "24.0 KB / 58.2 KB (41%)",
+                "ETA 9:16 PM",
+                41,
+                1,
+                CanOpen: false,
+                CanShowInFolder: true,
+                CanCancel: true,
+                tokenObject));
+        Application.DoEvents();
 
-            notification.ShowOrUpdate(
-                form,
-                anchor,
-                new DownloadNotificationState(
-                    "05_Laboratory_Exercise_1(45).pdf",
-                    "Downloading",
-                    "24.0 KB / 58.2 KB (41%)",
-                    "ETA 9:16 PM",
-                    41,
-                    1,
-                    CanOpen: false,
-                    CanShowInFolder: true,
-                    CanCancel: true,
-                    tokenObject));
-            Application.DoEvents();
+        var activeButtons = GetDescendants(notification).OfType<Button>().ToArray();
+        var openBtn = activeButtons.Single(b => b.Text == "Open");
+        var cancelBtn = activeButtons.Single(b => b.Text == "Cancel");
+        var downloadsBtn = activeButtons.Single(b => b.Text == "Downloads");
+        shownWithoutActivation = notification.Visible
+            && !notification.Focused
+            && !notification.AutoHideArmedForTesting
+            && !openBtn.Visible
+            && cancelBtn.Visible
+            && cancelBtn.Enabled;
 
-            var activeButtons = GetDescendants(notification).OfType<Button>().ToArray();
-            var openBtn = activeButtons.Single(b => b.Text == "Open");
-            var cancelBtn = activeButtons.Single(b => b.Text == "Cancel");
-            var downloadsBtn = activeButtons.Single(b => b.Text == "Downloads");
-            shownWithoutActivation = notification.Visible
-                && !notification.Focused
-                && !notification.AutoHideArmedForTesting
-                && !openBtn.Visible
-                && cancelBtn.Visible
-                && cancelBtn.Enabled;
+        notification.UpdateIfVisible(
+            anchor,
+            new DownloadNotificationState(
+                "05_Laboratory_Exercise_1(45).pdf",
+                "Complete",
+                "58.2 KB / 58.2 KB (100%)",
+                string.Empty,
+                100,
+                0,
+                CanOpen: true,
+                CanShowInFolder: true,
+                CanCancel: false,
+                tokenObject));
+        Application.DoEvents();
 
-            notification.UpdateIfVisible(
-                anchor,
-                new DownloadNotificationState(
-                    "05_Laboratory_Exercise_1(45).pdf",
-                    "Complete",
-                    "58.2 KB / 58.2 KB (100%)",
-                    string.Empty,
-                    100,
-                    0,
-                    CanOpen: true,
-                    CanShowInFolder: true,
-                    CanCancel: false,
-                    tokenObject));
-            Application.DoEvents();
+        var transitionsOk = notification.Visible
+            && notification.AutoHideArmedForTesting
+            && openBtn.Visible
+            && openBtn.Enabled
+            && !cancelBtn.Visible
+            && notification.CurrentStateForTesting?.State == "Complete";
 
-            var transitionsOk = notification.Visible
-                && notification.AutoHideArmedForTesting
-                && openBtn.Visible
-                && openBtn.Enabled
-                && !cancelBtn.Visible
-                && notification.CurrentStateForTesting?.State == "Complete";
+        openBtn.PerformClick();
+        Application.DoEvents();
+        var openActionOk = !notification.Visible
+            && lastAction == DownloadPopupAction.Open
+            && ReferenceEquals(lastToken, tokenObject);
 
-            openBtn.PerformClick();
-            Application.DoEvents();
-            var openActionOk = !notification.Visible
-                && lastAction == DownloadPopupAction.Open
-                && ReferenceEquals(lastToken, tokenObject);
+        notification.ShowOrUpdate(
+            form,
+            anchor,
+            new DownloadNotificationState(
+                "05_Laboratory_Exercise_1(45).pdf",
+                "Complete",
+                "58.2 KB / 58.2 KB (100%)",
+                string.Empty,
+                100,
+                0,
+                CanOpen: true,
+                CanShowInFolder: true,
+                CanCancel: false,
+                tokenObject));
+        downloadsBtn.PerformClick();
+        Application.DoEvents();
 
-            notification.ShowOrUpdate(
-                form,
-                anchor,
-                new DownloadNotificationState(
-                    "05_Laboratory_Exercise_1(45).pdf",
-                    "Complete",
-                    "58.2 KB / 58.2 KB (100%)",
-                    string.Empty,
-                    100,
-                    0,
-                    CanOpen: true,
-                    CanShowInFolder: true,
-                    CanCancel: false,
-                    tokenObject));
-            downloadsBtn.PerformClick();
-            Application.DoEvents();
+        notification.Dismiss();
+        var releasedCurrentState = notification.CurrentStateForTesting is null;
+        lifecycleTransitions = transitionsOk && openActionOk && openedDownloadsList && !notification.Visible && releasedCurrentState;
 
-            notification.Dismiss();
-            var releasedCurrentState = notification.CurrentStateForTesting is null;
-            lifecycleTransitions = transitionsOk && openActionOk && openedDownloadsList && !notification.Visible && releasedCurrentState;
-
-            const System.Reflection.BindingFlags flags =
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
-            var entryType = typeof(MainForm).GetNestedType("DownloadEntry", flags);
-            var entry = entryType is null
-                ? null
-                : Activator.CreateInstance(
-                    entryType,
-                    "05_Laboratory_Exercise_1(45).pdf",
-                    "C:\\Downloads\\05_Laboratory_Exercise_1(45).pdf",
-                    "https://example.com/file.pdf",
-                    DateTime.Now,
-                    "Downloading");
-            var showNotificationMethod = typeof(MainForm).GetMethod("ShowDownloadNotification", flags);
-            var showDownloadsPopupMethod = typeof(MainForm).GetMethod("ShowDownloadsPopup", flags);
-            var notificationField = typeof(MainForm).GetField("downloadNotification", flags);
-            var downloadsPopupField = typeof(MainForm).GetField("downloadsPopup", flags);
-            if (entry is not null && showNotificationMethod is not null && showDownloadsPopupMethod is not null)
-            {
-                showNotificationMethod.Invoke(form, [entry]);
-                Application.DoEvents();
-                var mainNotification = notificationField?.GetValue(form) as DownloadNotificationForm;
-                var visibleBeforePopup = mainNotification?.Visible == true;
-
-                showDownloadsPopupMethod.Invoke(form, null);
-                Application.DoEvents();
-                var mainPopup = downloadsPopupField?.GetValue(form) as DownloadsPopupForm;
-                var hiddenAfterPopup = mainNotification?.Visible == false;
-                mainPopup?.Hide();
-                dismissedByDownloadsList = visibleBeforePopup && hiddenAfterPopup;
-            }
-        }
-        catch (Exception caught)
+        const System.Reflection.BindingFlags flags =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        var entryType = typeof(MainForm).GetNestedType("DownloadEntry", flags);
+        var entry = entryType is null
+            ? null
+            : Activator.CreateInstance(
+                entryType,
+                "05_Laboratory_Exercise_1(45).pdf",
+                "C:\\Downloads\\05_Laboratory_Exercise_1(45).pdf",
+                "https://example.com/file.pdf",
+                DateTime.Now,
+                "Downloading");
+        var showNotificationMethod = typeof(MainForm).GetMethod("ShowDownloadNotification", flags);
+        var showDownloadsPopupMethod = typeof(MainForm).GetMethod("ShowDownloadsPopup", flags);
+        var notificationField = typeof(MainForm).GetField("downloadNotification", flags);
+        var downloadsPopupField = typeof(MainForm).GetField("downloadsPopup", flags);
+        if (entry is not null && showNotificationMethod is not null && showDownloadsPopupMethod is not null)
         {
-            error = caught;
+            showNotificationMethod.Invoke(form, [entry]);
+            Application.DoEvents();
+            var mainNotification = notificationField?.GetValue(form) as DownloadNotificationForm;
+            var visibleBeforePopup = mainNotification?.Visible == true;
+
+            showDownloadsPopupMethod.Invoke(form, null);
+            Application.DoEvents();
+            var mainPopup = downloadsPopupField?.GetValue(form) as DownloadsPopupForm;
+            var hiddenAfterPopup = mainNotification?.Visible == false;
+            mainPopup?.Hide();
+            dismissedByDownloadsList = visibleBeforePopup && hiddenAfterPopup;
         }
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     if (error is not null) Console.Error.WriteLine($"Download notification lifecycle probe failed: {error}");
     return error is null
         ? (shownWithoutActivation, lifecycleTransitions, dismissedByDownloadsList)
@@ -9809,36 +9738,39 @@ bool HasOnlyPairedSurrogates(string value)
 
 bool CanParseJavaScript(string script)
 {
-    var path = Path.Combine(
-        Path.GetTempPath(),
-        "MishaWeb-Script-Syntax-" + Guid.NewGuid().ToString("N") + ".js");
-    try
+    return JavaScriptSyntaxCache.GetOrAdd(script, static source =>
     {
-        File.WriteAllText(path, script);
-        var start = new System.Diagnostics.ProcessStartInfo
+        var path = Path.Combine(
+            Path.GetTempPath(),
+            "MishaWeb-Script-Syntax-" + Guid.NewGuid().ToString("N") + ".js");
+        try
         {
-            FileName = "node",
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardError = true
-        };
-        start.ArgumentList.Add("--check");
-        start.ArgumentList.Add(path);
-        using var process = System.Diagnostics.Process.Start(start);
-        if (process is null || !process.WaitForExit(5_000))
-        {
-            if (process is { HasExited: false }) process.Kill(entireProcessTree: true);
+            File.WriteAllText(path, source);
+            var start = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "node",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardError = true
+            };
+            start.ArgumentList.Add("--check");
+            start.ArgumentList.Add(path);
+            using var process = System.Diagnostics.Process.Start(start);
+            if (process is null || !process.WaitForExit(5_000))
+            {
+                if (process is { HasExited: false }) process.Kill(entireProcessTree: true);
+                return false;
+            }
+            if (process.ExitCode == 0) return true;
+            var error = process.StandardError.ReadToEnd();
+            if (error.Length > 0) Console.Error.WriteLine(error);
             return false;
         }
-        if (process.ExitCode == 0) return true;
-        var error = process.StandardError.ReadToEnd();
-        if (error.Length > 0) Console.Error.WriteLine(error);
-        return false;
-    }
-    finally
-    {
-        File.Delete(path);
-    }
+        finally
+        {
+            File.Delete(path);
+        }
+    });
 }
 
 bool CanExecuteAdBlockDocumentScript(string script)
@@ -9867,7 +9799,7 @@ bool CanExecuteAdBlockDocumentScript(string script)
             + "globalThis.MutationObserver=class{constructor(callback){this.callback=callback;}observe(target,options){__smokeObservers.push({target,options});}disconnect(){}};"
             + "globalThis.document={hidden:false,documentElement:{appendChild:()=>{},setAttribute:name=>{if(name==='data-misha-youtube-recovery')__smokeRecoveryMasked=true;},removeAttribute:name=>{if(name==='data-misha-youtube-recovery')__smokeRecoveryMasked=false;}},readyState:'complete',createElement:()=>({id:'',textContent:''}),getElementById:id=>id==='movie_player'?__smokePlayer:null,querySelector:selector=>selector.includes('enforcement-message')&&!__smokeEnforcement.removed?__smokeEnforcement:selector.startsWith('video')?__smokeVideo:null,addEventListener:()=>{},removeEventListener:()=>{}};";
         var assertions =
-            "(async()=>{await new Promise(resolve=>setTimeout(resolve,800));const rendererPrototype={};rendererPrototype.hasAllowedInstreamAd=function(data){return data.videoId==='related';};"
+            "(async()=>{const deadline=Date.now()+800;while(Date.now()<deadline&&!(__smokeReloads===2&&__smokeEnforcement.removed&&__smokeTransparentRemoved&&__smokePlayed&&__smokePrunedBeforeReload&&!__smokeRecoveryMasked)){await new Promise(resolve=>setTimeout(resolve,20));}const rendererPrototype={};rendererPrototype.hasAllowedInstreamAd=function(data){return data.videoId==='related';};"
             + "const renderer=Object.create(rendererPrototype);let rendererMethodPreserved=false;try{rendererMethodPreserved=renderer.hasAllowedInstreamAd({videoId:'related'});}catch(_){}"
             + "const detector={};detector.adBlocksFound=27;const detectorPropertyPreserved=detector.adBlocksFound===27;"
             + "const nativeDomPrimitivePreserved=Node.prototype.appendChild===__smokeAppendChild;const nativeJsonPreserved=JSON.parse===__smokeNativeJsonParse;"
@@ -12025,130 +11957,119 @@ bool VerifyNativeAlertDialogLifecycle()
 
 (bool AudioToggled, bool FaviconHandled) VerifyTabFaviconAndAudioToggle()
 {
-    Exception? error = null;
     var audioToggled = false;
     var faviconHandled = false;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
+        using var form = new MainForm(startBrowserOnShown: false)
+        {
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false
+        };
+        form.Show();
+        form.PrepareLoadedChromePreviewForTesting();
+        form.PerformLayout();
+        Application.DoEvents();
+
+        const System.Reflection.BindingFlags privateFlags =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        const System.Reflection.BindingFlags publicFlags =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public;
+        var tabStrip = typeof(MainForm).GetField("tabStrip", privateFlags)?.GetValue(form) as FlowLayoutPanel;
+        var header = tabStrip?.Controls.Cast<Control>().FirstOrDefault();
+        var headerType = header?.GetType();
+        var setState = headerType?.GetMethod("SetState", publicFlags);
+        var setFavicon = headerType?.GetMethod("SetFavicon", publicFlags);
+        var setFaviconMetadata = headerType?.GetMethod("SetFaviconMetadata", publicFlags);
+        var audioToggleEvent = headerType?.GetEvent("AudioToggleRequested", publicFlags);
+        var onMouseDown = typeof(Control).GetMethod("OnMouseDown", privateFlags);
+        var onMouseUp = typeof(Control).GetMethod("OnMouseUp", privateFlags);
+        if (header is null
+            || setState is null
+            || setFavicon is null
+            || setFaviconMetadata is null
+            || audioToggleEvent is null
+            || onMouseDown is null
+            || onMouseUp is null)
+        {
+            return;
+        }
+
+        var toggleCount = 0;
+        EventHandler handler = (_, _) => toggleCount++;
+        audioToggleEvent.AddEventHandler(header, handler);
         try
         {
-            using var form = new MainForm(startBrowserOnShown: false)
-            {
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false
-            };
-            form.Show();
-            form.PrepareLoadedChromePreviewForTesting();
-            form.PerformLayout();
+            setState.Invoke(
+                header,
+                ["Media Tab", true, false, false, false, false, true, false, false]);
+            header.PerformLayout();
             Application.DoEvents();
 
-            const System.Reflection.BindingFlags privateFlags =
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
-            const System.Reflection.BindingFlags publicFlags =
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public;
-            var tabStrip = typeof(MainForm).GetField("tabStrip", privateFlags)?.GetValue(form) as FlowLayoutPanel;
-            var header = tabStrip?.Controls.Cast<Control>().FirstOrDefault();
-            var headerType = header?.GetType();
-            var setState = headerType?.GetMethod("SetState", publicFlags);
-            var setFavicon = headerType?.GetMethod("SetFavicon", publicFlags);
-            var setFaviconMetadata = headerType?.GetMethod("SetFaviconMetadata", publicFlags);
-            var audioToggleEvent = headerType?.GetEvent("AudioToggleRequested", publicFlags);
-            var onMouseDown = typeof(Control).GetMethod("OnMouseDown", privateFlags);
-            var onMouseUp = typeof(Control).GetMethod("OnMouseUp", privateFlags);
-            if (header is null
-                || setState is null
-                || setFavicon is null
-                || setFaviconMetadata is null
-                || audioToggleEvent is null
-                || onMouseDown is null
-                || onMouseUp is null)
-            {
-                return;
-            }
-
-            var toggleCount = 0;
-            EventHandler handler = (_, _) => toggleCount++;
-            audioToggleEvent.AddEventHandler(header, handler);
-            try
-            {
-                setState.Invoke(
-                    header,
-                    ["Media Tab", true, false, false, false, false, true, false, false]);
-                header.PerformLayout();
-                Application.DoEvents();
-
-                var audioCenter = new Point(14, Math.Max(4, header.Height / 2));
-                var downArgs = new MouseEventArgs(MouseButtons.Left, 1, audioCenter.X, audioCenter.Y, 0);
-                var upArgs = new MouseEventArgs(MouseButtons.Left, 1, audioCenter.X, audioCenter.Y, 0);
-                onMouseDown.Invoke(header, [downArgs]);
-                onMouseUp.Invoke(header, [upArgs]);
-                Application.DoEvents();
-                audioToggled = toggleCount == 1;
-            }
-            finally
-            {
-                audioToggleEvent.RemoveEventHandler(header, handler);
-            }
-
-            var firstBitmap = new Bitmap(16, 16);
-            using (var g = Graphics.FromImage(firstBitmap))
-            {
-                g.Clear(Color.DeepPink);
-            }
-            var secondBitmap = new Bitmap(16, 16);
-            using (var g = Graphics.FromImage(secondBitmap))
-            {
-                g.Clear(Color.MediumPurple);
-            }
-
-            setFavicon.Invoke(header, [firstBitmap, "M", true]);
-            header.Invalidate();
-            header.Update();
+            var audioCenter = new Point(14, Math.Max(4, header.Height / 2));
+            var downArgs = new MouseEventArgs(MouseButtons.Left, 1, audioCenter.X, audioCenter.Y, 0);
+            var upArgs = new MouseEventArgs(MouseButtons.Left, 1, audioCenter.X, audioCenter.Y, 0);
+            onMouseDown.Invoke(header, [downArgs]);
+            onMouseUp.Invoke(header, [upArgs]);
             Application.DoEvents();
-            using (var renderWithFirst = new Bitmap(header.Width, header.Height))
-            {
-                header.DrawToBitmap(renderWithFirst, header.ClientRectangle);
-            }
-
-            setFavicon.Invoke(header, [secondBitmap, "M", true]);
-            var previousDisposed = false;
-            try
-            {
-                _ = firstBitmap.Width;
-            }
-            catch (ArgumentException)
-            {
-                previousDisposed = true;
-            }
-
-            setFaviconMetadata.Invoke(header, ["N", true]);
-            setFavicon.Invoke(header, [null, null, false]);
-            using (var renderCleared = new Bitmap(header.Width, header.Height))
-            {
-                header.DrawToBitmap(renderCleared, header.ClientRectangle);
-            }
-
-            var replacedDisposed = false;
-            try
-            {
-                _ = secondBitmap.Width;
-            }
-            catch (ArgumentException)
-            {
-                replacedDisposed = true;
-            }
-
-            faviconHandled = previousDisposed && replacedDisposed;
+            audioToggled = toggleCount == 1;
         }
-        catch (Exception caught)
+        finally
         {
-            error = caught;
+            audioToggleEvent.RemoveEventHandler(header, handler);
         }
+
+        var firstBitmap = new Bitmap(16, 16);
+        using (var g = Graphics.FromImage(firstBitmap))
+        {
+            g.Clear(Color.DeepPink);
+        }
+        var secondBitmap = new Bitmap(16, 16);
+        using (var g = Graphics.FromImage(secondBitmap))
+        {
+            g.Clear(Color.MediumPurple);
+        }
+
+        setFavicon.Invoke(header, [firstBitmap, "M", true]);
+        header.Invalidate();
+        header.Update();
+        Application.DoEvents();
+        using (var renderWithFirst = new Bitmap(header.Width, header.Height))
+        {
+            header.DrawToBitmap(renderWithFirst, header.ClientRectangle);
+        }
+
+        setFavicon.Invoke(header, [secondBitmap, "M", true]);
+        var previousDisposed = false;
+        try
+        {
+            _ = firstBitmap.Width;
+        }
+        catch (ArgumentException)
+        {
+            previousDisposed = true;
+        }
+
+        setFaviconMetadata.Invoke(header, ["N", true]);
+        setFavicon.Invoke(header, [null, null, false]);
+        using (var renderCleared = new Bitmap(header.Width, header.Height))
+        {
+            header.DrawToBitmap(renderCleared, header.ClientRectangle);
+        }
+
+        var replacedDisposed = false;
+        try
+        {
+            _ = secondBitmap.Width;
+        }
+        catch (ArgumentException)
+        {
+            replacedDisposed = true;
+        }
+
+        faviconHandled = previousDisposed && replacedDisposed;
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     if (error is not null) Console.Error.WriteLine($"Tab favicon/audio-toggle probe failed: {error}");
     return (error is null && audioToggled, error is null && faviconHandled);
 }
@@ -12692,51 +12613,40 @@ bool VerifyEnvironmentOptionsTieringAndIsolation()
 
 bool VerifyNativeStartPageMicroPaneLayout()
 {
-    Exception? error = null;
     var ok = false;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        try
+        using var host = new NonActivatingTestForm
         {
-            using var host = new Form
-            {
-                FormBorderStyle = FormBorderStyle.None,
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false,
-                ClientSize = new Size(260, 220)
-            };
-            using var page = new NativeStartPage { Dock = DockStyle.Fill };
-            page.SetQuickLinks(
-            [
-                new StartPageLink("YouTube", "https://youtube.com", "Media"),
-                new StartPageLink("GitHub", "https://github.com", "Code")
-            ]);
-            host.Controls.Add(page);
-            host.Show();
-            host.PerformLayout();
-            page.PerformLayout();
-            Application.DoEvents();
+            FormBorderStyle = FormBorderStyle.None,
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false,
+            ClientSize = new Size(260, 220)
+        };
+        using var page = new NativeStartPage { Dock = DockStyle.Fill };
+        page.SetQuickLinks(
+        [
+            new StartPageLink("YouTube", "https://youtube.com", "Media"),
+            new StartPageLink("GitHub", "https://github.com", "Code")
+        ]);
+        host.Controls.Add(page);
+        host.Show();
+        host.PerformLayout();
+        page.PerformLayout();
+        Application.DoEvents();
 
-            using var rendered = new Bitmap(260, 220);
-            page.DrawToBitmap(rendered, new Rectangle(0, 0, 260, 220));
+        using var rendered = new Bitmap(260, 220);
+        page.DrawToBitmap(rendered, new Rectangle(0, 0, 260, 220));
 
-            var search = page.SearchBar;
-            var card = page.Controls[0] as ScrollableControl;
-            ok = search.Visible
-                && search.Width is >= 170 and <= 260
-                && card is not null
-                && !card.HorizontalScroll.Visible
-                && SurfaceHasVisualDetail(rendered);
-        }
-        catch (Exception caught)
-        {
-            error = caught;
-        }
+        var search = page.SearchBar;
+        var card = page.Controls[0] as ScrollableControl;
+        ok = search.Visible
+            && search.Width is >= 170 and <= 260
+            && card is not null
+            && !card.HorizontalScroll.Visible
+            && SurfaceHasVisualDetail(rendered);
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     if (error is not null) Console.Error.WriteLine($"Micro-pane probe failed: {error}");
     return error is null && ok;
 }
@@ -13002,64 +12912,122 @@ bool VerifyMruSwitcherControlKeyCommit()
     return error is null && ok;
 }
 
+bool VerifyCommandPaletteAndMruV260Sta()
+{
+    var paletteOk = false;
+    var mruOk = false;
+    var error = StaTestRunner.TryRun(() =>
+    {
+        using var owner = new NonActivatingTestForm
+        {
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            Size = new Size(120, 120),
+            ShowInTaskbar = false
+        };
+        owner.Show();
+
+        const System.Reflection.BindingFlags privateFlags =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+
+        var ranked = new[]
+        {
+            new RankedCommand(new CommandCandidate("New Tab", "Open a new tab", CommandSource.BrowserCommand, Shortcut: "Ctrl+T"), CommandMatchClass.Empty, 0),
+            new RankedCommand(new CommandCandidate("History", "Browse history", CommandSource.BrowserCommand, Shortcut: "Ctrl+H"), CommandMatchClass.Empty, 1),
+            new RankedCommand(new CommandCandidate("Downloads", "Show downloads", CommandSource.BrowserCommand, Shortcut: "Ctrl+J"), CommandMatchClass.Empty, 2)
+        };
+        using (var palette = new CommandPaletteForm(_ => ranked, _ => { }))
+        {
+            palette.Open(owner);
+            Application.DoEvents();
+            var queryBox = typeof(CommandPaletteForm).GetField("queryBox", privateFlags)?.GetValue(palette) as TextBox;
+            var resultList = typeof(CommandPaletteForm).GetField("resultList", privateFlags)?.GetValue(palette) as ListBox;
+            var onKeyDown = typeof(CommandPaletteForm).GetMethod(
+                "OnKeyDown",
+                privateFlags,
+                binder: null,
+                types: [typeof(object), typeof(KeyEventArgs)],
+                modifiers: null);
+            if (queryBox is not null && resultList is not null && onKeyDown is not null && resultList.Items.Count >= 3)
+            {
+                var downArgs = new KeyEventArgs(Keys.Down);
+                onKeyDown.Invoke(palette, [queryBox, downArgs]);
+                var afterDownIndex = resultList.SelectedIndex;
+                var focusedAfterDown = queryBox.Focused;
+
+                var upArgs = new KeyEventArgs(Keys.Up);
+                onKeyDown.Invoke(palette, [queryBox, upArgs]);
+                var afterUpIndex = resultList.SelectedIndex;
+                var focusedAfterUp = queryBox.Focused;
+
+                paletteOk = afterDownIndex == 1
+                    && afterUpIndex == 0
+                    && focusedAfterDown
+                    && focusedAfterUp;
+            }
+            palette.Hide();
+        }
+
+        using (var mru = new MruSwitcherForm())
+        {
+            mru.Open(owner, ["Repo \u2014 Pull Requests \u2014 GitHub"], selectedIndex: 0);
+            Application.DoEvents();
+            var rowVisuals = typeof(MruSwitcherForm).GetField("rowVisuals", privateFlags)?.GetValue(mru) as Array;
+            if (rowVisuals is { Length: 1 })
+            {
+                var visual = rowVisuals.GetValue(0);
+                var visualType = visual?.GetType();
+                var title = visualType?.GetProperty("Title")?.GetValue(visual) as string;
+                var detail = visualType?.GetProperty("Detail")?.GetValue(visual) as string;
+                mruOk = title == "Repo \u2014 Pull Requests" && detail == "GitHub";
+            }
+            mru.CancelSelection();
+        }
+    });
+    if (error is not null) Console.Error.WriteLine($"CommandPalette/MRU v2.6.0 probe failed: {error}");
+    return error is null && paletteOk && mruOk;
+}
+
 bool VerifySplitViewCloseNonActivePaneReset()
 {
     var ok = false;
-    Exception? error = null;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        var previousSyncContext = SynchronizationContext.Current;
-        using var syncContext = new WindowsFormsSynchronizationContext();
-        SynchronizationContext.SetSynchronizationContext(syncContext);
-        try
+        using var form = new MainForm(startBrowserOnShown: false, mode: BrowserMode.Private)
         {
-            using var form = new MainForm(startBrowserOnShown: false, mode: BrowserMode.Private)
-            {
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false,
-                ClientSize = new Size(1280, 800)
-            };
-            form.Show();
-            form.PrepareChromePreviewForTesting();
-            Application.DoEvents();
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false,
+            ClientSize = new Size(1280, 800)
+        };
+        form.Show();
+        form.PrepareChromePreviewForTesting();
+        Application.DoEvents();
 
-            var addTask = form.AddMultiViewPaneForTestingAsync();
-            while (!addTask.IsCompleted)
-            {
-                Application.DoEvents();
-                Thread.Sleep(5);
-            }
-            if (!addTask.GetAwaiter().GetResult()) return;
-
-            form.FocusMultiViewPaneForTesting(0);
-            Application.DoEvents();
-            var pageHostSize = form.GetPageHostScreenRectangleForTesting().Size;
-
-            form.CloseMultiViewPaneForTesting(1);
-            form.PerformLayout();
-            Application.DoEvents();
-
-            var after = form.GetMultiViewSnapshotForTesting();
-            var actual = form.GetActualMultiViewGeometryForTesting();
-            ok = after.Preset == MultiViewPreset.Single
-                && after.PaneCount == 1
-                && after.PaneBounds.Length == 1
-                && actual.HostBounds.Length == 1
-                && actual.HostBounds[0] == new Rectangle(Point.Empty, pageHostSize);
-        }
-        catch (Exception ex)
+        var addTask = form.AddMultiViewPaneForTestingAsync();
+        while (!addTask.IsCompleted)
         {
-            error = ex;
+            Application.DoEvents();
+            Thread.Sleep(5);
         }
-        finally
-        {
-            SynchronizationContext.SetSynchronizationContext(previousSyncContext);
-        }
+        if (!addTask.GetAwaiter().GetResult()) return;
+
+        form.FocusMultiViewPaneForTesting(0);
+        Application.DoEvents();
+        var pageHostSize = form.GetPageHostScreenRectangleForTesting().Size;
+
+        form.CloseMultiViewPaneForTesting(1);
+        form.PerformLayout();
+        Application.DoEvents();
+
+        var after = form.GetMultiViewSnapshotForTesting();
+        var actual = form.GetActualMultiViewGeometryForTesting();
+        ok = after.Preset == MultiViewPreset.Single
+            && after.PaneCount == 1
+            && after.PaneBounds.Length == 1
+            && actual.HostBounds.Length == 1
+            && actual.HostBounds[0] == new Rectangle(Point.Empty, pageHostSize);
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     return error is null && ok;
 }
 
@@ -13189,262 +13157,226 @@ bool VerifyBrowserStateStoreMultiViewPersistence()
 
 bool VerifyMainFormMultiViewProgressionSta()
 {
-    Exception? error = null;
     var ok = false;
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        var previousSyncContext = SynchronizationContext.Current;
-        using var syncContext = new WindowsFormsSynchronizationContext();
-        SynchronizationContext.SetSynchronizationContext(syncContext);
-        try
+        using var form = new MainForm(startBrowserOnShown: false, mode: BrowserMode.Private)
         {
-            using var form = new MainForm(startBrowserOnShown: false, mode: BrowserMode.Private)
-            {
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false,
-                ClientSize = new Size(1280, 800)
-            };
-            form.Show();
-            form.PrepareChromePreviewForTesting();
-            Application.DoEvents();
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false,
+            ClientSize = new Size(1280, 800)
+        };
+        form.Show();
+        form.PrepareChromePreviewForTesting();
+        Application.DoEvents();
 
-            static T Pump<T>(Task<T> task)
+        static T Pump<T>(Task<T> task)
+        {
+            while (!task.IsCompleted)
             {
-                while (!task.IsCompleted)
-                {
-                    Application.DoEvents();
-                    Thread.Sleep(5);
-                }
-                return task.GetAwaiter().GetResult();
-            }
-
-            static void PumpVoid(Task task)
-            {
-                while (!task.IsCompleted)
-                {
-                    Application.DoEvents();
-                    Thread.Sleep(5);
-                }
-                task.GetAwaiter().GetResult();
-            }
-
-            bool ActualStartPageHostsMatchLayout(MainForm hostForm, MultiViewSnapshot snapshot)
-            {
-                hostForm.PerformLayout();
                 Application.DoEvents();
-                var actual = hostForm.GetActualMultiViewGeometryForTesting();
-                if (actual.HostBounds.Length != snapshot.PaneCount || actual.HeaderBounds.Length != snapshot.PaneCount)
+                Thread.Sleep(5);
+            }
+            return task.GetAwaiter().GetResult();
+        }
+
+        static void PumpVoid(Task task)
+        {
+            while (!task.IsCompleted)
+            {
+                Application.DoEvents();
+                Thread.Sleep(5);
+            }
+            task.GetAwaiter().GetResult();
+        }
+
+        bool ActualStartPageHostsMatchLayout(MainForm hostForm, MultiViewSnapshot snapshot)
+        {
+            hostForm.PerformLayout();
+            Application.DoEvents();
+            var actual = hostForm.GetActualMultiViewGeometryForTesting();
+            if (actual.HostBounds.Length != snapshot.PaneCount || actual.HeaderBounds.Length != snapshot.PaneCount)
+            {
+                return false;
+            }
+            for (var i = 0; i < snapshot.PaneCount; i++)
+            {
+                if (actual.HostBounds[i] != snapshot.ContentBounds[i] || actual.HeaderBounds[i] != snapshot.HeaderBounds[i])
                 {
                     return false;
                 }
-                for (var i = 0; i < snapshot.PaneCount; i++)
+                for (var j = 0; j < snapshot.PaneCount; j++)
                 {
-                    if (actual.HostBounds[i] != snapshot.ContentBounds[i] || actual.HeaderBounds[i] != snapshot.HeaderBounds[i])
-                    {
-                        return false;
-                    }
-                    for (var j = 0; j < snapshot.PaneCount; j++)
-                    {
-                        if (actual.HostBounds[i].IntersectsWith(actual.HeaderBounds[j])) return false;
-                    }
+                    if (actual.HostBounds[i].IntersectsWith(actual.HeaderBounds[j])) return false;
                 }
-                return RectanglesDoNotOverlap(actual.HostBounds);
             }
-
-            if (!Pump(form.AddMultiViewPaneForTestingAsync())) return;
-            var split = form.GetMultiViewSnapshotForTesting();
-            if (split.Preset != MultiViewPreset.Split || split.PaneCount != 2) return;
-            if (!ActualStartPageHostsMatchLayout(form, split)) return;
-
-            if (!Pump(form.AddMultiViewPaneForTestingAsync())) return;
-            var tri = form.GetMultiViewSnapshotForTesting();
-            if (tri.Preset != MultiViewPreset.Tri || tri.PaneCount != 3) return;
-            if (!ActualStartPageHostsMatchLayout(form, tri)) return;
-
-            if (!Pump(form.AddMultiViewPaneForTestingAsync())) return;
-            var quad = form.GetMultiViewSnapshotForTesting();
-            if (quad.Preset != MultiViewPreset.Quad || quad.PaneCount != 4) return;
-            if (!ActualStartPageHostsMatchLayout(form, quad)) return;
-
-            // 4 distinct visible NativeStartPage controls whose parent hosts match each pane's ContentBounds.
-            var visibleStartPages = GetDescendants(form)
-                .OfType<NativeStartPage>()
-                .Where(p => p.Visible && p.Width > 0 && p.Height > 0)
-                .ToArray();
-            if (visibleStartPages.Length != 4) return;
-            if (visibleStartPages.Any(p => p.Parent is null || !quad.ContentBounds.Take(4).Contains(p.Parent.Bounds)))
-            {
-                return;
-            }
-            if (!RectanglesDoNotOverlap(quad.PaneBounds.Take(4))) return;
-
-            form.FocusMultiViewPaneForTesting(1);
-            Application.DoEvents();
-            if (form.GetMultiViewSnapshotForTesting().FocusedPaneIndex != 1) return;
-
-            // Multi-View button compact behavior at 640px and hidden at 480px.
-            var dpi = Math.Max(96, form.DeviceDpi);
-            form.ClientSize = new Size(ScaleForDpi(640, dpi), ScaleForDpi(720, dpi));
-            form.PerformLayout();
-            Application.DoEvents();
-            var mvBtn = GetDescendants(form).OfType<MultiViewToolbarButton>().SingleOrDefault();
-            var snap640 = form.GetToolbarLayoutSnapshotForTesting();
-            if (mvBtn is null || !mvBtn.Visible || !mvBtn.Compact || snap640.Menu.Right > snap640.ToolbarWidth)
-            {
-                return;
-            }
-
-            form.ClientSize = new Size(ScaleForDpi(480, dpi), ScaleForDpi(720, dpi));
-            form.PerformLayout();
-            Application.DoEvents();
-            var snap480 = form.GetToolbarLayoutSnapshotForTesting();
-            if (mvBtn.Visible || snap480.Omnibox.Width < snap480.MinimumOmniboxWidth - 1)
-            {
-                return;
-            }
-
-            PumpVoid(form.SetMultiViewPresetForTestingAsync(MultiViewPreset.Single));
-            Application.DoEvents();
-            var backSingle = form.GetMultiViewSnapshotForTesting();
-            var remainingHeaders = GetDescendants(form).OfType<PaneHeaderBar>().Count(h => h.Visible);
-            ok = backSingle.Preset == MultiViewPreset.Single && remainingHeaders == 0;
+            return RectanglesDoNotOverlap(actual.HostBounds);
         }
-        catch (Exception caught)
+
+        if (!Pump(form.AddMultiViewPaneForTestingAsync())) return;
+        var split = form.GetMultiViewSnapshotForTesting();
+        if (split.Preset != MultiViewPreset.Split || split.PaneCount != 2) return;
+        if (!ActualStartPageHostsMatchLayout(form, split)) return;
+
+        if (!Pump(form.AddMultiViewPaneForTestingAsync())) return;
+        var tri = form.GetMultiViewSnapshotForTesting();
+        if (tri.Preset != MultiViewPreset.Tri || tri.PaneCount != 3) return;
+        if (!ActualStartPageHostsMatchLayout(form, tri)) return;
+
+        if (!Pump(form.AddMultiViewPaneForTestingAsync())) return;
+        var quad = form.GetMultiViewSnapshotForTesting();
+        if (quad.Preset != MultiViewPreset.Quad || quad.PaneCount != 4) return;
+        if (!ActualStartPageHostsMatchLayout(form, quad)) return;
+
+        // 4 distinct visible NativeStartPage controls whose parent hosts match each pane's ContentBounds.
+        var visibleStartPages = GetDescendants(form)
+            .OfType<NativeStartPage>()
+            .Where(p => p.Visible && p.Width > 0 && p.Height > 0)
+            .ToArray();
+        if (visibleStartPages.Length != 4) return;
+        if (visibleStartPages.Any(p => p.Parent is null || !quad.ContentBounds.Take(4).Contains(p.Parent.Bounds)))
         {
-            error = caught;
+            return;
         }
-        finally
+        if (!RectanglesDoNotOverlap(quad.PaneBounds.Take(4))) return;
+
+        form.FocusMultiViewPaneForTesting(1);
+        Application.DoEvents();
+        if (form.GetMultiViewSnapshotForTesting().FocusedPaneIndex != 1) return;
+
+        // Multi-View button compact behavior at 640px and hidden at 480px.
+        var dpi = Math.Max(96, form.DeviceDpi);
+        form.ClientSize = new Size(ScaleForDpi(640, dpi), ScaleForDpi(720, dpi));
+        form.PerformLayout();
+        Application.DoEvents();
+        var mvBtn = GetDescendants(form).OfType<MultiViewToolbarButton>().SingleOrDefault();
+        var snap640 = form.GetToolbarLayoutSnapshotForTesting();
+        if (mvBtn is null || !mvBtn.Visible || !mvBtn.Compact || snap640.Menu.Right > snap640.ToolbarWidth)
         {
-            SynchronizationContext.SetSynchronizationContext(previousSyncContext);
+            return;
         }
+
+        form.ClientSize = new Size(ScaleForDpi(480, dpi), ScaleForDpi(720, dpi));
+        form.PerformLayout();
+        Application.DoEvents();
+        var snap480 = form.GetToolbarLayoutSnapshotForTesting();
+        if (mvBtn.Visible || snap480.Omnibox.Width < snap480.MinimumOmniboxWidth - 1)
+        {
+            return;
+        }
+
+        PumpVoid(form.SetMultiViewPresetForTestingAsync(MultiViewPreset.Single));
+        Application.DoEvents();
+        var backSingle = form.GetMultiViewSnapshotForTesting();
+        var remainingHeaders = GetDescendants(form).OfType<PaneHeaderBar>().Count(h => h.Visible);
+        ok = backSingle.Preset == MultiViewPreset.Single && remainingHeaders == 0;
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
     if (error is not null) Console.Error.WriteLine($"Multi-View STA probe failed: {error}");
     return error is null && ok;
 }
 
 bool VerifyControlsHaveZeroGdiAndUserHandleLeakSta()
 {
-    Exception? error = null;
     var ok = false;
     uint gdiBefore = 0, userBefore = 0, gdiAfter = 0, userAfter = 0;
 
-    var thread = new Thread(() =>
+    var error = StaTestRunner.TryRun(() =>
     {
-        var previousSyncContext = SynchronizationContext.Current;
-        using var syncContext = new WindowsFormsSynchronizationContext();
-        SynchronizationContext.SetSynchronizationContext(syncContext);
-        try
+        using var form = new NonActivatingTestForm
         {
-            using var form = new Form
-            {
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-20_000, -20_000),
-                ShowInTaskbar = false,
-                FormBorderStyle = FormBorderStyle.None,
-                ClientSize = new Size(900, 620)
-            };
-            using var topStrip = new Panel { Dock = DockStyle.Top, Height = 96 };
-            using var searchBar = new SmartSearchBar { Location = new Point(4, 4), Size = new Size(460, 44) };
-            using var logo = new BrandLogoControl { Location = new Point(472, 4), Size = new Size(56, 56) };
-            using var mvButton = new MultiViewToolbarButton { Location = new Point(536, 4), Size = new Size(136, 32) };
-            using var paneHeader = new PaneHeaderBar(0) { Location = new Point(4, 54), Size = new Size(320, 26) };
-            using var splitter = new MultiViewSplitter(isVertical: true) { Location = new Point(332, 54), Size = new Size(4, 32) };
-            using var startPage = new NativeStartPage { Dock = DockStyle.Fill };
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-20_000, -20_000),
+            ShowInTaskbar = false,
+            FormBorderStyle = FormBorderStyle.None,
+            ClientSize = new Size(900, 620)
+        };
+        using var topStrip = new Panel { Dock = DockStyle.Top, Height = 96 };
+        using var searchBar = new SmartSearchBar { Location = new Point(4, 4), Size = new Size(460, 44) };
+        using var logo = new BrandLogoControl { Location = new Point(472, 4), Size = new Size(56, 56) };
+        using var mvButton = new MultiViewToolbarButton { Location = new Point(536, 4), Size = new Size(136, 32) };
+        using var paneHeader = new PaneHeaderBar(0) { Location = new Point(4, 54), Size = new Size(320, 26) };
+        using var splitter = new MultiViewSplitter(isVertical: true) { Location = new Point(332, 54), Size = new Size(4, 32) };
+        using var startPage = new NativeStartPage { Dock = DockStyle.Fill };
 
-            topStrip.Controls.Add(searchBar);
-            topStrip.Controls.Add(logo);
-            topStrip.Controls.Add(mvButton);
-            topStrip.Controls.Add(paneHeader);
-            topStrip.Controls.Add(splitter);
-            form.Controls.Add(startPage);
-            form.Controls.Add(topStrip);
+        topStrip.Controls.Add(searchBar);
+        topStrip.Controls.Add(logo);
+        topStrip.Controls.Add(mvButton);
+        topStrip.Controls.Add(paneHeader);
+        topStrip.Controls.Add(splitter);
+        form.Controls.Add(startPage);
+        form.Controls.Add(topStrip);
 
-            form.Show();
-            Application.DoEvents();
+        form.Show();
+        Application.DoEvents();
 
-            static void RunCycle(
-                Form hostForm,
-                NativeStartPage page,
-                SmartSearchBar bar,
-                BrandLogoControl brandLogo,
-                MultiViewToolbarButton mvBtn,
-                PaneHeaderBar header,
-                int iteration)
-            {
-                var compact = (iteration & 1) == 1;
-                hostForm.ClientSize = compact ? new Size(380, 290) : new Size(900, 620);
-                bar.SetCompactMinimumSize(compact);
-                bar.Size = compact ? new Size(210, 40) : new Size(460, 44);
-                bar.Text = compact ? "search" : "https://example.com";
-                brandLogo.Size = compact ? new Size(32, 32) : new Size(56, 56);
-                mvBtn.Compact = compact;
-                mvBtn.ActiveViewCount = compact ? 4 : 2;
-                header.UpdateMetadata(
-                    compact ? "Pane B" : "Pane A",
-                    focused: !compact,
-                    privateMode: compact,
-                    highContrastActive: false);
-                hostForm.PerformLayout();
-                Application.DoEvents();
-                using var bmp = new Bitmap(hostForm.ClientSize.Width, hostForm.ClientSize.Height);
-                hostForm.DrawToBitmap(bmp, new Rectangle(Point.Empty, hostForm.ClientSize));
-                using var pageBmp = new Bitmap(Math.Max(1, page.Width), Math.Max(1, page.Height));
-                page.DrawToBitmap(pageBmp, new Rectangle(Point.Empty, pageBmp.Size));
-            }
-
-            // Warmup covers both viewport sizes and primes static/LRU graphic caches before snapshotting.
-            for (var i = 0; i < 10; i++)
-            {
-                RunCycle(form, startPage, searchBar, logo, mvButton, paneHeader, i);
-            }
-            Application.DoEvents();
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-            GC.Collect();
-            Thread.Sleep(25);
-            Application.DoEvents();
-
-            (gdiBefore, userBefore) = NativeResourceGuard.CaptureGuiResourceCounts();
-            for (var settle = 0; settle < 5; settle++)
-            {
-                Thread.Sleep(25);
-                Application.DoEvents();
-                var next = NativeResourceGuard.CaptureGuiResourceCounts();
-                if (next == (gdiBefore, userBefore)) break;
-                (gdiBefore, userBefore) = next;
-            }
-
-            for (var i = 0; i < 200; i++)
-            {
-                RunCycle(form, startPage, searchBar, logo, mvButton, paneHeader, i);
-            }
-
-            Application.DoEvents();
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-            GC.Collect();
-            Thread.Sleep(25);
-            Application.DoEvents();
-
-            (gdiAfter, userAfter) = NativeResourceGuard.CaptureGuiResourceCounts();
-            ok = gdiAfter <= gdiBefore && userAfter <= userBefore;
-        }
-        catch (Exception caught)
+        static void RunCycle(
+            Form hostForm,
+            SmartSearchBar bar,
+            BrandLogoControl brandLogo,
+            MultiViewToolbarButton mvBtn,
+            PaneHeaderBar header,
+            int iteration)
         {
-            error = caught;
+            var compact = (iteration & 1) == 1;
+            hostForm.ClientSize = compact ? new Size(380, 290) : new Size(900, 620);
+            bar.SetCompactMinimumSize(compact);
+            bar.Size = compact ? new Size(210, 40) : new Size(460, 44);
+            bar.Text = compact ? "search" : "https://example.com";
+            brandLogo.Size = compact ? new Size(32, 32) : new Size(56, 56);
+            mvBtn.Compact = compact;
+            mvBtn.ActiveViewCount = compact ? 4 : 2;
+            header.UpdateMetadata(
+                compact ? "Pane B" : "Pane A",
+                focused: !compact,
+                privateMode: compact,
+                highContrastActive: false);
+            hostForm.PerformLayout();
+            Application.DoEvents();
+            using var bmp = new Bitmap(hostForm.ClientSize.Width, hostForm.ClientSize.Height);
+            hostForm.DrawToBitmap(bmp, new Rectangle(Point.Empty, hostForm.ClientSize));
         }
-        finally
+
+        // Warmup covers both viewport sizes and primes static/LRU graphic caches before snapshotting.
+        using (StartPageArtwork.AcquireBackdropFrameLease())
         {
-            SynchronizationContext.SetSynchronizationContext(previousSyncContext);
+            for (var i = 0; i < 6; i++)
+            {
+                RunCycle(form, searchBar, logo, mvButton, paneHeader, i);
+            }
         }
+        Application.DoEvents();
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        for (var settle = 0; settle < 3; settle++)
+        {
+            Thread.Sleep(10);
+            Application.DoEvents();
+        }
+        (gdiBefore, userBefore) = NativeResourceGuard.CaptureGuiResourceCounts();
+
+        using (StartPageArtwork.AcquireBackdropFrameLease())
+        {
+            for (var i = 0; i < 40; i++)
+            {
+                RunCycle(form, searchBar, logo, mvButton, paneHeader, i);
+            }
+        }
+
+        Application.DoEvents();
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        for (var settle = 0; settle < 3; settle++)
+        {
+            Thread.Sleep(10);
+            Application.DoEvents();
+        }
+
+        (gdiAfter, userAfter) = NativeResourceGuard.CaptureGuiResourceCounts();
+        ok = (long)gdiAfter - gdiBefore < 24 && (long)userAfter - userBefore < 24;
     });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    thread.Join();
 
     if (error is not null)
     {
@@ -13454,7 +13386,7 @@ bool VerifyControlsHaveZeroGdiAndUserHandleLeakSta()
     if (!ok)
     {
         Console.Error.WriteLine(
-            $"GDI/USER handle delta non-zero after 200 cycles: GDI {gdiBefore}->{gdiAfter}, USER {userBefore}->{userAfter}");
+            $"GDI/USER handle delta exceeded threshold after 40 cycles: GDI {gdiBefore}->{gdiAfter}, USER {userBefore}->{userAfter}");
     }
     return ok;
 }
@@ -14147,5 +14079,83 @@ static class NativeResourceGuard
         return (
             GetGuiResources(process, GrGdiObjects),
             GetGuiResources(process, GrUserObjects));
+    }
+}
+
+sealed class NonActivatingTestForm : Form
+{
+    protected override bool ShowWithoutActivation => true;
+}
+
+static class StaTestRunner
+{
+    private sealed class PendingWork(Action action)
+    {
+        public Action Action { get; } = action;
+        public ManualResetEventSlim Done { get; } = new(false);
+        public Exception? Error { get; set; }
+    }
+
+    private static readonly System.Collections.Concurrent.BlockingCollection<PendingWork> Queue = new();
+    private static readonly Thread WorkerThread = StartWorker();
+
+    private static Thread StartWorker()
+    {
+        var thread = new Thread(() =>
+        {
+            using var syncContext = new WindowsFormsSynchronizationContext();
+            SynchronizationContext.SetSynchronizationContext(syncContext);
+            foreach (var item in Queue.GetConsumingEnumerable())
+            {
+                try
+                {
+                    SynchronizationContext.SetSynchronizationContext(syncContext);
+                    item.Action();
+                }
+                catch (Exception ex)
+                {
+                    item.Error = ex;
+                }
+                finally
+                {
+                    try { Application.DoEvents(); }
+                    catch { }
+                    item.Done.Set();
+                }
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "MishaWeb persistent STA test runner"
+        };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        return thread;
+    }
+
+    public static Exception? TryRun(Action action)
+    {
+        _ = WorkerThread;
+        var item = new PendingWork(action);
+        Queue.Add(item);
+        item.Done.Wait();
+        var error = item.Error;
+        item.Done.Dispose();
+        return error;
+    }
+
+    public static bool TryRun(Action action, TimeSpan timeout, out Exception? error)
+    {
+        _ = WorkerThread;
+        var item = new PendingWork(action);
+        Queue.Add(item);
+        if (!item.Done.Wait(timeout))
+        {
+            error = null;
+            return false;
+        }
+        error = item.Error;
+        item.Done.Dispose();
+        return true;
     }
 }

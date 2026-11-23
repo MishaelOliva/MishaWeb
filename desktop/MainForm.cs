@@ -239,6 +239,7 @@ public sealed partial class MainForm : Form
     private readonly object externalNavigationSync = new();
     private readonly Queue<string?> pendingExternalNavigations = [];
     private readonly bool persistStateOnClose;
+    private readonly bool showWithoutActivationForTesting;
     private readonly BrowserMode browserMode;
     private readonly bool isPrivateMode;
     private SystemMemorySnapshot systemMemory;
@@ -437,6 +438,7 @@ public sealed partial class MainForm : Form
             ? null
             : Path.GetFullPath(webViewUserDataFolderOverride);
         persistStateOnClose = startBrowserOnShown && !isPrivateMode;
+        showWithoutActivationForTesting = !startBrowserOnShown;
         browserStartupCompleted = !startBrowserOnShown;
         if (previewState is not null)
         {
@@ -693,6 +695,9 @@ public sealed partial class MainForm : Form
     }
 
     internal bool IsPrivateBrowserWindow => isPrivateMode;
+
+    protected override bool ShowWithoutActivation =>
+        showWithoutActivationForTesting || base.ShowWithoutActivation;
     internal bool IsClosingForApplicationContext => Volatile.Read(ref isClosing);
     internal bool IsWindowMinimizedForApplicationContext => Volatile.Read(ref isWindowMinimized);
     internal bool IsPrivateCleanupInProgressForApplicationContext => Volatile.Read(ref privateCleanupInProgress);

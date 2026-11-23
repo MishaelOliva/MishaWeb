@@ -18,6 +18,7 @@ public sealed partial class MainForm
     private TableLayoutPanel? omniboxLayout;
     private (string Primary, bool IsHoverPrimary, int Blocked, int ActiveDownloads, int Sleeping, int Unloaded) lastStatusTuple;
     private bool hasStatusTuple;
+    private bool syncingAddressBar;
 
     internal bool IsPrivateWindow => isPrivateMode;
 
@@ -1283,6 +1284,10 @@ public sealed partial class MainForm
         addressBar.TextChanged += (_, _) =>
         {
             if (isAutocompletingAddressBar) return;
+            if (!syncingAddressBar && addressBar.TextLength > 0)
+            {
+                PrewarmEnvironmentOnUserInput();
+            }
             if (suppressAddressBarAutocomplete)
             {
                 suppressAddressBarAutocomplete = false;
@@ -2928,9 +2933,17 @@ public sealed partial class MainForm
     {
         if (addressBarEditing) return;
         HideAddressSuggestions();
-        addressBar.Text = activeTab is null || activeTab.IsStartPage
-            ? string.Empty
-            : FormatAddressForDisplay(activeTab.Url);
+        syncingAddressBar = true;
+        try
+        {
+            addressBar.Text = activeTab is null || activeTab.IsStartPage
+                ? string.Empty
+                : FormatAddressForDisplay(activeTab.Url);
+        }
+        finally
+        {
+            syncingAddressBar = false;
+        }
     }
 
     internal static string FormatAddressForDisplay(string? address)

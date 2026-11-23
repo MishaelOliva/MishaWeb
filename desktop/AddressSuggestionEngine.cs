@@ -1003,6 +1003,7 @@ internal static class AddressSuggestionEngine
     {
         private SuggestionIndexCache(
             BrowserState state,
+            long stateRevision,
             BookmarkEntry[] bookmarks,
             HistoryEntry[] history,
             string[] dismissedUrls,
@@ -1010,6 +1011,7 @@ internal static class AddressSuggestionEngine
             IndexedCandidate[] candidates)
         {
             State = new WeakReference<BrowserState>(state);
+            StateRevision = stateRevision;
             Bookmarks = bookmarks;
             History = history;
             DismissedUrls = dismissedUrls;
@@ -1018,6 +1020,7 @@ internal static class AddressSuggestionEngine
         }
 
         private WeakReference<BrowserState> State { get; }
+        private long StateRevision { get; }
         private BookmarkEntry[] Bookmarks { get; }
         private HistoryEntry[] History { get; }
         private string[] DismissedUrls { get; }
@@ -1026,9 +1029,14 @@ internal static class AddressSuggestionEngine
 
         public bool Matches(BrowserState state)
         {
-            return State.TryGetTarget(out var cachedState)
-                && ReferenceEquals(cachedState, state)
-                && SequenceReferencesMatch(state.Bookmarks, Bookmarks, MaximumBookmarksToScan)
+            if (!State.TryGetTarget(out var cachedState)
+                || !ReferenceEquals(cachedState, state)
+                || state.StateRevision != StateRevision)
+            {
+                return false;
+            }
+
+            return SequenceReferencesMatch(state.Bookmarks, Bookmarks, MaximumBookmarksToScan)
                 && SequenceReferencesMatch(state.History, History, MaximumHistoryItemsToScan)
                 && SequenceReferencesMatch(state.DismissedSuggestionUrls, DismissedUrls, int.MaxValue)
                 && SequenceReferencesMatch(state.SuggestionUsage, Usage, int.MaxValue);
@@ -1039,6 +1047,7 @@ internal static class AddressSuggestionEngine
 
         public static SuggestionIndexCache Create(BrowserState state)
         {
+            var stateRevision = state.StateRevision;
             var bookmarks = SnapshotPrefix(state.Bookmarks, MaximumBookmarksToScan);
             var history = SnapshotPrefix(state.History, MaximumHistoryItemsToScan);
             var dismissedSnapshot = SnapshotPrefix(state.DismissedSuggestionUrls, int.MaxValue);
@@ -1071,6 +1080,7 @@ internal static class AddressSuggestionEngine
 
             return new SuggestionIndexCache(
                 state,
+                stateRevision,
                 bookmarks,
                 history,
                 dismissedSnapshot,

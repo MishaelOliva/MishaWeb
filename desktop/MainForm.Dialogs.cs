@@ -292,8 +292,17 @@ public sealed partial class MainForm
             Tag = connectionColor
         });
 
+        var breakdown = GetTabShieldCategoryBreakdown(tab);
+        var blockedSummaryParts = new List<string>(5);
+        if (breakdown.Ads > 0) blockedSummaryParts.Add($"Ads {breakdown.Ads}");
+        if (breakdown.Trackers > 0) blockedSummaryParts.Add($"Trackers {breakdown.Trackers}");
+        if (breakdown.Privacy > 0) blockedSummaryParts.Add($"Privacy {breakdown.Privacy}");
+        if (breakdown.Scripts > 0) blockedSummaryParts.Add($"Scripts {breakdown.Scripts}");
+        if (breakdown.Other > 0) blockedSummaryParts.Add($"Other {breakdown.Other}");
         var blockedLabel = tab.BlockedRequestCount > 0
-            ? $"Shield blocked {tab.BlockedRequestCount} (Ads {tab.BlockedAdCount} \u00B7 Trackers {tab.BlockedTrackerCount} \u00B7 Scripts {tab.BlockedScriptCount})"
+            ? blockedSummaryParts.Count > 0
+                ? $"Shield blocked {tab.BlockedRequestCount} ({string.Join(" \u00B7 ", blockedSummaryParts)})"
+                : $"Shield blocked {tab.BlockedRequestCount}"
             : "Shield blocked: 0";
         if (tab.BlockedRequestCount > 0 || tab.RecentBlockedHosts.Count > 0)
         {
@@ -305,12 +314,16 @@ public sealed partial class MainForm
             };
             blockedMenu.DropDown.Renderer = menuRenderer;
             NativeUiTheme.ApplyMenuWindowFrame(blockedMenu.DropDown, palette.WindowFrameBorder);
-            blockedMenu.DropDownItems.Add(new ToolStripMenuItem($"Ads: {tab.BlockedAdCount}") { Enabled = false, Tag = NativeUiTheme.SecondaryText });
-            blockedMenu.DropDownItems.Add(new ToolStripMenuItem($"Trackers: {tab.BlockedTrackerCount}") { Enabled = false, Tag = NativeUiTheme.SecondaryText });
-            blockedMenu.DropDownItems.Add(new ToolStripMenuItem($"Scripts: {tab.BlockedScriptCount}") { Enabled = false, Tag = NativeUiTheme.SecondaryText });
-            if (tab.BlockedOtherCount > 0)
+            blockedMenu.DropDownItems.Add(new ToolStripMenuItem($"Ads: {breakdown.Ads}") { Enabled = false, Tag = NativeUiTheme.SecondaryText });
+            blockedMenu.DropDownItems.Add(new ToolStripMenuItem($"Trackers: {breakdown.Trackers}") { Enabled = false, Tag = NativeUiTheme.SecondaryText });
+            if (breakdown.Privacy > 0)
             {
-                blockedMenu.DropDownItems.Add(new ToolStripMenuItem($"Other: {tab.BlockedOtherCount}") { Enabled = false, Tag = NativeUiTheme.SecondaryText });
+                blockedMenu.DropDownItems.Add(new ToolStripMenuItem($"Privacy: {breakdown.Privacy}") { Enabled = false, Tag = NativeUiTheme.SecondaryText });
+            }
+            blockedMenu.DropDownItems.Add(new ToolStripMenuItem($"Scripts: {breakdown.Scripts}") { Enabled = false, Tag = NativeUiTheme.SecondaryText });
+            if (breakdown.Other > 0)
+            {
+                blockedMenu.DropDownItems.Add(new ToolStripMenuItem($"Other: {breakdown.Other}") { Enabled = false, Tag = NativeUiTheme.SecondaryText });
             }
             if (tab.RecentBlockedHosts.Count > 0)
             {

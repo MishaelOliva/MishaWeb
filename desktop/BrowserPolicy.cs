@@ -153,9 +153,14 @@ internal static class BrowserPolicy
 
         if (Uri.TryCreate(value, UriKind.Absolute, out var absoluteUri))
         {
-            return (absoluteUri.IsFile && TryNormalizeLocalFileUrl(absoluteUri.AbsoluteUri, out _))
+            if ((absoluteUri.IsFile && TryNormalizeLocalFileUrl(absoluteUri.AbsoluteUri, out _))
                 || absoluteUri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
-                || absoluteUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase);
+                || absoluteUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return LooksLikeHost(value, out _);
         }
 
         return LooksLikeHost(value, out _);
