@@ -2,7 +2,7 @@ namespace MishaWeb;
 
 internal static class BrowserPerformance
 {
-    public const string NoMotionDocumentScript =
+    public static readonly string NoMotionDocumentScript =
         """
         (() => {
             const styleId = '__misha_no_motion_style';
@@ -35,7 +35,7 @@ internal static class BrowserPerformance
     public const string RestoreMotionDocumentScript =
         "document.getElementById('__misha_no_motion_style')?.remove();";
 
-    public const string SiteResponsivenessDocumentScript =
+    public static readonly string SiteResponsivenessDocumentScript =
         """
         (() => {
             if (window.__mishaSiteResponsivenessInstalled) return;
@@ -50,7 +50,7 @@ internal static class BrowserPerformance
             }
 
             // 1. Safe, Selective Passive Event Listeners for Scrolling
-            // We ONLY mark default scroll events on Window/Document/Body as passive when
+            // We ONLY mark default scroll events on Window/Document/Body/DocumentElement as passive when
             // the caller did NOT explicitly pass { passive: false }.
             // We NEVER override explicit { passive: false }, and we NEVER touch interactive
             // surfaces (canvas, maps, sliders, games, contenteditable) that require preventDefault.
@@ -61,7 +61,7 @@ internal static class BrowserPerformance
                     if (scrollTypes.has(type)) {
                         const isExplicitActive = typeof options === 'object' && options !== null && options.passive === false;
                         if (!isExplicitActive) {
-                            const isGlobalTarget = this === window || this === document || this === document.body;
+                            const isGlobalTarget = this === window || this === document || this === document.body || this === document.documentElement;
                             if (isGlobalTarget) {
                                 if (typeof options === 'boolean') {
                                     options = { capture: options, passive: true };
@@ -116,13 +116,26 @@ internal static class BrowserPerformance
                     }
                 };
 
-                const preconnectAnchor = (anchor) => {
+                const getEligiblePreconnectOrigin = (anchor) => {
+                    if (!anchor) return null;
+                    try {
+                        const protocol = anchor.protocol;
+                        if (protocol !== 'http:' && protocol !== 'https:') return null;
+                        const origin = anchor.origin;
+                        if (!origin || origin === 'null' || origin === location.origin || preconnectedOrigins.has(origin)) {
+                            return null;
+                        }
+                        return origin;
+                    } catch (_) {
+                        return null;
+                    }
+                };
+
+                const preconnectAnchor = (anchor, resolvedOrigin) => {
                     if (!anchor || document.hidden) return;
                     try {
-                        const href = anchor.href;
-                        if (!href || (!href.startsWith('http://') && !href.startsWith('https://'))) return;
-                        const targetOrigin = new URL(href).origin;
-                        if (targetOrigin === location.origin || preconnectedOrigins.has(targetOrigin)) return;
+                        const targetOrigin = resolvedOrigin || getEligiblePreconnectOrigin(anchor);
+                        if (!targetOrigin || targetOrigin === location.origin || preconnectedOrigins.has(targetOrigin)) return;
 
                         preconnectedOrigins.add(targetOrigin);
                         const head = document.head || document.documentElement;
@@ -153,16 +166,21 @@ internal static class BrowserPerformance
 
                 document.addEventListener('mouseover', (e) => {
                     const target = e.target;
+                    if (currentAnchor && target && typeof currentAnchor.contains === 'function' && currentAnchor.contains(target)) {
+                        return;
+                    }
                     const anchor = target && typeof target.closest === 'function' ? target.closest('a[href]') : null;
                     if (anchor === currentAnchor) return;
                     currentAnchor = anchor;
                     clearHoverTimer();
                     if (!anchor || document.hidden) return;
+                    const targetOrigin = getEligiblePreconnectOrigin(anchor);
+                    if (!targetOrigin) return;
 
                     hoverTimer = setTimeout(() => {
                         hoverTimer = null;
                         if (currentAnchor !== anchor) return;
-                        preconnectAnchor(anchor);
+                        preconnectAnchor(anchor, targetOrigin);
                     }, 65);
                 }, { passive: true });
 

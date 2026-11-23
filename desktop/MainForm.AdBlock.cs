@@ -99,12 +99,17 @@ public sealed partial class MainForm
         await Task.CompletedTask;
     }
 
-    private async Task InstallAdBlockPageScriptsAsync(BrowserTab tab)
+    private string[]? cachedAdBlockPolicyExceptions;
+    private string? cachedAdBlockPolicyScript;
+
+    private string? GetOrBuildAdBlockPolicyScript()
     {
-        var core = tab.Core;
-        if (!adBlockEnabled || core is null || tab.IsClosed) return;
-        RemoveAdBlockPageScripts(tab, core);
-        var generation = tab.AdBlockScriptGeneration;
+        if (state.AdBlockExceptionHosts.Count == 0)
+        {
+            cachedAdBlockPolicyExceptions = null;
+            cachedAdBlockPolicyScript = null;
+            return null;
+        }
 
         var exceptions = state.AdBlockExceptionHosts
             .Select(BrowserPolicy.NormalizeExactHost)
@@ -112,6 +117,21 @@ public sealed partial class MainForm
             .Cast<string>()
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
+        if (exceptions.Length == 0)
+        {
+            cachedAdBlockPolicyExceptions = null;
+            cachedAdBlockPolicyScript = null;
+            return null;
+        }
+
+        if (cachedAdBlockPolicyScript is not null
+            && cachedAdBlockPolicyExceptions is not null
+            && cachedAdBlockPolicyExceptions.Length == exceptions.Length
+            && cachedAdBlockPolicyExceptions.AsSpan().SequenceEqual(exceptions))
+        {
+            return cachedAdBlockPolicyScript;
+        }
+
         var exceptionJson = JsonSerializer.Serialize(exceptions, BrowserStateJsonContext.Default.StringArray);
         var policyScript =
             "(() => { const hosts = new Set("
@@ -121,16 +141,33 @@ public sealed partial class MainForm
             + "try { topHost=new URL(document.referrer).hostname.toLowerCase(); } catch (_) {} }"
             + "if (hosts.has(location.hostname.toLowerCase()) || hosts.has(topHost)) "
             + "window.__mishaAdBlockEnabled = false; })();";
-        var policyId = await core.AddScriptToExecuteOnDocumentCreatedAsync(policyScript);
-        if (!adBlockEnabled
-            || tab.IsClosed
-            || tab.Core != core
-            || tab.AdBlockScriptGeneration != generation)
+        cachedAdBlockPolicyExceptions = exceptions;
+        cachedAdBlockPolicyScript = policyScript;
+        return policyScript;
+    }
+
+    private async Task InstallAdBlockPageScriptsAsync(BrowserTab tab)
+    {
+        var core = tab.Core;
+        if (!adBlockEnabled || core is null || tab.IsClosed) return;
+        RemoveAdBlockPageScripts(tab, core);
+        var generation = tab.AdBlockScriptGeneration;
+
+        string? policyId = null;
+        var policyScript = GetOrBuildAdBlockPolicyScript();
+        if (policyScript is not null)
         {
-            TryRemoveAdBlockScript(core, policyId, "Could not remove a stale adblock site policy");
-            return;
+            policyId = await core.AddScriptToExecuteOnDocumentCreatedAsync(policyScript);
+            if (!adBlockEnabled
+                || tab.IsClosed
+                || tab.Core != core
+                || tab.AdBlockScriptGeneration != generation)
+            {
+                TryRemoveAdBlockScript(core, policyId, "Could not remove a stale adblock site policy");
+                return;
+            }
+            tab.AdBlockPolicyScriptId = policyId;
         }
-        tab.AdBlockPolicyScriptId = policyId;
 
         var controlChannel = EnsureAdBlockControlChannel(tab);
         var scriptId = await core.AddScriptToExecuteOnDocumentCreatedAsync(
@@ -141,7 +178,7 @@ public sealed partial class MainForm
             || tab.AdBlockScriptGeneration != generation)
         {
             TryRemoveAdBlockScript(core, scriptId, "Could not remove a stale adblock page shield");
-            if (tab.AdBlockPolicyScriptId == policyId)
+            if (policyId is not null && tab.AdBlockPolicyScriptId == policyId)
             {
                 TryRemoveAdBlockScript(core, policyId, "Could not remove a stale adblock site policy");
                 tab.AdBlockPolicyScriptId = null;
@@ -745,11 +782,13 @@ public sealed partial class MainForm
                     resourceType,
                     mediaPermissionGranted)) return;
         }
-        var evaluation = adBlocker.EvaluateRequest(
-            requestUri,
-            sourceUrl,
-            resourceType,
-            cacheEvaluation: !isPrivateMode);
+        var evaluation = parsedRequestUri is not null
+            ? adBlocker.EvaluateRequest(parsedRequestUri, parsedSourceUri, resourceType)
+            : adBlocker.EvaluateRequest(
+                requestUri,
+                sourceUrl,
+                resourceType,
+                cacheEvaluation: !isPrivateMode);
         if (!evaluation.Blocked) return;
 
         e.Response = CreateBlockedResourceResponse(
@@ -759,9 +798,73 @@ public sealed partial class MainForm
             requestHeaders,
             parsedRequestUri,
             parsedTopLevelUri);
+        RecordTabBlockedCategory(tab, evaluation);
         tab.RecordBlockedAttempt(evaluation);
         if (tab.BlockedRequestCount == 1) ShowTransientStatus("Shield blocked ad and tracker requests");
         else if (activeTab == tab && !statusUiTimer.Enabled) statusUiTimer.Start();
+    }
+
+    private sealed class TabShieldCategoryBreakdown
+    {
+        public int Ads;
+        public int Trackers;
+        public int Privacy;
+        public int Scripts;
+        public int Other;
+        public long DocumentGeneration = -1;
+
+        public void Reset(long generation)
+        {
+            Ads = 0;
+            Trackers = 0;
+            Privacy = 0;
+            Scripts = 0;
+            Other = 0;
+            DocumentGeneration = generation;
+        }
+    }
+
+    private readonly ConditionalWeakTable<BrowserTab, TabShieldCategoryBreakdown> tabShieldBreakdowns = new();
+
+    private void RecordTabBlockedCategory(BrowserTab tab, AdBlockMatchResult evaluation)
+    {
+        var breakdown = tabShieldBreakdowns.GetOrCreateValue(tab);
+        if (tab.BlockedRequestCount == 0 || breakdown.DocumentGeneration != tab.DocumentNavigationGeneration)
+        {
+            breakdown.Reset(tab.DocumentNavigationGeneration);
+        }
+
+        if (string.Equals(evaluation.Category, "Ad", StringComparison.OrdinalIgnoreCase))
+        {
+            breakdown.Ads++;
+        }
+        else if (string.Equals(evaluation.Category, "Tracker", StringComparison.OrdinalIgnoreCase))
+        {
+            breakdown.Trackers++;
+        }
+        else if (string.Equals(evaluation.Category, "Privacy", StringComparison.OrdinalIgnoreCase))
+        {
+            breakdown.Privacy++;
+        }
+        else if (string.Equals(evaluation.Category, "Script", StringComparison.OrdinalIgnoreCase))
+        {
+            breakdown.Scripts++;
+        }
+        else
+        {
+            breakdown.Other++;
+        }
+    }
+
+    private (int Ads, int Trackers, int Privacy, int Scripts, int Other) GetTabShieldCategoryBreakdown(BrowserTab tab)
+    {
+        if (tab.BlockedRequestCount == 0
+            || !tabShieldBreakdowns.TryGetValue(tab, out var breakdown)
+            || breakdown.DocumentGeneration != tab.DocumentNavigationGeneration)
+        {
+            return (tab.BlockedAdCount, tab.BlockedTrackerCount, 0, tab.BlockedScriptCount, tab.BlockedOtherCount);
+        }
+        return (breakdown.Ads, breakdown.Trackers, breakdown.Privacy, breakdown.Scripts, breakdown.Other);
     }
 
     private static bool IsHttpUri(Uri? uri, string rawUrl) =>
@@ -1698,8 +1801,8 @@ public sealed partial class MainForm
     private const int MaximumCachedSerializedCosmeticCssEntries = 32;
     private static readonly ConditionalWeakTable<AdBlockEngine, SerializedCosmeticCssCache> CosmeticCssCachesByEngine = new();
 
-    private readonly record struct CosmeticCssCacheKey(string Host, int CssLength);
-    private readonly record struct CachedCosmeticCssEntry(CosmeticCssCacheKey Key, string RawCss, string Serialized);
+    private readonly record struct CosmeticCssCacheKey(string Host, int CssLength, bool RequireMatchingHost);
+    private readonly record struct CachedCosmeticCssEntry(CosmeticCssCacheKey Key, string RawCss, string WrapperScript);
 
     private sealed class SerializedCosmeticCssCache
     {
@@ -1712,10 +1815,14 @@ public sealed partial class MainForm
         private bool lastReady;
         private AdBlockCompileDiagnostics lastDiagnostics;
 
-        public string GetOrSerialize(AdBlockEngine engine, string pageUrl, string css)
+        public string GetOrCreateWrapperScript(
+            AdBlockEngine engine,
+            string pageUrl,
+            string css,
+            bool requireMatchingHost)
         {
-            var host = HostFromUrl(pageUrl).ToLowerInvariant();
-            var key = new CosmeticCssCacheKey(host, css.Length);
+            var host = requireMatchingHost ? HostFromUrl(pageUrl).ToLowerInvariant() : string.Empty;
+            var key = new CosmeticCssCacheKey(host, css.Length, requireMatchingHost);
             var isReady = engine.IsReady;
             var diagnostics = engine.LastCompileDiagnostics;
 
@@ -1730,9 +1837,12 @@ public sealed partial class MainForm
 
                 for (var i = 0; i < recentIdentities.Length; i++)
                 {
-                    if (ReferenceEquals(recentIdentities[i].RawCss, css))
+                    ref readonly var recent = ref recentIdentities[i];
+                    if (ReferenceEquals(recent.RawCss, css)
+                        && recent.Key.RequireMatchingHost == requireMatchingHost
+                        && (!requireMatchingHost || string.Equals(recent.Key.Host, host, StringComparison.Ordinal)))
                     {
-                        return recentIdentities[i].Serialized;
+                        return recent.WrapperScript;
                     }
                 }
 
@@ -1741,11 +1851,11 @@ public sealed partial class MainForm
                 {
                     order.Remove(existingNode);
                     order.AddLast(existingNode);
-                    return existingNode.Value.Serialized;
+                    return existingNode.Value.WrapperScript;
                 }
             }
 
-            var serialized = JsonSerializer.Serialize(css, BrowserStateJsonContext.Default.String);
+            var wrapperScript = BuildCosmeticStyleWrapperScript(css, host, requireMatchingHost);
             lock (sync)
             {
                 if (engine.IsReady != isReady || engine.LastCompileDiagnostics != diagnostics)
@@ -1753,7 +1863,7 @@ public sealed partial class MainForm
                     ClearLocked();
                     lastReady = engine.IsReady;
                     lastDiagnostics = engine.LastCompileDiagnostics;
-                    return serialized;
+                    return wrapperScript;
                 }
 
                 if (SerializedCosmeticCssCacheMap.TryGetValue(key, out var existingNode))
@@ -1762,7 +1872,7 @@ public sealed partial class MainForm
                     {
                         order.Remove(existingNode);
                         order.AddLast(existingNode);
-                        return existingNode.Value.Serialized;
+                        return existingNode.Value.WrapperScript;
                     }
                     order.Remove(existingNode);
                     SerializedCosmeticCssCacheMap.Remove(key);
@@ -1775,11 +1885,11 @@ public sealed partial class MainForm
                     SerializedCosmeticCssCacheMap.Remove(oldest.Value.Key);
                 }
 
-                var entry = new CachedCosmeticCssEntry(key, css, serialized);
+                var entry = new CachedCosmeticCssEntry(key, css, wrapperScript);
                 var node = order.AddLast(entry);
                 SerializedCosmeticCssCacheMap[key] = node;
                 recentIdentities[nextIdentitySlot++ & 3] = entry;
-                return serialized;
+                return wrapperScript;
             }
         }
 
@@ -1796,18 +1906,30 @@ public sealed partial class MainForm
         }
     }
 
-    private static string GetOrSerializeCosmeticCss(
-        AdBlockEngine engine,
-        string pageUrl,
+    private static string BuildCosmeticStyleWrapperScript(
         string css,
-        bool cacheSerialization)
+        string expectedHost,
+        bool requireMatchingHost)
     {
-        if (!cacheSerialization)
-        {
-            return JsonSerializer.Serialize(css, BrowserStateJsonContext.Default.String);
-        }
-        var cache = CosmeticCssCachesByEngine.GetValue(engine, static _ => new SerializedCosmeticCssCache());
-        return cache.GetOrSerialize(engine, pageUrl, css);
+        var serializedCss = JsonSerializer.Serialize(css, BrowserStateJsonContext.Default.String);
+        // The guard compares only the lowercase hostname so a same-host
+        // client-side redirect or History API rewrite keeps the stylesheet while
+        // a cross-host navigation cannot inherit it. Inherited-origin frames
+        // (about:blank, data:) have no hostname of their own, so the guard is
+        // skipped for them.
+        var hostGuard = requireMatchingHost
+            ? "try {"
+                + $"if (location.hostname.toLowerCase() !== {JsonSerializer.Serialize(expectedHost, BrowserStateJsonContext.Default.String)}) return;"
+                + "} catch (_) { return; }"
+            : string.Empty;
+        return "(() => {"
+            + "if (window.__mishaAdBlockEnabled === false || !document.documentElement) return;"
+            + hostGuard
+            + "const id='__misha_adblock_remote_style';"
+            + "let style=document.getElementById(id);"
+            + "if (!style) { style=document.createElement('style'); style.id=id; document.documentElement.appendChild(style); }"
+            + $"style.textContent={serializedCss};"
+            + "})();";
     }
 
     private static void ClearCosmeticCssCache(AdBlockEngine engine)
@@ -1825,26 +1947,13 @@ public sealed partial class MainForm
         bool requireMatchingHost = true,
         bool cacheSerialization = true)
     {
-        var serializedCss = GetOrSerializeCosmeticCss(engine, pageUrl, css, cacheSerialization);
-        var serializedPageUrl = JsonSerializer.Serialize(pageUrl, BrowserStateJsonContext.Default.String);
-        // The guard used to compare the full URL, so a client-side redirect or a
-        // History API rewrite before DOMContentLoaded silently dropped the whole
-        // stylesheet. Cosmetic rules are host-scoped, so a same-host URL change
-        // cannot make them wrong; a host change still must not inherit them.
-        // Inherited-origin frames (about:blank, data:) have no hostname of their
-        // own to compare against, so the guard is skipped for them.
-        return "(() => {"
-            + "if (window.__mishaAdBlockEnabled === false || !document.documentElement) return;"
-            + (requireMatchingHost
-                ? "try {"
-                    + $"if (new URL(location.href).hostname !== new URL({serializedPageUrl}).hostname) return;"
-                    + "} catch (_) { return; }"
-                : string.Empty)
-            + "const id='__misha_adblock_remote_style';"
-            + "let style=document.getElementById(id);"
-            + "if (!style) { style=document.createElement('style'); style.id=id; document.documentElement.appendChild(style); }"
-            + $"style.textContent={serializedCss};"
-            + "})();";
+        if (!cacheSerialization)
+        {
+            var expectedHost = requireMatchingHost ? HostFromUrl(pageUrl).ToLowerInvariant() : string.Empty;
+            return BuildCosmeticStyleWrapperScript(css, expectedHost, requireMatchingHost);
+        }
+        var cache = CosmeticCssCachesByEngine.GetValue(engine, static _ => new SerializedCosmeticCssCache());
+        return cache.GetOrCreateWrapperScript(engine, pageUrl, css, requireMatchingHost);
     }
 
     /// <summary>
