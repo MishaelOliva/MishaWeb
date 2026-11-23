@@ -10486,7 +10486,8 @@ Dictionary<string, bool> ExecuteYouTubeAdSkipFixture(string script)
                     && clicks(__skipB)===1
                     && __skipSelectorCalls===1
                     && __video.muted===true
-                    && __video.playbackRate===16;
+                    && __video.playbackRate===16
+                    && __video.currentTime===__video.duration;
                 // The old loop ran one querySelector per skip selector on every
                 // poll. None of those may survive.
                 const noPerSelectorQueries=__legacySkipQueryCalls===0;

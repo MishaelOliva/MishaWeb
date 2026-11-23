@@ -361,16 +361,107 @@ internal static class AdBlockDocumentScript
             };
 
             const payloadSanitizeSignal = /"(?:adPlacements|playerAds|adSlots|adBreak|instreamAd|instreamVideoAdRenderer|playerAdParams|adLayoutLoggingData|paidContentOverlayRenderer|adSlotRenderer|adPlacement|adSafetyReason|linearAdSequenceRenderer|playerLegacyDesktopWatchAdsRenderer|videoAdRenderer|adEngagementPanelContent|adsEngagementPanelContentRenderer|adClientParams|playabilityStatus)"/;
-            const sanitizePayload = value => {
+            const textByteLength = (text, encoder) => {
+                if (encoder) return encoder.encode(text).byteLength;
+                if (typeof TextEncoder === 'function') return new TextEncoder().encode(text).byteLength;
+                try { return unescape(encodeURIComponent(text)).length; }
+                catch (_) { return text.length; }
+            };
+            const sanitizeJsonText = value => {
                 if (!isEnabled() || typeof value !== 'string') return value;
-                if (!payloadSanitizeSignal.test(value)) return value;
+                const xssiMatch = /^\)\]\}'\r?\n/.exec(value);
+                const prefix = xssiMatch ? xssiMatch[0] : '';
+                const body = prefix ? value.slice(prefix.length) : value;
+                if (!payloadSanitizeSignal.test(body)) return value;
                 try {
-                    const parsed = JSON.parse(value);
+                    const parsed = JSON.parse(body);
                     const sanitized = sanitize(parsed);
                     repairPlayerResponse(sanitized);
                     inspectPlayerResponse(sanitized);
-                    return JSON.stringify(sanitized);
+                    return prefix + JSON.stringify(sanitized);
                 } catch (_) { return value; }
+            };
+            const extractMultipartBoundary = (contentType, sampleText) => {
+                if (typeof contentType === 'string' && contentType) {
+                    const match = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(contentType);
+                    const boundary = match?.[1] || match?.[2] || '';
+                    if (boundary) return boundary;
+                }
+                if (!contentType && typeof sampleText === 'string' && sampleText) {
+                    const firstLineMatch = /^(?:\r?\n)?--([^\r\n]+)\r?\n/.exec(sampleText);
+                    const candidate = firstLineMatch?.[1] || '';
+                    if (candidate
+                        && !candidate.endsWith('--')
+                        && (sampleText.includes('\r\n\r\n') || sampleText.includes('\n\n'))) {
+                        return candidate;
+                    }
+                }
+                return '';
+            };
+            const sanitizeMultipartPart = (partSegment, delimiter, encoder) => {
+                if (!partSegment.startsWith(delimiter)
+                    || partSegment.startsWith(delimiter + '--')) return partSegment;
+                let sepIndex = partSegment.indexOf('\r\n\r\n');
+                let sepLen = 4;
+                if (sepIndex === -1) {
+                    sepIndex = partSegment.indexOf('\n\n');
+                    sepLen = 2;
+                }
+                if (sepIndex === -1) return partSegment;
+                const headerBlock = partSegment.slice(0, sepIndex);
+                const sep = partSegment.slice(sepIndex, sepIndex + sepLen);
+                const rawBody = partSegment.slice(sepIndex + sepLen);
+                if (!payloadSanitizeSignal.test(rawBody)) return partSegment;
+                let bodyCore = rawBody;
+                let trailing = '';
+                if (rawBody.endsWith('\r\n')) {
+                    bodyCore = rawBody.slice(0, -2);
+                    trailing = '\r\n';
+                } else if (rawBody.endsWith('\n')) {
+                    bodyCore = rawBody.slice(0, -1);
+                    trailing = '\n';
+                }
+                const sanitizedCore = sanitizeJsonText(bodyCore);
+                if (sanitizedCore === bodyCore) return partSegment;
+                let nextHeaderBlock = headerBlock;
+                const clPattern = /^(content-length\s*:\s*)(\d+)(\s*)$/im;
+                const clMatch = clPattern.exec(headerBlock);
+                if (clMatch) {
+                    const origLen = Number(clMatch[2]);
+                    const countIncludesTrailing = origLen === textByteLength(rawBody, encoder);
+                    const nextLen = countIncludesTrailing
+                        ? textByteLength(sanitizedCore + trailing, encoder)
+                        : textByteLength(sanitizedCore, encoder);
+                    nextHeaderBlock = headerBlock.replace(
+                        clPattern,
+                        (_, prefixText, _digits, suffixText) => `${prefixText}${nextLen}${suffixText}`);
+                }
+                return nextHeaderBlock + sep + sanitizedCore + trailing;
+            };
+            const sanitizePayload = (value, contentType = '') => {
+                if (!isEnabled() || typeof value !== 'string') return value;
+                if (!payloadSanitizeSignal.test(value)) return value;
+                const boundary = extractMultipartBoundary(contentType, value);
+                if (boundary) {
+                    const delimiter = '--' + boundary;
+                    const firstIdx = value.indexOf(delimiter);
+                    if (firstIdx !== -1) {
+                        const out = [value.slice(0, firstIdx)];
+                        let cursor = firstIdx;
+                        const encoder = typeof TextEncoder === 'function' ? new TextEncoder() : null;
+                        while (cursor < value.length) {
+                            const nextIdx = value.indexOf(delimiter, cursor + delimiter.length);
+                            const segment = nextIdx === -1
+                                ? value.slice(cursor)
+                                : value.slice(cursor, nextIdx);
+                            out.push(sanitizeMultipartPart(segment, delimiter, encoder));
+                            if (nextIdx === -1) break;
+                            cursor = nextIdx;
+                        }
+                        return out.join('');
+                    }
+                }
+                return sanitizeJsonText(value);
             };
 
             // Current uBO quick fixes disable YouTube's delayed network-machine
@@ -892,7 +983,8 @@ internal static class AdBlockDocumentScript
                         client.clientScreen = 'CHANNEL';
                         mutated = true;
                     }
-                    const playback = body.playbackContext?.contentPlaybackContext;
+                    const playback = body.playbackContext?.contentPlaybackContext
+                        || body.playerRequest?.playbackContext?.contentPlaybackContext;
                     if (playback && (activeRecoveryMarker === 'lactmilli' || !playback.lactMilliseconds)) {
                         playback.lactMilliseconds = String(Date.now());
                         mutated = true;
@@ -907,6 +999,108 @@ internal static class AdBlockDocumentScript
                 } catch (_) { return bodyText; }
             };
 
+            const createSanitizedStream = (nativeBody, contentType) => {
+                if (!nativeBody
+                    || typeof nativeBody.getReader !== 'function'
+                    || typeof ReadableStream !== 'function'
+                    || typeof TextDecoder !== 'function'
+                    || typeof TextEncoder !== 'function') {
+                    return nativeBody;
+                }
+                const reader = nativeBody.getReader();
+                const decoder = new TextDecoder('utf-8');
+                const encoder = new TextEncoder();
+                let boundary = extractMultipartBoundary(contentType, '');
+                let delimiter = boundary ? '--' + boundary : '';
+                let seenFirstDelimiter = false;
+                let checkedDynamicBoundary = Boolean(boundary);
+                let pending = '';
+                const drainParts = controller => {
+                    let enqueued = false;
+                    if (!seenFirstDelimiter) {
+                        const firstIdx = pending.indexOf(delimiter);
+                        if (firstIdx !== -1) {
+                            if (firstIdx > 0) {
+                                controller.enqueue(encoder.encode(pending.slice(0, firstIdx)));
+                                enqueued = true;
+                            }
+                            pending = pending.slice(firstIdx);
+                            seenFirstDelimiter = true;
+                        }
+                    }
+                    if (seenFirstDelimiter) {
+                        while (true) {
+                            const nextIdx = pending.indexOf(delimiter, delimiter.length);
+                            if (nextIdx === -1) break;
+                            const part = pending.slice(0, nextIdx);
+                            pending = pending.slice(nextIdx);
+                            controller.enqueue(encoder.encode(sanitizeMultipartPart(part, delimiter, encoder)));
+                            enqueued = true;
+                        }
+                    }
+                    return enqueued;
+                };
+                return new ReadableStream({
+                    async pull(controller) {
+                        try {
+                            while (true) {
+                                const { done, value } = await reader.read();
+                                if (done) {
+                                    pending += decoder.decode();
+                                    if (!checkedDynamicBoundary && pending) {
+                                        const detected = extractMultipartBoundary(contentType, pending);
+                                        if (detected) {
+                                            boundary = detected;
+                                            delimiter = '--' + boundary;
+                                        }
+                                        checkedDynamicBoundary = true;
+                                    }
+                                    if (boundary) {
+                                        drainParts(controller);
+                                        if (pending) {
+                                            const out = seenFirstDelimiter && pending.startsWith(delimiter)
+                                                ? sanitizeMultipartPart(pending, delimiter, encoder)
+                                                : sanitizePayload(pending, contentType);
+                                            controller.enqueue(encoder.encode(out));
+                                            pending = '';
+                                        }
+                                    } else if (pending) {
+                                        const out = sanitizePayload(pending, contentType);
+                                        controller.enqueue(encoder.encode(out));
+                                        pending = '';
+                                    }
+                                    controller.close();
+                                    return;
+                                }
+                                if (value !== undefined) {
+                                    pending += typeof value === 'string'
+                                        ? value
+                                        : decoder.decode(value, { stream: true });
+                                }
+                                if (!checkedDynamicBoundary
+                                    && (pending.includes('\r\n\r\n') || pending.includes('\n\n'))) {
+                                    const detected = extractMultipartBoundary(contentType, pending);
+                                    if (detected) {
+                                        boundary = detected;
+                                        delimiter = '--' + boundary;
+                                    }
+                                    checkedDynamicBoundary = true;
+                                }
+                                if (boundary && drainParts(controller)) {
+                                    return;
+                                }
+                            }
+                        } catch (error) {
+                            controller.error(error);
+                        }
+                    },
+                    cancel(reason) {
+                        try { return reader.cancel(reason); }
+                        catch (_) { return Promise.resolve(); }
+                    }
+                });
+            };
+
             const patchResponse = (response, request) => {
                 if (!isEnabled()
                     || !response
@@ -914,26 +1108,88 @@ internal static class AdBlockDocumentScript
                     || (!shouldSanitizePlayerPayload(request)
                         && !shouldSanitizePlayerPayload(response.url))) return response;
                 try {
-                    const nativeJson = response.json.bind(response);
-                    Object.defineProperty(response, 'json', {
-                        configurable: true,
-                        value: (...args) => nativeJson(...args).then(res => {
-                            const sanitized = sanitize(res);
-                            repairPlayerResponse(sanitized);
-                            inspectPlayerResponse(sanitized);
-                            return sanitized;
-                        })
-                    });
-                    const nativeText = response.text.bind(response);
-                    Object.defineProperty(response, 'text', {
-                        configurable: true,
-                        value: (...args) => nativeText(...args).then(text => sanitizePayload(text))
-                    });
-                    const nativeClone = response.clone.bind(response);
-                    Object.defineProperty(response, 'clone', {
-                        configurable: true,
-                        value: (...args) => patchResponse(nativeClone(...args), request)
-                    });
+                    const contentType = response.headers?.get?.('content-type') || '';
+                    if (typeof response.json === 'function') {
+                        const nativeJson = response.json.bind(response);
+                        Object.defineProperty(response, 'json', {
+                            configurable: true,
+                            value: (...args) => nativeJson(...args).then(res => {
+                                const sanitized = sanitize(res);
+                                repairPlayerResponse(sanitized);
+                                inspectPlayerResponse(sanitized);
+                                return sanitized;
+                            })
+                        });
+                    }
+                    if (typeof response.text === 'function') {
+                        const nativeText = response.text.bind(response);
+                        Object.defineProperty(response, 'text', {
+                            configurable: true,
+                            value: (...args) => nativeText(...args).then(text => sanitizePayload(text, contentType))
+                        });
+                    }
+                    if (typeof response.arrayBuffer === 'function'
+                        && typeof TextDecoder === 'function'
+                        && typeof TextEncoder === 'function') {
+                        const nativeArrayBuffer = response.arrayBuffer.bind(response);
+                        Object.defineProperty(response, 'arrayBuffer', {
+                            configurable: true,
+                            value: (...args) => nativeArrayBuffer(...args).then(buffer => {
+                                const text = new TextDecoder('utf-8').decode(buffer);
+                                const sanitized = sanitizePayload(text, contentType);
+                                if (sanitized === text) return buffer;
+                                return new TextEncoder().encode(sanitized).buffer;
+                            })
+                        });
+                    }
+                    if (typeof response.bytes === 'function'
+                        && typeof TextDecoder === 'function'
+                        && typeof TextEncoder === 'function') {
+                        const nativeBytes = response.bytes.bind(response);
+                        Object.defineProperty(response, 'bytes', {
+                            configurable: true,
+                            value: (...args) => nativeBytes(...args).then(bytes => {
+                                const text = new TextDecoder('utf-8').decode(bytes);
+                                const sanitized = sanitizePayload(text, contentType);
+                                if (sanitized === text) return bytes;
+                                return new TextEncoder().encode(sanitized);
+                            })
+                        });
+                    }
+                    const ownBodyDesc = Object.getOwnPropertyDescriptor(response, 'body');
+                    const protoBodyDesc = typeof Response === 'function' && response instanceof Response
+                        ? Object.getOwnPropertyDescriptor(Response.prototype, 'body')
+                        : null;
+                    const bodyGetter = ownBodyDesc?.get || protoBodyDesc?.get;
+                    const hasOwnValueBody = Boolean(
+                        ownBodyDesc && Object.prototype.hasOwnProperty.call(ownBodyDesc, 'value'));
+                    if (typeof ReadableStream === 'function'
+                        && typeof TextDecoder === 'function'
+                        && typeof TextEncoder === 'function'
+                        && (bodyGetter || hasOwnValueBody)
+                        && (!ownBodyDesc || ownBodyDesc.configurable)) {
+                        const initialBodyValue = hasOwnValueBody ? ownBodyDesc.value : undefined;
+                        let sanitizedBodyStream;
+                        let bodyResolved = false;
+                        Object.defineProperty(response, 'body', {
+                            configurable: true,
+                            enumerable: ownBodyDesc?.enumerable ?? protoBodyDesc?.enumerable ?? true,
+                            get() {
+                                if (bodyResolved) return sanitizedBodyStream;
+                                bodyResolved = true;
+                                const nativeBody = bodyGetter ? bodyGetter.call(response) : initialBodyValue;
+                                sanitizedBodyStream = createSanitizedStream(nativeBody, contentType);
+                                return sanitizedBodyStream;
+                            }
+                        });
+                    }
+                    if (typeof response.clone === 'function') {
+                        const nativeClone = response.clone.bind(response);
+                        Object.defineProperty(response, 'clone', {
+                            configurable: true,
+                            value: (...args) => patchResponse(nativeClone(...args), request)
+                        });
+                    }
                     Object.defineProperty(response, '__mishaAdBlockPatched', { value: true });
                 } catch (_) { }
                 return response;
@@ -1002,10 +1258,11 @@ internal static class AdBlockDocumentScript
                 const xhrSanitizedCache = new WeakMap();
                 const sanitizeXhrString = (xhr, value) => {
                     if (typeof value !== 'string') return value;
+                    const contentType = xhr.getResponseHeader?.('content-type') || '';
                     const cached = xhrSanitizedCache.get(xhr);
-                    if (cached && cached.raw === value) return cached.sanitized;
-                    const sanitized = sanitizePayload(value);
-                    xhrSanitizedCache.set(xhr, { raw: value, sanitized });
+                    if (cached && cached.raw === value && cached.contentType === contentType) return cached.sanitized;
+                    const sanitized = sanitizePayload(value, contentType);
+                    xhrSanitizedCache.set(xhr, { raw: value, contentType, sanitized });
                     return sanitized;
                 };
                 const nativeOpen = XMLHttpRequest.prototype.open;
@@ -1027,6 +1284,23 @@ internal static class AdBlockDocumentScript
                             const value = responseDescriptor.get.call(this);
                             if (!shouldSanitizePlayerPayload(requestUrls.get(this))) return value;
                             if (typeof value === 'string') return sanitizeXhrString(this, value);
+                            if (typeof ArrayBuffer === 'function'
+                                && value instanceof ArrayBuffer
+                                && typeof TextDecoder === 'function'
+                                && typeof TextEncoder === 'function') {
+                                const contentType = this.getResponseHeader?.('content-type') || '';
+                                const cached = xhrSanitizedCache.get(this);
+                                if (cached && cached.raw === value && cached.contentType === contentType) return cached.sanitized;
+                                try {
+                                    const text = new TextDecoder('utf-8').decode(value);
+                                    const sanitizedText = sanitizePayload(text, contentType);
+                                    const result = sanitizedText === text
+                                        ? value
+                                        : new TextEncoder().encode(sanitizedText).buffer;
+                                    xhrSanitizedCache.set(this, { raw: value, contentType, sanitized: result });
+                                    return result;
+                                } catch (_) { return value; }
+                            }
                             if (value && typeof value === 'object') {
                                 const res = sanitize(value);
                                 repairPlayerResponse(res);
@@ -1625,6 +1899,13 @@ internal static class AdBlockDocumentScript
                 }
             };
 
+            const isSkipControlInactive = button =>
+                button.disabled === true
+                || button.hidden === true
+                || button.getAttribute?.('aria-disabled') === 'true'
+                || button.style?.display === 'none'
+                || button.closest?.('.ytp-ad-skip-button-slot, .ytp-ad-skip-button-container')?.style?.display === 'none';
+
             const cleanPlayerAds = () => {
                 if (!isEnabled()) return false;
                 let adActivity = false;
@@ -1652,6 +1933,7 @@ internal static class AdBlockDocumentScript
                         progress,
                         recoveredVideo,
                         snapshot)) return true;
+                    let isSsapAd = false;
                     if (isYouTubeWatch() && !isPremium()) {
                         const unfinished = progress?.duration > 0
                             && (progress.loaded < progress.duration
@@ -1659,6 +1941,7 @@ internal static class AdBlockDocumentScript
                         if (unfinished) {
                             const serverContract = snapshot.refresh().stats?.debug_info;
                             if (serverContract?.startsWith?.('SSAP, AD')) {
+                                isSsapAd = true;
                                 player.seekTo?.(progress.duration, true);
                                 adActivity = true;
                             }
@@ -1669,7 +1952,6 @@ internal static class AdBlockDocumentScript
                         || player?.classList?.contains('ad-interrupting');
                     if (isClientAd) {
                         adActivity = true;
-                        try { player?.mute?.(); } catch (_) { }
                         const videos = document.querySelectorAll('video.html5-main-video, video');
                         for (const video of videos) {
                             if (!(video instanceof HTMLVideoElement)) continue;
@@ -1690,13 +1972,27 @@ internal static class AdBlockDocumentScript
                                     video.playbackRate = 16;
                                 }
                             } catch (_) { }
+                            try {
+                                if (!isSsapAd
+                                    && Number.isFinite(video.duration)
+                                    && video.duration > 0
+                                    && video.currentTime < video.duration - 0.1) {
+                                    video.currentTime = video.duration;
+                                }
+                            } catch (_) { }
                         }
+                        if (!adWasActive) {
+                            adWasActive = true;
+                        }
+                        muteAppliedByBlocker = true;
+                        try { player?.mute?.(); } catch (_) { }
                         // One combined lookup beats nine independent selector
                         // passes, and each distinct control is clicked once per
-                        // ad instead of once per poll.
+                        // active state instead of waiting out stale clicks.
                         for (const button of document.querySelectorAll(skipAdSelector)) {
                             if (!(button instanceof HTMLElement)
-                                || clickedSkipButtons.has(button)) continue;
+                                || clickedSkipButtons.has(button)
+                                || isSkipControlInactive(button)) continue;
                             clickedSkipButtons.add(button);
                             try { button.click(); } catch (_) { }
                         }
@@ -2079,6 +2375,31 @@ internal static class AdBlockDocumentScript
                 queueCleanup();
                 scheduleFallback(false);
             };
+            const sanitizePageDataEnvelope = candidate => {
+                if (!candidate || typeof candidate !== 'object') return;
+                const sanitized = sanitize(candidate);
+                repairPlayerResponse(sanitized);
+                inspectPlayerResponse(sanitized);
+            };
+            const onPageDataFetched = event => {
+                if (!isEnabled()) return;
+                try {
+                    const detail = event?.detail;
+                    if (detail && typeof detail === 'object') {
+                        const pageData = detail.pageData;
+                        if (pageData && typeof pageData === 'object') {
+                            sanitizePageDataEnvelope(pageData.playerResponse);
+                            sanitizePageDataEnvelope(pageData.response);
+                        }
+                        sanitizePageDataEnvelope(detail.response);
+                        sanitizePageDataEnvelope(detail.playerResponse);
+                    }
+                    if (isYouTubeWatch()) {
+                        observePlayer();
+                        queueUrgentCleanup();
+                    }
+                } catch (_) { }
+            };
             const startCleanup = () => {
                 if (!isEnabled() || cleanupStarted || !document.documentElement) return;
                 cleanupStarted = true;
@@ -2098,6 +2419,7 @@ internal static class AdBlockDocumentScript
                 for (const eventName of cleanupEvents) {
                     document.addEventListener(eventName, queueCleanup, { passive: true });
                 }
+                document.addEventListener('yt-page-data-fetched', onPageDataFetched, true);
                 document.addEventListener('yt-navigate-start', onNavigationStart, { passive: true });
                 document.addEventListener('yt-navigate-finish', onNavigationFinish, { passive: true });
                 try { window.addEventListener?.('popstate', onNavigationStart, { passive: true }); } catch (_) { }
@@ -2121,6 +2443,7 @@ internal static class AdBlockDocumentScript
                     for (const eventName of cleanupEvents) {
                         document.removeEventListener(eventName, queueCleanup);
                     }
+                    document.removeEventListener('yt-page-data-fetched', onPageDataFetched, true);
                     document.removeEventListener('yt-navigate-start', onNavigationStart);
                     document.removeEventListener('yt-navigate-finish', onNavigationFinish);
                     try { window.removeEventListener?.('popstate', onNavigationStart); } catch (_) { }
