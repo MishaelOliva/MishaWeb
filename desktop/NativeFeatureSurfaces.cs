@@ -1,4 +1,5 @@
 using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 
 namespace MishaWeb;
 
@@ -339,10 +340,17 @@ internal sealed class CommandPaletteForm : Form
 
 internal sealed class MruSwitcherForm : Form
 {
+    private const int VkControl = 0x11;
+
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int vKey);
+
     private readonly ListBox itemList = new();
+    private readonly System.Windows.Forms.Timer ctrlReleaseTimer = new() { Interval = 25 };
     private IReadOnlyList<string> labels = [];
     private ModernListRowVisual[] rowVisuals = [];
     private bool suppressDeactivate;
+    private bool commitOnCtrlRelease;
 
     public MruSwitcherForm()
     {
@@ -371,6 +379,13 @@ internal sealed class MruSwitcherForm : Form
             (index, _) => index >= 0 && index < rowVisuals.Length
                 ? rowVisuals[index]
                 : new ModernListRowVisual(string.Empty, string.Empty, string.Empty));
+        ctrlReleaseTimer.Tick += (_, _) =>
+        {
+            if (Visible && commitOnCtrlRelease && !IsCtrlPhysicallyDown())
+            {
+                CommitSelection();
+            }
+        };
         itemList.MouseClick += (_, e) =>
         {
             var index = itemList.IndexFromPoint(e.Location);
@@ -391,7 +406,7 @@ internal sealed class MruSwitcherForm : Form
         };
         KeyUp += (_, e) =>
         {
-            if (e.KeyCode == Keys.ControlKey && Visible) CommitSelection();
+            if (e.KeyCode is Keys.ControlKey or Keys.LControlKey or Keys.RControlKey && Visible) CommitSelection();
         };
         Deactivate += (_, _) =>
         {
@@ -413,9 +428,15 @@ internal sealed class MruSwitcherForm : Form
 
     public int SelectedIndex => itemList.SelectedIndex;
 
-    public void Open(IWin32Window owner, IReadOnlyList<string> rowLabels, int selectedIndex = 0)
+    public void Open(
+        IWin32Window owner,
+        IReadOnlyList<string> rowLabels,
+        int selectedIndex = 0,
+        bool commitOnCtrlRelease = false)
     {
         const string separator = " \u2014 ";
+        this.commitOnCtrlRelease = commitOnCtrlRelease;
+        ctrlReleaseTimer.Stop();
         labels = rowLabels.Take(8).ToArray();
         var visuals = new ModernListRowVisual[labels.Count];
         for (var i = 0; i < labels.Count; i++)
@@ -461,6 +482,20 @@ internal sealed class MruSwitcherForm : Form
         if (!Visible) Show(owner);
         Activate();
         itemList.Focus();
+        if (commitOnCtrlRelease)
+        {
+            ctrlReleaseTimer.Start();
+            if (!IsCtrlPhysicallyDown() && IsHandleCreated)
+            {
+                BeginInvoke(() =>
+                {
+                    if (!IsDisposed && Visible && this.commitOnCtrlRelease && !IsCtrlPhysicallyDown())
+                    {
+                        CommitSelection();
+                    }
+                });
+            }
+        }
     }
 
     public void MoveSelection(int direction)
@@ -480,6 +515,8 @@ internal sealed class MruSwitcherForm : Form
 
     public void CommitSelection()
     {
+        commitOnCtrlRelease = false;
+        ctrlReleaseTimer.Stop();
         if (!Visible) return;
         suppressDeactivate = true;
         try { Hide(); }
@@ -489,12 +526,16 @@ internal sealed class MruSwitcherForm : Form
 
     public void CancelSelection()
     {
+        commitOnCtrlRelease = false;
+        ctrlReleaseTimer.Stop();
         if (!Visible) return;
         suppressDeactivate = true;
         try { Hide(); }
         finally { suppressDeactivate = false; }
         Cancelled?.Invoke(this, EventArgs.Empty);
     }
+
+    private static bool IsCtrlPhysicallyDown() => (GetAsyncKeyState(VkControl) & 0x8000) != 0;
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
@@ -519,6 +560,16 @@ internal sealed class MruSwitcherForm : Form
             return true;
         }
         return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            ctrlReleaseTimer.Stop();
+            ctrlReleaseTimer.Dispose();
+        }
+        base.Dispose(disposing);
     }
 }
 

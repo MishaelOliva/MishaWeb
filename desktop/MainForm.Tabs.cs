@@ -348,6 +348,12 @@ public sealed partial class MainForm
                 e.SuppressKeyPress = true;
                 OpenPrivateWindow();
             }
+            else if (e.KeyCode == Keys.Tab && e.Control && !e.Alt)
+            {
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                BeginMruSwitch(e.Shift ? -1 : 1);
+            }
         };
         EventHandler gotFocusHandler = (_, _) => OnPaneContentFocused(tab);
         view.KeyUp += keyUpHandler;
@@ -2198,12 +2204,24 @@ public sealed partial class MainForm
             tabStrip.AutoScrollPosition = Point.Empty;
             return;
         }
-        var minimumTabWidth = ScaleChromeLogical(84);
+        var minimumTabWidth = ScaleChromeLogical(48);
+        var pinnedTabWidth = ScaleChromeLogical(42);
+        var tabMargin = ScaleChromeLogical(4);
         var contentAvailable = Math.Max(minimumTabWidth, availableWidth - tabStrip.Padding.Horizontal);
-        var width = Math.Clamp(
-            (contentAvailable / tabs.Count) - ScaleChromeLogical(4),
-            minimumTabWidth,
-            ScaleChromeLogical(220));
+        var pinnedCount = 0;
+        foreach (var tab in tabs)
+        {
+            if (tab.IsPinned) pinnedCount++;
+        }
+        var unpinnedCount = tabs.Count - pinnedCount;
+        var pinnedTotalWidth = pinnedCount * (pinnedTabWidth + tabMargin);
+        var remainingForUnpinned = Math.Max(0, contentAvailable - pinnedTotalWidth);
+        var width = unpinnedCount > 0
+            ? Math.Clamp(
+                (remainingForUnpinned / unpinnedCount) - tabMargin,
+                minimumTabWidth,
+                ScaleChromeLogical(220))
+            : minimumTabWidth;
         var contentWidth = tabStrip.Padding.Horizontal;
         var isMaximized = WindowState == FormWindowState.Maximized;
         tabStrip.SuspendLayout();
@@ -2211,12 +2229,7 @@ public sealed partial class MainForm
         {
             foreach (var tab in tabs)
             {
-                var headerWidth = tab.IsPinned
-                    ? Math.Clamp(
-                        Math.Min(width, ScaleChromeLogical(124)),
-                        ScaleChromeLogical(92),
-                        ScaleChromeLogical(124))
-                    : width;
+                var headerWidth = tab.IsPinned ? pinnedTabWidth : width;
                 tab.Header.Width = headerWidth;
                 tab.Header.Height = stripHeight;
                 tab.Header.SetMaximized(isMaximized);

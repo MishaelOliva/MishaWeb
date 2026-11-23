@@ -1993,33 +1993,50 @@ public sealed partial class MainForm
         return current;
     }
 
-    private void BeginMruSwitch(int direction)
+    internal void BeginMruSwitch(int direction)
     {
         if (activeTab is null || tabs.Count < 2) return;
-        if (mruSnapshot is null)
+        if (mruSnapshot is not null && mruSwitcher?.Visible == true)
         {
-            mruSnapshot = mruTabs.Begin(activeTab);
-            if (mruSnapshot.Items.Count == 0)
-            {
-                mruSnapshot = null;
-                return;
-            }
-            mruSwitcher ??= CreateMruSwitcher();
-            var labels = mruSnapshot.Items
-                .Take(8)
-                .Select(item => $"{item.Title} \u2014 {BuildTabDetail(item)}")
-                .ToArray();
-            openingMruSwitcher = true;
-            try
-            {
-                mruSwitcher.Open(this, labels);
-            }
-            finally
-            {
-                openingMruSwitcher = false;
-            }
+            mruSwitcher.MoveSelection(direction);
+            return;
         }
-        if (direction < 0) mruSwitcher?.MoveSelection(-1);
+
+        if (mruTabs.Order.Count < tabs.Count)
+        {
+            var existing = mruTabs.Order.Where(item => !item.IsClosed && tabs.Contains(item)).ToList();
+            var missing = tabs.Where(item => !item.IsClosed && !existing.Contains(item)).ToList();
+            if (missing.Count > 0) mruTabs.Reset(existing.Concat(missing));
+        }
+
+        mruSnapshot = mruTabs.Begin(activeTab);
+        if (mruSnapshot.Items.Count == 0)
+        {
+            mruSnapshot = null;
+            return;
+        }
+        mruSwitcher ??= CreateMruSwitcher();
+        var labels = mruSnapshot.Items
+            .Take(8)
+            .Select(item => $"{item.Title} \u2014 {BuildTabDetail(item)}")
+            .ToArray();
+        var initialIndex = direction < 0 ? Math.Max(0, labels.Length - 1) : 0;
+        openingMruSwitcher = true;
+        try
+        {
+            mruSwitcher.Open(this, labels, initialIndex, commitOnCtrlRelease: true);
+        }
+        finally
+        {
+            openingMruSwitcher = false;
+        }
+    }
+
+    internal bool TryCommitActiveMruSwitch()
+    {
+        if (mruSnapshot is null || mruSwitcher is not { Visible: true }) return false;
+        mruSwitcher.CommitSelection();
+        return true;
     }
 
     private MruSwitcherForm CreateMruSwitcher()
@@ -2870,7 +2887,7 @@ public sealed partial class MainForm
 
     private void HandleMruKeyUp(KeyEventArgs e)
     {
-        if (e.KeyCode == Keys.ControlKey && mruSnapshot is not null)
+        if (e.KeyCode is Keys.ControlKey or Keys.LControlKey or Keys.RControlKey && mruSnapshot is not null)
         {
             mruSwitcher?.CommitSelection();
         }

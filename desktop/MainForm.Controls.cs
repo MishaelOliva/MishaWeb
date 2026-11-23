@@ -316,7 +316,7 @@ public sealed partial class MainForm
             var prepared = new Bitmap(side, side, PixelFormat.Format32bppPArgb);
             try
             {
-                prepared.SetResolution(96f, 96f);
+                prepared.SetResolution(dpi, dpi);
                 using var g = Graphics.FromImage(prepared);
                 g.Clear(Color.Transparent);
                 g.SmoothingMode = SmoothingMode.AntiAlias;
@@ -663,6 +663,8 @@ public sealed partial class MainForm
                 return;
             }
 
+            var showClose = ShouldShowCloseButton();
+            var isCompactNormalTab = !hasAudioState && Width < ScalePx(64);
             if (hasAudioState)
             {
                 var audioBounds = GetAudioButtonBounds();
@@ -690,7 +692,10 @@ public sealed partial class MainForm
             else if (hasFaviconVisual)
             {
                 var iconSide = 16f * s;
-                var iconBounds = new RectangleF(8f * s, Math.Max(1f * s, (Height - iconSide) / 2f), iconSide, iconSide);
+                var iconX = isCompactNormalTab
+                    ? (showClose ? 6f * s : Math.Max(4f * s, (Width - iconSide) / 2f))
+                    : 8f * s;
+                var iconBounds = new RectangleF(iconX, Math.Max(1f * s, (Height - iconSide) / 2f), iconSide, iconSide);
                 DrawFaviconOrMonogram(e.Graphics, iconBounds, s);
                 if (isLoading || isDiscarded || isSuspended || keepAwake)
                 {
@@ -724,31 +729,34 @@ public sealed partial class MainForm
                     dotSize);
             }
 
-            var showClose = ShouldShowCloseButton();
             var titleLeft = Math.Max(ScalePx(10), Padding.Left);
             var titleRightReserve = showClose ? ScalePx(29) : ScalePx(10);
-            var titleBounds = new Rectangle(
-                titleLeft,
-                0,
-                Math.Max(1, Width - titleLeft - titleRightReserve),
-                Height);
-            var titleColor = HighContrast
-                ? (isSelected || isHovered ? SystemColors.HighlightText : SystemColors.ControlText)
-                : isDragging ? MutedTextColor
-                : isSuspended ? Color.FromArgb(181, 138, 156)
-                : isSelected ? PageTextColor : Color.FromArgb(228, 198, 214);
-            TextRenderer.DrawText(
-                e.Graphics,
-                currentTitle,
-                TabTitleFont,
-                titleBounds,
-                titleColor,
-                TextFormatFlags.Left
-                | TextFormatFlags.VerticalCenter
-                | TextFormatFlags.SingleLine
-                | TextFormatFlags.EndEllipsis
-                | TextFormatFlags.NoPrefix
-                | TextFormatFlags.NoPadding);
+            var titleWidth = Width - titleLeft - titleRightReserve;
+            if (titleWidth >= ScalePx(12) && !(isCompactNormalTab && hasFaviconVisual))
+            {
+                var titleBounds = new Rectangle(
+                    titleLeft,
+                    0,
+                    titleWidth,
+                    Height);
+                var titleColor = HighContrast
+                    ? (isSelected || isHovered ? SystemColors.HighlightText : SystemColors.ControlText)
+                    : isDragging ? MutedTextColor
+                    : isSuspended ? Color.FromArgb(181, 138, 156)
+                    : isSelected ? PageTextColor : Color.FromArgb(228, 198, 214);
+                TextRenderer.DrawText(
+                    e.Graphics,
+                    currentTitle,
+                    TabTitleFont,
+                    titleBounds,
+                    titleColor,
+                    TextFormatFlags.Left
+                    | TextFormatFlags.VerticalCenter
+                    | TextFormatFlags.SingleLine
+                    | TextFormatFlags.EndEllipsis
+                    | TextFormatFlags.NoPrefix
+                    | TextFormatFlags.NoPadding);
+            }
 
             if (showClose)
             {
@@ -842,10 +850,16 @@ public sealed partial class MainForm
                 }
                 if (renderedFaviconBitmap is not null)
                 {
-                    graphics.DrawImageUnscaled(
-                        renderedFaviconBitmap,
+                    var destRect = new Rectangle(
                         (int)Math.Round(bounds.X),
-                        (int)Math.Round(bounds.Y));
+                        (int)Math.Round(bounds.Y),
+                        Math.Max(1, (int)Math.Round(bounds.Width)),
+                        Math.Max(1, (int)Math.Round(bounds.Height)));
+                    graphics.DrawImage(
+                        renderedFaviconBitmap,
+                        destRect,
+                        new Rectangle(0, 0, renderedFaviconBitmap.Width, renderedFaviconBitmap.Height),
+                        GraphicsUnit.Pixel);
                     return;
                 }
             }
@@ -3352,7 +3366,7 @@ public sealed partial class MainForm
                 var bitmap = new Bitmap(Width, Height, PixelFormat.Format32bppPArgb);
                 try
                 {
-                    bitmap.SetResolution(96f, 96f);
+                    bitmap.SetResolution(Math.Max(48f, e.Graphics.DpiX), Math.Max(48f, e.Graphics.DpiY));
                     using var renderGraphics = Graphics.FromImage(bitmap);
                     RenderChrome(
                         renderGraphics,
@@ -3373,7 +3387,11 @@ public sealed partial class MainForm
                 }
             }
 
-            e.Graphics.DrawImageUnscaled(cachedChromeBitmap, 0, 0);
+            e.Graphics.DrawImage(
+                cachedChromeBitmap,
+                new Rectangle(0, 0, Width, Height),
+                new Rectangle(0, 0, cachedChromeBitmap.Width, cachedChromeBitmap.Height),
+                GraphicsUnit.Pixel);
         }
 
         private void RenderChrome(
@@ -3641,14 +3659,17 @@ public sealed partial class MainForm
 internal sealed class IncognitoShortcutMessageFilter : IMessageFilter
 {
     private const int WM_KEYDOWN = 0x0100;
+    private const int WM_KEYUP = 0x0101;
     private const int WM_SYSKEYDOWN = 0x0104;
+    private const int WM_SYSKEYUP = 0x0105;
 
     public bool PreFilterMessage(ref Message m)
     {
         if (m.Msg is WM_KEYDOWN or WM_SYSKEYDOWN)
         {
             var key = (Keys)(int)m.WParam;
-            if (key == Keys.N && (Control.ModifierKeys & (Keys.Control | Keys.Shift)) == (Keys.Control | Keys.Shift))
+            var modifiers = Control.ModifierKeys;
+            if (key == Keys.N && (modifiers & (Keys.Control | Keys.Shift)) == (Keys.Control | Keys.Shift))
             {
                 if (Form.ActiveForm is MainForm activeWindow && !activeWindow.IsDisposed)
                 {
@@ -3658,6 +3679,38 @@ internal sealed class IncognitoShortcutMessageFilter : IMessageFilter
                 if (Application.OpenForms.OfType<MainForm>().FirstOrDefault(w => !w.IsDisposed) is { } anyWindow)
                 {
                     anyWindow.OpenPrivateWindow();
+                    return true;
+                }
+            }
+            if (key == Keys.Tab
+                && (modifiers & Keys.Control) == Keys.Control
+                && (modifiers & Keys.Alt) == 0)
+            {
+                var direction = (modifiers & Keys.Shift) == Keys.Shift ? -1 : 1;
+                if (Form.ActiveForm is MruSwitcherForm activeSwitcher && activeSwitcher.Visible && !activeSwitcher.IsDisposed)
+                {
+                    activeSwitcher.MoveSelection(direction);
+                    return true;
+                }
+                if (Form.ActiveForm is MainForm activeWindow && !activeWindow.IsDisposed)
+                {
+                    activeWindow.BeginMruSwitch(direction);
+                    return true;
+                }
+            }
+        }
+        else if (m.Msg is WM_KEYUP or WM_SYSKEYUP)
+        {
+            var key = (Keys)(int)m.WParam;
+            if (key is Keys.ControlKey or Keys.LControlKey or Keys.RControlKey)
+            {
+                if (Form.ActiveForm is MruSwitcherForm activeSwitcher && activeSwitcher.Visible && !activeSwitcher.IsDisposed)
+                {
+                    activeSwitcher.CommitSelection();
+                    return true;
+                }
+                if (Form.ActiveForm is MainForm activeWindow && !activeWindow.IsDisposed && activeWindow.TryCommitActiveMruSwitch())
+                {
                     return true;
                 }
             }

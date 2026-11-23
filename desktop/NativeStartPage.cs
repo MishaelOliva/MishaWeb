@@ -1563,7 +1563,11 @@ internal sealed class NativeStartPage : UserControl
                     cached.SetResolution(graphics.DpiX, graphics.DpiY);
                 }
 
-                graphics.DrawImageUnscaled(cached, bounds.X, bounds.Y);
+                graphics.DrawImage(
+                    cached,
+                    new Rectangle(bounds.X, bounds.Y, bounds.Width, bounds.Height),
+                    new Rectangle(0, 0, cached.Width, cached.Height),
+                    GraphicsUnit.Pixel);
             }
         }
 

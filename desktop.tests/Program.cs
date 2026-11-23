@@ -7015,6 +7015,134 @@ Check(
         && slashSubredditResolution.Url is not null
         && slashSubredditResolution.Url.StartsWith("https://", StringComparison.Ordinal));
 
+var controlsHiDpiSource = ReadRepositorySource("desktop", "MainForm.Controls.cs");
+var startPageHiDpiSource = ReadRepositorySource("desktop", "NativeStartPage.cs");
+var roundedPanelType = typeof(MainForm).GetNestedType(
+    "RoundedPanel",
+    System.Reflection.BindingFlags.NonPublic);
+var roundedPanelSymmetryOk = false;
+var roundedPanelError = StaTestRunner.TryRun(() =>
+{
+    if (roundedPanelType is null || Activator.CreateInstance(roundedPanelType) is not Panel card) return;
+    using (card)
+    using (var host = new Form
+    {
+        StartPosition = FormStartPosition.Manual,
+        FormBorderStyle = FormBorderStyle.None,
+        Location = new Point(-20_000, -20_000),
+        ShowInTaskbar = false,
+        BackColor = Color.Black,
+        ClientSize = new Size(240, 180)
+    })
+    {
+        card.Bounds = new Rectangle(0, 0, 240, 180);
+        roundedPanelType.GetProperty("CornerRadius")?.SetValue(card, 18);
+        roundedPanelType.GetProperty("FillColor")?.SetValue(card, NativeUiTheme.Surface);
+        roundedPanelType.GetProperty("BorderColor")?.SetValue(card, NativeUiTheme.Border);
+        host.Controls.Add(card);
+        host.CreateControl();
+        card.CreateControl();
+        _ = host.Handle;
+        _ = card.Handle;
+        using var bmp = new Bitmap(240, 180);
+        card.DrawToBitmap(bmp, new Rectangle(0, 0, 240, 180));
+        // Outer corners just inside the card bounds must remain host black (rounded cutout),
+        // while interior center must be card fill (non-black).
+        var tl = bmp.GetPixel(1, 1);
+        var tr = bmp.GetPixel(238, 1);
+        var bl = bmp.GetPixel(1, 178);
+        var br = bmp.GetPixel(238, 178);
+        var center = bmp.GetPixel(120, 90);
+        bool IsNearBlack(Color c) => c.R < 20 && c.G < 20 && c.B < 20;
+        roundedPanelSymmetryOk = IsNearBlack(tl) && IsNearBlack(tr) && IsNearBlack(bl) && IsNearBlack(br) && !IsNearBlack(center);
+    }
+});
+Check(
+    "HiDPI cached bitmaps use GraphicsUnit.Pixel without DrawImageUnscaled clipping and round all four corners",
+    roundedPanelError is null
+        && roundedPanelSymmetryOk
+        && !controlsHiDpiSource.Contains("DrawImageUnscaled", StringComparison.Ordinal)
+        && !startPageHiDpiSource.Contains("DrawImageUnscaled", StringComparison.Ordinal));
+
+var tabCompressionOk = false;
+var mruBackgroundSwitchOk = false;
+var uiInteractionRegressionError = StaTestRunner.TryRun(() =>
+{
+    const System.Reflection.BindingFlags privateFlags =
+        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+    using var form = new MainForm(startBrowserOnShown: false)
+    {
+        StartPosition = FormStartPosition.Manual,
+        Location = new Point(-20_000, -20_000),
+        ShowInTaskbar = false,
+        ClientSize = new Size(1000, 700)
+    };
+    form.PrepareLoadedChromePreviewForTesting();
+    var tabsList = typeof(MainForm).GetField("tabs", privateFlags)?.GetValue(form) as System.Collections.IList;
+    var tabStrip = typeof(MainForm).GetField("tabStrip", privateFlags)?.GetValue(form) as FlowLayoutPanel;
+    var activeTabField = typeof(MainForm).GetField("activeTab", privateFlags);
+    var mruTabsObj = typeof(MainForm).GetField("mruTabs", privateFlags)?.GetValue(form);
+    var setPinnedMethod = typeof(MainForm).GetMethod("SetTabPinned", privateFlags);
+    var createTabMethod = typeof(MainForm).GetMethod("CreateBrowserTab", privateFlags);
+    var resizeHeadersMethod = typeof(MainForm).GetMethod("ResizeTabHeaders", privateFlags);
+    var mruSwitcherField = typeof(MainForm).GetField("mruSwitcher", privateFlags);
+    if (tabsList is null || tabStrip is null || activeTabField is null || mruTabsObj is null
+        || setPinnedMethod is null || createTabMethod is null || resizeHeadersMethod is null)
+    {
+        return;
+    }
+
+    // 1. Ensure a background tab never manually activated still participates in Ctrl+Tab MRU switching
+    var firstTab = tabsList[0]!;
+    var mruRemove = mruTabsObj.GetType().GetMethod("Remove");
+    var secondTab = createTabMethod.Invoke(form, ["https://second-mru.invalid/", false, false, null, false, false]);
+    var thirdTab = createTabMethod.Invoke(form, ["https://third-mru.invalid/", false, false, null, false, false]);
+    if (secondTab is null || thirdTab is null) return;
+    tabsList.Add(secondTab);
+    tabsList.Add(thirdTab);
+    if (secondTab.GetType().GetProperty("Header")?.GetValue(secondTab) is Control h2) tabStrip.Controls.Add(h2);
+    if (thirdTab.GetType().GetProperty("Header")?.GetValue(thirdTab) is Control h3) tabStrip.Controls.Add(h3);
+    mruRemove?.Invoke(mruTabsObj, [secondTab]);
+    mruRemove?.Invoke(mruTabsObj, [thirdTab]);
+
+    form.BeginMruSwitch(1);
+    var switcher = mruSwitcherField?.GetValue(form) as MruSwitcherForm;
+    var openedAtZero = switcher is { Visible: true, SelectedIndex: 0 };
+    form.BeginMruSwitch(1);
+    var steppedToOne = switcher is { Visible: true, SelectedIndex: 1 };
+    var committed = form.TryCommitActiveMruSwitch();
+    var switchedToSecondOrThird = committed
+        && switcher is { Visible: false }
+        && !ReferenceEquals(activeTabField.GetValue(form), firstTab);
+    mruBackgroundSwitchOk = openedAtZero && steppedToOne && switchedToSecondOrThird;
+
+    // 2. Ensure pinned tabs compress to compact ~42px pills and 20+ normal tabs compress well below 84px
+    setPinnedMethod.Invoke(form, [secondTab, true]);
+    for (var i = 0; i < 18; i++)
+    {
+        var extra = createTabMethod.Invoke(form, [$"https://compress-{i}.invalid/", false, false, null, false, false]);
+        if (extra is not null)
+        {
+            tabsList.Add(extra);
+            if (extra.GetType().GetProperty("Header")?.GetValue(extra) is Control extraHeader) tabStrip.Controls.Add(extraHeader);
+        }
+    }
+    resizeHeadersMethod.Invoke(form, null);
+    var scale = Math.Max(1f, form.DeviceDpi / 96f);
+    var secondHeader = secondTab.GetType().GetProperty("Header")?.GetValue(secondTab) as Control;
+    var thirdHeader = thirdTab.GetType().GetProperty("Header")?.GetValue(thirdTab) as Control;
+    tabCompressionOk = secondHeader is not null
+        && thirdHeader is not null
+        && secondHeader.Width <= (int)Math.Ceiling(56 * scale)
+        && thirdHeader.Width < (int)Math.Floor(72 * scale);
+});
+Check(
+    "Pinned tabs compress to compact icon pills and 20+ normal tabs compress below 72px",
+    uiInteractionRegressionError is null && tabCompressionOk);
+Check(
+    "Ctrl+Tab BeginMruSwitch includes background tabs, advances selection, and commits",
+    uiInteractionRegressionError is null && mruBackgroundSwitchOk);
+
 if (failures.Count > 0)
 {
     Console.Error.WriteLine($"{failures.Count} smoke test(s) failed:");
@@ -8519,14 +8647,33 @@ bool WindowCaptionDragUsesNativeMove()
 
         const System.Reflection.BindingFlags flags =
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        var tabsList = typeof(MainForm).GetField("tabs", flags)?.GetValue(form) as System.Collections.IList;
         var tabArea = typeof(MainForm).GetField("tabArea", flags)?.GetValue(form) as Panel;
         var tabStrip = typeof(MainForm).GetField("tabStrip", flags)?.GetValue(form) as FlowLayoutPanel;
         var newTabButton = typeof(MainForm).GetField("newTabButton", flags)?.GetValue(form) as Button;
         var isCaptionPoint = typeof(MainForm).GetMethod("IsCaptionPoint", flags);
-        if (tabArea is null || tabStrip is null || newTabButton is null || isCaptionPoint is null)
+        var createTabMethod = typeof(MainForm).GetMethod("CreateBrowserTab", flags);
+        var resizeHeadersMethod = typeof(MainForm).GetMethod("ResizeTabHeaders", flags);
+        if (tabsList is null || tabArea is null || tabStrip is null || newTabButton is null
+            || isCaptionPoint is null || createTabMethod is null || resizeHeadersMethod is null)
         {
             return;
         }
+        for (var i = 0; i < 4; i++)
+        {
+            var extra = createTabMethod.Invoke(form, [$"https://crowded-{i}.invalid/", false, false, null, false, false]);
+            if (extra is not null)
+            {
+                tabsList.Add(extra);
+                if (extra.GetType().GetProperty("Header")?.GetValue(extra) is Control extraHeader)
+                {
+                    tabStrip.Controls.Add(extraHeader);
+                }
+            }
+        }
+        resizeHeadersMethod.Invoke(form, null);
+        form.PerformLayout();
+        Application.DoEvents();
 
         reservedWidth = tabArea.ClientSize.Width - newTabButton.Right;
         var expectedWidth = ScaleForDpi(48, form.DeviceDpi);
