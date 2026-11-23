@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -12,6 +13,7 @@ internal static class WebView2LoaderBootstrap
     private static readonly TimeSpan RuntimeProbeTimeout = TimeSpan.FromSeconds(20);
     private static nint loaderHandle;
     private static int cleanupStarted;
+    private static (byte[] Hash, string VersionKey)? cachedEmbeddedDigest;
 
     public static void EnsureLoaded()
     {
@@ -20,41 +22,96 @@ internal static class WebView2LoaderBootstrap
             if (loaderHandle != 0) return;
 
             var assembly = Assembly.GetExecutingAssembly();
-            using var stream = assembly.GetManifestResourceStream(ResourceName)
-                ?? throw new InvalidOperationException("The embedded WebView2 loader is missing.");
-            var expectedHash = SHA256.HashData(stream);
-            var versionKey = Convert.ToHexString(expectedHash).ToLowerInvariant();
-            var runtimeRoot = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "MishaWeb",
-                "Runtime");
-            var folder = Path.Combine(runtimeRoot, versionKey);
-            var loaderPath = Path.Combine(folder, "WebView2Loader.dll");
-
-            Directory.CreateDirectory(folder);
-            EnsureNoReparsePoints(runtimeRoot, folder, loaderPath);
-
-            FileStream? verifiedLoader = TryOpenVerifiedLoader(loaderPath, expectedHash);
-            if (verifiedLoader is null)
-            {
-                var loaderBytes = ReadEmbeddedLoaderBytes(assembly, stream);
-                WriteLoaderAtomically(loaderPath, loaderBytes);
-                EnsureNoReparsePoints(runtimeRoot, folder, loaderPath);
-                verifiedLoader = OpenVerifiedLoader(loaderPath, expectedHash);
-            }
+            byte[]? rentedLoaderBuffer = null;
+            byte[]? fallbackLoaderBytes = null;
+            var loaderByteLength = 0;
 
             try
             {
-                // Keep the non-sharing verification handle open through Load so the
-                // verified bytes cannot be replaced between hashing and mapping.
-                loaderHandle = NativeLibrary.Load(loaderPath);
+                byte[] expectedHash;
+                string versionKey;
+                if (cachedEmbeddedDigest is { } cached)
+                {
+                    expectedHash = cached.Hash;
+                    versionKey = cached.VersionKey;
+                }
+                else
+                {
+                    using var stream = assembly.GetManifestResourceStream(ResourceName)
+                        ?? throw new InvalidOperationException("The embedded WebView2 loader is missing.");
+                    if (stream.CanSeek && stream.Length is > 0 and <= int.MaxValue)
+                    {
+                        loaderByteLength = (int)stream.Length;
+                        rentedLoaderBuffer = ArrayPool<byte>.Shared.Rent(loaderByteLength);
+                        stream.ReadExactly(rentedLoaderBuffer.AsSpan(0, loaderByteLength));
+                        expectedHash = SHA256.HashData(rentedLoaderBuffer.AsSpan(0, loaderByteLength));
+                    }
+                    else
+                    {
+                        using var buffer = new MemoryStream();
+                        stream.CopyTo(buffer);
+                        fallbackLoaderBytes = buffer.ToArray();
+                        loaderByteLength = fallbackLoaderBytes.Length;
+                        expectedHash = SHA256.HashData(fallbackLoaderBytes);
+                    }
+
+                    versionKey = Convert.ToHexString(expectedHash).ToLowerInvariant();
+                    cachedEmbeddedDigest = (expectedHash, versionKey);
+                }
+
+                var runtimeRoot = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "MishaWeb",
+                    "Runtime");
+                var folder = Path.Combine(runtimeRoot, versionKey);
+                var loaderPath = Path.Combine(folder, "WebView2Loader.dll");
+
+                Directory.CreateDirectory(folder);
+                EnsureNoReparsePoints(runtimeRoot, folder, loaderPath);
+
+                FileStream? verifiedLoader = TryOpenVerifiedLoader(loaderPath, expectedHash);
+                if (verifiedLoader is null)
+                {
+                    ReadOnlySpan<byte> loaderBytes;
+                    if (rentedLoaderBuffer is not null)
+                    {
+                        loaderBytes = rentedLoaderBuffer.AsSpan(0, loaderByteLength);
+                    }
+                    else if (fallbackLoaderBytes is not null)
+                    {
+                        loaderBytes = fallbackLoaderBytes;
+                    }
+                    else
+                    {
+                        fallbackLoaderBytes = ReadEmbeddedLoaderBytes(assembly);
+                        loaderBytes = fallbackLoaderBytes;
+                    }
+
+                    WriteLoaderAtomically(loaderPath, loaderBytes);
+                    EnsureNoReparsePoints(runtimeRoot, folder, loaderPath);
+                    verifiedLoader = OpenVerifiedLoader(loaderPath, expectedHash);
+                }
+
+                try
+                {
+                    // Keep the non-sharing verification handle open through Load so the
+                    // verified bytes cannot be replaced between hashing and mapping.
+                    loaderHandle = NativeLibrary.Load(loaderPath);
+                }
+                finally
+                {
+                    verifiedLoader.Dispose();
+                }
+
+                ScheduleObsoleteRuntimeCleanup(runtimeRoot, versionKey);
             }
             finally
             {
-                verifiedLoader.Dispose();
+                if (rentedLoaderBuffer is not null)
+                {
+                    ArrayPool<byte>.Shared.Return(rentedLoaderBuffer);
+                }
             }
-
-            ScheduleObsoleteRuntimeCleanup(runtimeRoot, versionKey);
         }
     }
 
@@ -67,20 +124,19 @@ internal static class WebView2LoaderBootstrap
         return environment.BrowserVersionString;
     }
 
-    private static byte[] ReadEmbeddedLoaderBytes(Assembly assembly, Stream existingStream)
+    private static byte[] ReadEmbeddedLoaderBytes(Assembly assembly)
     {
-        if (existingStream.CanSeek)
+        using var stream = assembly.GetManifestResourceStream(ResourceName)
+            ?? throw new InvalidOperationException("The embedded WebView2 loader is missing.");
+        if (stream.CanSeek && stream.Length is > 0 and <= int.MaxValue)
         {
-            existingStream.Position = 0;
-            var exactBytes = new byte[existingStream.Length];
-            existingStream.ReadExactly(exactBytes);
+            var exactBytes = new byte[stream.Length];
+            stream.ReadExactly(exactBytes);
             return exactBytes;
         }
 
-        using var fallbackStream = assembly.GetManifestResourceStream(ResourceName)
-            ?? throw new InvalidOperationException("The embedded WebView2 loader is missing.");
         using var buffer = new MemoryStream();
-        fallbackStream.CopyTo(buffer);
+        stream.CopyTo(buffer);
         return buffer.ToArray();
     }
 
@@ -105,7 +161,7 @@ internal static class WebView2LoaderBootstrap
         }
     }
 
-    private static void WriteLoaderAtomically(string destination, byte[] bytes)
+    private static void WriteLoaderAtomically(string destination, ReadOnlySpan<byte> bytes)
     {
         var temporaryPath = destination
             + "."
@@ -113,6 +169,7 @@ internal static class WebView2LoaderBootstrap
             + "."
             + Guid.NewGuid().ToString("N")
             + ".tmp";
+        var moved = false;
         try
         {
             using (var stream = new FileStream(
@@ -129,6 +186,7 @@ internal static class WebView2LoaderBootstrap
             try
             {
                 File.Move(temporaryPath, destination, true);
+                moved = true;
             }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException)
             {
@@ -140,13 +198,16 @@ internal static class WebView2LoaderBootstrap
         }
         finally
         {
-            try
+            if (!moved)
             {
-                if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
-            }
-            catch
-            {
-                // A leftover temporary file is harmless and can be replaced later.
+                try
+                {
+                    if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+                }
+                catch
+                {
+                    // A leftover temporary file is harmless and can be replaced later.
+                }
             }
         }
     }
@@ -164,8 +225,7 @@ internal static class WebView2LoaderBootstrap
                     if (string.Equals(name, activeVersionKey, StringComparison.OrdinalIgnoreCase)) continue;
                     try
                     {
-                        var info = new DirectoryInfo(directory);
-                        if (info.Attributes.HasFlag(FileAttributes.ReparsePoint)) continue;
+                        if (File.GetAttributes(directory).HasFlag(FileAttributes.ReparsePoint)) continue;
                         Directory.Delete(directory, recursive: true);
                     }
                     catch
@@ -201,12 +261,10 @@ internal static class WebView2LoaderBootstrap
 
     private static void EnsureNoReparsePoints(string runtimeRoot, string folder, string loaderPath)
     {
-        foreach (var path in new[] { runtimeRoot, folder })
+        if (File.GetAttributes(runtimeRoot).HasFlag(FileAttributes.ReparsePoint)
+            || File.GetAttributes(folder).HasFlag(FileAttributes.ReparsePoint))
         {
-            if (new DirectoryInfo(path).Attributes.HasFlag(FileAttributes.ReparsePoint))
-            {
-                throw new IOException("The WebView2 runtime cache cannot use a linked directory.");
-            }
+            throw new IOException("The WebView2 runtime cache cannot use a linked directory.");
         }
         if (File.Exists(loaderPath)
             && File.GetAttributes(loaderPath).HasFlag(FileAttributes.ReparsePoint))

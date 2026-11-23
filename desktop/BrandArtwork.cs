@@ -177,22 +177,26 @@ internal static class BrandArtwork
                 Color.FromArgb(205, 255, 232, 246),
                 Color.FromArgb(95, NativeUiTheme.Accent),
                 LinearGradientMode.Vertical);
-            using var outerRimPen = new Pen(outerRimBrush, Math.Max(1.1f, bounds.Width / 42f));
+            using var outerRimPen = new Pen(outerRimBrush, Math.Max(1f, bounds.Width / 42f));
             graphics.DrawPath(outerRimPen, borderPath);
 
-            var innerBounds = borderBounds;
-            innerBounds.Inflate(-1.1f, -1.1f);
-            if (innerBounds.Width > 4f && innerBounds.Height > 4f)
+            if (bounds.Width >= 32 && bounds.Height >= 32)
             {
-                var innerRadius = Math.Max(2f, borderRadius - 1.1f);
-                using var innerPath = NativeUiTheme.CreateRoundedPath(innerBounds, innerRadius);
-                using var innerRimBrush = new LinearGradientBrush(
-                    innerBounds,
-                    Color.FromArgb(115, 255, 255, 255),
-                    Color.FromArgb(28, 255, 196, 232),
-                    LinearGradientMode.Vertical);
-                using var innerRimPen = new Pen(innerRimBrush, 1f);
-                graphics.DrawPath(innerRimPen, innerPath);
+                var innerInset = Math.Max(1.1f, Math.Min(bounds.Width, bounds.Height) / 36f);
+                var innerBounds = borderBounds;
+                innerBounds.Inflate(-innerInset, -innerInset);
+                if (innerBounds.Width > 4f && innerBounds.Height > 4f)
+                {
+                    var innerRadius = Math.Max(2f, borderRadius - innerInset);
+                    using var innerPath = NativeUiTheme.CreateRoundedPath(innerBounds, innerRadius);
+                    using var innerRimBrush = new LinearGradientBrush(
+                        innerBounds,
+                        Color.FromArgb(115, 255, 255, 255),
+                        Color.FromArgb(28, 255, 196, 232),
+                        LinearGradientMode.Vertical);
+                    using var innerRimPen = new Pen(innerRimBrush, Math.Max(0.9f, bounds.Width / 64f));
+                    graphics.DrawPath(innerRimPen, innerPath);
+                }
             }
         }
         finally
@@ -268,19 +272,35 @@ internal sealed class BrandLogoControl : Control
         if (!privateMode) return;
 
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        var scale = Math.Max(1f, DeviceDpi / 96f);
         var badgeSize = Math.Max(8, side / 3);
         var badgeBounds = new Rectangle(
             logoBounds.Right - badgeSize,
             logoBounds.Bottom - badgeSize,
             badgeSize,
             badgeSize);
-        using var fill = new SolidBrush(
-            SystemInformation.HighContrast ? SystemColors.Highlight : NativeUiTheme.Lavender);
-        using var border = new Pen(
-            SystemInformation.HighContrast ? SystemColors.WindowText : Color.FromArgb(120, 60, 148),
-            1f);
-        e.Graphics.FillEllipse(fill, badgeBounds);
-        e.Graphics.DrawEllipse(border, badgeBounds);
+        var haloPad = Math.Max(1, (int)Math.Round(1.3f * scale));
+        var haloBounds = Rectangle.Inflate(badgeBounds, haloPad, haloPad);
+        var haloColor = SystemInformation.HighContrast
+            ? SystemColors.Window
+            : (BackColor.A == 255 && BackColor != Color.Transparent ? BackColor : Color.FromArgb(24, 11, 25));
+        e.Graphics.FillEllipse(NativeUiTheme.GetSharedBrush(haloColor), haloBounds);
+
+        if (SystemInformation.HighContrast)
+        {
+            e.Graphics.FillEllipse(NativeUiTheme.GetSharedBrush(SystemColors.Highlight), badgeBounds);
+            e.Graphics.DrawEllipse(NativeUiTheme.GetSharedPen(SystemColors.WindowText, 1f), badgeBounds);
+        }
+        else
+        {
+            using var fill = new LinearGradientBrush(
+                badgeBounds,
+                Color.FromArgb(238, 178, 255),
+                Color.FromArgb(164, 84, 224),
+                LinearGradientMode.Vertical);
+            e.Graphics.FillEllipse(fill, badgeBounds);
+            e.Graphics.DrawEllipse(NativeUiTheme.GetSharedPen(Color.FromArgb(156, 240, 214, 255), 1f), badgeBounds);
+        }
         var badgePointSize = Math.Clamp((badgeSize * 0.58f * 72f) / Math.Max(96f, e.Graphics.DpiY), 5.5f, 24f);
         var badgeFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", badgePointSize, FontStyle.Bold);
         TextRenderer.DrawText(

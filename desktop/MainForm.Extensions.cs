@@ -157,20 +157,23 @@ public sealed partial class MainForm
         ExtensionsManagerForm? manager = null;
         try
         {
-            var browserEnvironment = await GetOrCreateEnvironmentAsync();
-            if (isClosing || environment != browserEnvironment) return;
-            var controllerOptions = browserEnvironment.CreateCoreWebView2ControllerOptions();
-            controllerOptions.IsInPrivateModeEnabled = false;
-            controller = await browserEnvironment.CreateCoreWebView2ControllerAsync(Handle, controllerOptions);
-            if (isClosing || environment != browserEnvironment)
+            if (TryGetLiveTabProfile() is null)
             {
-                controller.Close();
-                controller = null;
-                return;
+                var browserEnvironment = await GetOrCreateEnvironmentAsync();
+                if (isClosing || environment != browserEnvironment) return;
+                var controllerOptions = browserEnvironment.CreateCoreWebView2ControllerOptions();
+                controllerOptions.IsInPrivateModeEnabled = false;
+                controller = await browserEnvironment.CreateCoreWebView2ControllerAsync(Handle, controllerOptions);
+                if (isClosing || environment != browserEnvironment)
+                {
+                    controller.Close();
+                    controller = null;
+                    return;
+                }
+                controller.IsVisible = false;
+                controller.Bounds = Rectangle.Empty;
+                extensionProfileController = controller;
             }
-            controller.IsVisible = false;
-            controller.Bounds = Rectangle.Empty;
-            extensionProfileController = controller;
 
             manager = new ExtensionsManagerForm(
                 BuildExtensionManagerRowsAsync,
@@ -186,7 +189,7 @@ public sealed partial class MainForm
             manager.FormClosed += (_, _) =>
             {
                 if (ReferenceEquals(extensionsManager, manager)) extensionsManager = null;
-                DisposeExtensionProfileController(controller);
+                if (controller is not null) DisposeExtensionProfileController(controller);
                 ReleaseBrowserEnvironmentIfIdle();
             };
             manager.Show(this);
@@ -863,6 +866,24 @@ public sealed partial class MainForm
         }
     }
 
+    private CoreWebView2Profile? TryGetLiveTabProfile()
+    {
+        if (isPrivateMode) return null;
+        if (activeTab is { IsClosed: false, Core.Profile: { } activeProfile })
+        {
+            return activeProfile;
+        }
+        for (var index = 0; index < tabs.Count; index++)
+        {
+            var candidate = tabs[index];
+            if (!candidate.IsClosed && candidate.Core?.Profile is { } profile)
+            {
+                return profile;
+            }
+        }
+        return null;
+    }
+
     private CoreWebView2Profile GetExtensionManagerProfile()
     {
         if (isPrivateMode)
@@ -870,6 +891,7 @@ public sealed partial class MainForm
             throw new InvalidOperationException("Extensions are unavailable in private windows.");
         }
         return extensionProfileController?.CoreWebView2?.Profile
+            ?? TryGetLiveTabProfile()
             ?? throw new InvalidOperationException("The extensions manager is no longer connected to the browser profile.");
     }
 

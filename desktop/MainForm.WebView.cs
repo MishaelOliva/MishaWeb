@@ -232,7 +232,11 @@ public sealed partial class MainForm
             {
                 environment = created;
                 AttachBrowserVersionAvailableHandler(created, generation);
-                RefreshMemorySweepTimer();
+                if (!IsDisposed && !Disposing && IsHandleCreated)
+                {
+                    if (InvokeRequired) PostUi(RefreshMemorySweepTimer);
+                    else RefreshMemorySweepTimer();
+                }
             }
             return created;
         }
@@ -279,6 +283,9 @@ public sealed partial class MainForm
         environmentGeneration++;
         environment = null;
         environmentTask = null;
+        profileMediaPermissionsSeeded = false;
+        hasGrantedMediaPermissionOrigins = false;
+        profileGrantedMediaPermissionOrigins.Clear();
         memoryTimer.Stop();
     }
 
@@ -513,7 +520,7 @@ public sealed partial class MainForm
                 AddHistory(tab);
                 if (darkModeEnabled && state.DarkModeExcludedHosts.Count > 0)
                 {
-                    await ApplyWebsiteThemeAsync(tab);
+                    await ApplyWebsiteThemeIfChangedAsync(tab, source);
                     if (isClosing
                         || tab.IsClosed
                         || !ReferenceEquals(tab.Core, core)
@@ -606,7 +613,7 @@ public sealed partial class MainForm
         ApplySitePreferences(tab, persist: false);
         if (darkModeEnabled && state.DarkModeExcludedHosts.Count > 0)
         {
-            RunUiTask(() => ApplyWebsiteThemeAsync(tab), "Could not update the website color preference");
+            RunUiTask(() => ApplyWebsiteThemeIfChangedAsync(tab, source), "Could not update the website color preference");
         }
         if (!e.IsNewDocument) AddHistory(tab);
         if (keepAwakeChanged) UpdateTabHeader(tab);
@@ -1397,7 +1404,7 @@ public sealed partial class MainForm
         if (tab.NavigationRequestId != navigationRequestId
             || tab.IsStartPage
             || !BrowserPolicy.UrlEquals(tab.Url, targetUrl)) return;
-        await EnsureUrlScopedScriptsRegisteredAsync(tab, targetUrl);
+        await EnsureUrlScopedScriptsRegisteredIfNeededAsync(tab, targetUrl);
         if (isClosing
             || tab.IsClosed
             || tab.NavigationRequestId != navigationRequestId
@@ -1499,7 +1506,7 @@ public sealed partial class MainForm
                     else if (tabToRestore.NavigationRequestId == navigationRequestId
                         && BrowserPolicy.UrlEquals(tabToRestore.Url, targetUrl))
                     {
-                        await EnsureUrlScopedScriptsRegisteredAsync(tabToRestore, targetUrl);
+                        await EnsureUrlScopedScriptsRegisteredIfNeededAsync(tabToRestore, targetUrl);
                         if (!isClosing
                             && !tabToRestore.IsClosed
                             && tabToRestore.NavigationRequestId == navigationRequestId
@@ -2443,6 +2450,18 @@ public sealed partial class MainForm
             return;
         }
 
+        if (isPrivateMode)
+        {
+            profileMediaPermissionsSeeded = true;
+        }
+
+        if (profileMediaPermissionsSeeded
+            && !tab.HasMediaCapturePermissionForOrigin(origin)
+            && (!hasGrantedMediaPermissionOrigins || !profileGrantedMediaPermissionOrigins.Contains(origin)))
+        {
+            return;
+        }
+
         tab.PendingMediaPermissionRefreshes++;
         try
         {
@@ -2451,24 +2470,43 @@ public sealed partial class MainForm
             try
             {
                 var settings = await core.Profile.GetNonDefaultPermissionSettingsAsync();
+                profileGrantedMediaPermissionOrigins.Clear();
                 for (var index = 0; index < settings.Count; index++)
                 {
                     var setting = settings[index];
-                    if (setting.PermissionState != CoreWebView2PermissionState.Allow
-                        || !setting.PermissionOrigin.Equals(origin, StringComparison.OrdinalIgnoreCase))
+                    if (setting.PermissionState != CoreWebView2PermissionState.Allow)
                     {
                         continue;
                     }
 
-                    if (setting.PermissionKind == CoreWebView2PermissionKind.Microphone)
+                    var isMicrophone = setting.PermissionKind == CoreWebView2PermissionKind.Microphone;
+                    var isCamera = setting.PermissionKind == CoreWebView2PermissionKind.Camera;
+                    if (!isMicrophone && !isCamera)
+                    {
+                        continue;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(setting.PermissionOrigin))
+                    {
+                        profileGrantedMediaPermissionOrigins.Add(setting.PermissionOrigin);
+                    }
+
+                    if (!setting.PermissionOrigin.Equals(origin, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (isMicrophone)
                     {
                         microphoneAllowed = true;
                     }
-                    else if (setting.PermissionKind == CoreWebView2PermissionKind.Camera)
+                    else
                     {
                         cameraAllowed = true;
                     }
                 }
+                hasGrantedMediaPermissionOrigins = profileGrantedMediaPermissionOrigins.Count > 0;
+                profileMediaPermissionsSeeded = true;
             }
             catch (Exception error)
             {
@@ -2506,6 +2544,15 @@ public sealed partial class MainForm
         var microphoneAllowed = tab.MicrophoneAllowedOrigins.Contains(origin);
         var cameraAllowed = tab.CameraAllowedOrigins.Contains(origin);
         var allowed = permissionState == CoreWebView2PermissionState.Allow;
+        if (allowed)
+        {
+            profileGrantedMediaPermissionOrigins.Add(origin);
+            hasGrantedMediaPermissionOrigins = true;
+        }
+        else
+        {
+            profileMediaPermissionsSeeded = false;
+        }
         if (kind == CoreWebView2PermissionKind.Microphone) microphoneAllowed = allowed;
         else cameraAllowed = allowed;
         ApplyTabMediaPermissions(tab, origin, microphoneAllowed, cameraAllowed);
@@ -2516,6 +2563,19 @@ public sealed partial class MainForm
         CoreWebView2PermissionKind kind,
         CoreWebView2PermissionState permissionState)
     {
+        if (kind is CoreWebView2PermissionKind.Microphone or CoreWebView2PermissionKind.Camera)
+        {
+            if (permissionState == CoreWebView2PermissionState.Allow)
+            {
+                profileGrantedMediaPermissionOrigins.Add(origin);
+                hasGrantedMediaPermissionOrigins = true;
+            }
+            else
+            {
+                profileMediaPermissionsSeeded = false;
+            }
+        }
+
         foreach (var tab in tabs.Where(item =>
                      !item.IsClosed && TabContainsMediaOrigin(item, origin)))
         {
@@ -2536,6 +2596,7 @@ public sealed partial class MainForm
 
     private async Task RefreshLiveTabMediaPermissionsAsync()
     {
+        profileMediaPermissionsSeeded = false;
         foreach (var tab in tabs.Where(item => !item.IsClosed && item.Core is not null).ToArray())
         {
             var core = tab.Core!;
@@ -3319,6 +3380,131 @@ public sealed partial class MainForm
         }
     }
 
+    private async Task EnsureUrlScopedScriptsRegisteredIfNeededAsync(BrowserTab tab, string? url)
+    {
+        if (isClosing || tab.IsClosed || tab.Core is not { } core)
+        {
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(url)
+            && tab.LastScopedScriptRegistrationUrl is { } lastUrl
+            && string.Equals(lastUrl, url, StringComparison.Ordinal)
+            && tab.LastScopedScriptAdBlockGeneration == tab.AdBlockScriptGeneration)
+        {
+            return;
+        }
+
+        await EnsureUrlScopedScriptsRegisteredAsync(tab, url);
+        if (!isClosing && !tab.IsClosed && ReferenceEquals(tab.Core, core))
+        {
+            tab.LastScopedScriptRegistrationUrl = url;
+            tab.LastScopedScriptAdBlockGeneration = tab.AdBlockScriptGeneration;
+        }
+    }
+
+    private void SyncWebsiteThemeBeforeNavigation(BrowserTab tab, string? targetUrl)
+    {
+        if (isClosing || tab.IsClosed || tab.IsStartPage || tab.View is null) return;
+
+        var url = string.IsNullOrWhiteSpace(targetUrl) ? tab.Url : targetUrl;
+        var applyAutoDark = WebsiteThemePolicy.ShouldApplyAutoDark(
+            darkModeEnabled,
+            url,
+            state.DarkModeExcludedHosts);
+        var targetBg = WebsiteThemePolicy.GetLoadingBackgroundColor(applyAutoDark);
+        try
+        {
+            if (tab.View.DefaultBackgroundColor != targetBg)
+            {
+                tab.View.DefaultBackgroundColor = targetBg;
+            }
+        }
+        catch (Exception error) when (error is InvalidOperationException or COMException or ObjectDisposedException)
+        {
+        }
+
+        var currentGeneration = Interlocked.Read(ref websiteThemeGeneration);
+        if (tab.Core is not null
+            && (tab.AppliedWebsiteThemeGeneration != currentGeneration
+                || tab.AppliedAutoDarkOverride != applyAutoDark
+                || tab.AppliedPreferredColorSchemeDark != darkModeEnabled))
+        {
+            RunUiTask(
+                () => ApplyWebsiteThemeIfChangedAsync(tab, url),
+                "Could not update the website color preference");
+        }
+    }
+
+    private async Task ApplyWebsiteThemeIfChangedAsync(BrowserTab tab, string? targetUrl = null)
+    {
+        if (isClosing || tab.IsClosed || tab.Core is not { } core) return;
+
+        var useDarkTheme = darkModeEnabled;
+        var currentGeneration = Interlocked.Read(ref websiteThemeGeneration);
+        var url = targetUrl;
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            url = tab.Url;
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(core.Source)) url = core.Source;
+            }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+        }
+
+        var applyAutoDark = WebsiteThemePolicy.ShouldApplyAutoDark(
+            useDarkTheme,
+            url,
+            state.DarkModeExcludedHosts);
+
+        if (tab.View is { IsDisposed: false } view)
+        {
+            var targetBg = WebsiteThemePolicy.GetLoadingBackgroundColor(applyAutoDark);
+            try
+            {
+                if (view.DefaultBackgroundColor != targetBg)
+                {
+                    view.DefaultBackgroundColor = targetBg;
+                }
+            }
+            catch (Exception error) when (error is InvalidOperationException or COMException or ObjectDisposedException)
+            {
+            }
+        }
+
+        if (tab.AppliedWebsiteThemeGeneration == currentGeneration
+            && tab.AppliedAutoDarkOverride == applyAutoDark
+            && tab.AppliedPreferredColorSchemeDark == useDarkTheme)
+        {
+            return;
+        }
+
+        try
+        {
+            if (tab.AppliedPreferredColorSchemeDark != useDarkTheme)
+            {
+                WebsiteThemePolicy.ApplyPreferredColorScheme(core, useDarkTheme);
+                tab.AppliedPreferredColorSchemeDark = useDarkTheme;
+            }
+            if (tab.AppliedAutoDarkOverride != applyAutoDark
+                || tab.AppliedWebsiteThemeGeneration != currentGeneration)
+            {
+                await WebsiteThemePolicy.ApplyAutoDarkModeOverrideAsync(core, applyAutoDark);
+                if (!isClosing && !tab.IsClosed && ReferenceEquals(tab.Core, core))
+                {
+                    tab.AppliedAutoDarkOverride = applyAutoDark;
+                    tab.AppliedWebsiteThemeGeneration = currentGeneration;
+                }
+            }
+        }
+        catch (Exception error)
+        {
+            stateStore.Log("Could not apply the automatic website color policy", error);
+        }
+    }
+
     private async Task ConfigureWebView(BrowserTab tab)
     {
         var view = tab.View ?? throw new InvalidOperationException("The tab view was not created.");
@@ -3368,7 +3554,7 @@ public sealed partial class MainForm
         // (such as Messenger / Facebook). The native shield continues to block
         // its audited network and cosmetic rules independently.
         core.Profile.PreferredTrackingPreventionLevel = CoreWebView2TrackingPreventionLevel.None;
-        await ApplyWebsiteThemeAsync(tab);
+        await ApplyWebsiteThemeIfChangedAsync(tab, tab.Url);
         try
         {
             await core.AddScriptToExecuteOnDocumentCreatedAsync(
@@ -3388,7 +3574,11 @@ public sealed partial class MainForm
 
         if (adBlockEnabled)
         {
-            _ = adBlocker.LoadAsync();
+            if (!adBlocker.IsReady && !adBlockerLoadStarted)
+            {
+                adBlockerLoadStarted = true;
+                _ = adBlocker.LoadAsync();
+            }
             try { await InstallAdBlockPageScriptsAsync(tab); }
             catch (Exception error) { stateStore.Log("Could not install the adblock page shield", error); }
         }
@@ -3405,13 +3595,18 @@ public sealed partial class MainForm
                 });
         }
 
-        await EnsureUrlScopedScriptsRegisteredAsync(tab, tab.Url);
+        await EnsureUrlScopedScriptsRegisteredIfNeededAsync(tab, tab.Url);
 
         TrackCoreEvent<CoreWebView2NavigationStartingEventArgs>(
             tab,
             handler => core.NavigationStarting += handler,
             handler => core.NavigationStarting -= handler,
-            (_, e) => { if (IsCurrentCore()) OnNavigationStarting(tab, e); });
+            (_, e) =>
+            {
+                if (!IsCurrentCore()) return;
+                OnNavigationStarting(tab, e);
+                if (!e.Cancel) SyncWebsiteThemeBeforeNavigation(tab, e.Uri);
+            });
         TrackCoreEvent<CoreWebView2DOMContentLoadedEventArgs>(
             tab,
             handler => core.DOMContentLoaded += handler,

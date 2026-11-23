@@ -248,18 +248,24 @@ internal sealed class MultiViewToolbarButton : Button
 internal sealed class PaneHeaderBar : Control
 {
     private static readonly Font TitleFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 8.25f);
+    private static readonly Font HostFont = NativeUiTheme.GetSharedFont("Segoe UI", 7.75f);
     private static readonly Font IndexFont = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 7.25f);
 
     private string paneTitle = "New tab";
+    private string hostLabel = string.Empty;
     private bool isFocusedPane;
     private bool isPrivateMode;
     private bool highContrast;
     private bool isAudible;
     private bool isMuted;
+    private bool isLoading;
+    private bool isMaximized;
     private bool closeHovered;
+    private bool maximizeHovered;
     private bool switchHovered;
     private bool audioHovered;
     private Rectangle closeBounds;
+    private Rectangle maximizeBounds;
     private Rectangle switchBounds;
     private Rectangle audioBounds;
 
@@ -278,7 +284,7 @@ internal sealed class PaneHeaderBar : Control
         TabStop = true;
         AccessibleRole = AccessibleRole.TitleBar;
         AccessibleName = $"View pane {paneIndex + 1}";
-        AccessibleDescription = "Activate pane, switch tab, toggle audio, or close pane";
+        AccessibleDescription = "Activate pane, switch tab, maximize or restore grid, toggle audio, or close pane";
     }
 
     public int PaneIndex { get; }
@@ -305,28 +311,42 @@ internal sealed class PaneHeaderBar : Control
         bool privateMode,
         bool highContrastActive,
         bool audible = false,
-        bool muted = false)
+        bool muted = false,
+        string? host = null,
+        bool loading = false,
+        bool maximized = false)
     {
         var normalized = TextSafety.SanitizeSingleLine(title, 96);
         if (normalized.Length == 0) normalized = "New tab";
+        var normalizedHost = string.IsNullOrWhiteSpace(host)
+            ? string.Empty
+            : TextSafety.SanitizeSingleLine(host, 48);
         if (string.Equals(paneTitle, normalized, StringComparison.Ordinal)
+            && string.Equals(hostLabel, normalizedHost, StringComparison.Ordinal)
             && isFocusedPane == focused
             && isPrivateMode == privateMode
             && highContrast == highContrastActive
             && isAudible == audible
-            && isMuted == muted)
+            && isMuted == muted
+            && isLoading == loading
+            && isMaximized == maximized)
         {
             return;
         }
         var audioStateChanged = (isAudible || isMuted) != (audible || muted);
         paneTitle = normalized;
+        hostLabel = normalizedHost;
         isFocusedPane = focused;
         isPrivateMode = privateMode;
         highContrast = highContrastActive;
         isAudible = audible;
         isMuted = muted;
+        isLoading = loading;
+        isMaximized = maximized;
         if (audioStateChanged) RecalculateButtonBounds();
-        AccessibleName = $"Pane {PaneIndex + 1}: {paneTitle}";
+        AccessibleName = normalizedHost.Length > 0
+            ? $"Pane {PaneIndex + 1}: {paneTitle} ({normalizedHost})"
+            : $"Pane {PaneIndex + 1}: {paneTitle}";
         Invalidate();
     }
 
@@ -397,15 +417,20 @@ internal sealed class PaneHeaderBar : Control
 
     protected override void OnMouseMove(MouseEventArgs e)
     {
-        var nextClose = closeBounds.Contains(e.Location);
-        var nextSwitch = !nextClose && switchBounds.Contains(e.Location);
-        var nextAudio = !nextClose && !nextSwitch && !audioBounds.IsEmpty && audioBounds.Contains(e.Location);
-        if (nextClose != closeHovered || nextSwitch != switchHovered || nextAudio != audioHovered)
+        var nextClose = !closeBounds.IsEmpty && closeBounds.Contains(e.Location);
+        var nextMaximize = !nextClose && !maximizeBounds.IsEmpty && maximizeBounds.Contains(e.Location);
+        var nextSwitch = !nextClose && !nextMaximize && !switchBounds.IsEmpty && switchBounds.Contains(e.Location);
+        var nextAudio = !nextClose && !nextMaximize && !nextSwitch && !audioBounds.IsEmpty && audioBounds.Contains(e.Location);
+        if (nextClose != closeHovered
+            || nextMaximize != maximizeHovered
+            || nextSwitch != switchHovered
+            || nextAudio != audioHovered)
         {
             closeHovered = nextClose;
+            maximizeHovered = nextMaximize;
             switchHovered = nextSwitch;
             audioHovered = nextAudio;
-            Cursor = nextClose || nextSwitch || nextAudio ? Cursors.Hand : Cursors.Default;
+            Cursor = nextClose || nextMaximize || nextSwitch || nextAudio ? Cursors.Hand : Cursors.Default;
             Invalidate();
         }
         base.OnMouseMove(e);
@@ -413,9 +438,10 @@ internal sealed class PaneHeaderBar : Control
 
     protected override void OnMouseLeave(EventArgs e)
     {
-        if (closeHovered || switchHovered || audioHovered)
+        if (closeHovered || maximizeHovered || switchHovered || audioHovered)
         {
             closeHovered = false;
+            maximizeHovered = false;
             switchHovered = false;
             audioHovered = false;
             Cursor = Cursors.Default;
@@ -429,9 +455,14 @@ internal sealed class PaneHeaderBar : Control
         base.OnMouseDown(e);
         if (e.Button != MouseButtons.Left) return;
 
-        if (closeBounds.Contains(e.Location))
+        if (!closeBounds.IsEmpty && closeBounds.Contains(e.Location))
         {
             CloseRequested?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+        if (!maximizeBounds.IsEmpty && maximizeBounds.Contains(e.Location))
+        {
+            MaximizeToggleRequested?.Invoke(this, EventArgs.Empty);
             return;
         }
         if (!audioBounds.IsEmpty && audioBounds.Contains(e.Location))
@@ -441,7 +472,7 @@ internal sealed class PaneHeaderBar : Control
         }
 
         PaneActivated?.Invoke(this, EventArgs.Empty);
-        if (switchBounds.Contains(e.Location))
+        if (!switchBounds.IsEmpty && switchBounds.Contains(e.Location))
         {
             TabSwitchRequested?.Invoke(this, PointToScreen(new Point(switchBounds.Left, Height)));
         }
@@ -451,8 +482,9 @@ internal sealed class PaneHeaderBar : Control
     {
         base.OnDoubleClick(e);
         var local = PointToClient(Cursor.Position);
-        if (closeBounds.Contains(local)
-            || switchBounds.Contains(local)
+        if ((!closeBounds.IsEmpty && closeBounds.Contains(local))
+            || (!maximizeBounds.IsEmpty && maximizeBounds.Contains(local))
+            || (!switchBounds.IsEmpty && switchBounds.Contains(local))
             || (!audioBounds.IsEmpty && audioBounds.Contains(local)))
         {
             return;
@@ -494,11 +526,28 @@ internal sealed class PaneHeaderBar : Control
                 using var sheenPen = new Pen(Color.FromArgb(36, 255, 240, 248), 1f);
                 graphics.DrawLine(sheenPen, 0, barHeight, Width - 1, barHeight);
             }
+
+            using var focusFramePen = new Pen(barColor, 1f);
+            graphics.DrawRectangle(focusFramePen, 0, 0, Width - 1, Height - 1);
+        }
+        else
+        {
+            using var bottomLine = new Pen(highContrast ? SystemColors.WindowText : NativeUiTheme.Border, 1f);
+            graphics.DrawLine(bottomLine, 0, Height - 1, Width - 1, Height - 1);
         }
 
-        using (var bottomLine = new Pen(highContrast ? SystemColors.WindowText : NativeUiTheme.Border, 1f))
+        if (isLoading)
         {
-            graphics.DrawLine(bottomLine, 0, Height - 1, Width - 1, Height - 1);
+            var loadHeight = Math.Max(2, (int)Math.Round(2f * scale));
+            var loadY = Math.Max(0, Height - loadHeight);
+            var loadColor = highContrast ? SystemColors.HighlightText : NativeUiTheme.Accent;
+            if (!highContrast && loadY > 0)
+            {
+                using var glowPen = new Pen(Color.FromArgb(92, NativeUiTheme.Accent), 1f);
+                graphics.DrawLine(glowPen, 0, loadY - 1, Width - 1, loadY - 1);
+            }
+            using var loadBrush = new SolidBrush(loadColor);
+            graphics.FillRectangle(loadBrush, 0, loadY, Width, loadHeight);
         }
 
         var badgeSize = Math.Max(14f, 15f * scale);
@@ -521,21 +570,61 @@ internal sealed class PaneHeaderBar : Control
         var titleLeft = (int)Math.Ceiling(badgeRect.Right + (6f * scale));
         var rightLimit = !audioBounds.IsEmpty
             ? audioBounds.Left
-            : (switchBounds.Width > 0 ? switchBounds.Left : (closeBounds.Width > 0 ? closeBounds.Left : Width));
+            : (!switchBounds.IsEmpty
+                ? switchBounds.Left
+                : (!maximizeBounds.IsEmpty
+                    ? maximizeBounds.Left
+                    : (!closeBounds.IsEmpty ? closeBounds.Left : Width)));
         var titleRight = Math.Max(titleLeft + 1, rightLimit - (int)Math.Ceiling(4f * scale));
-        var titleRect = new Rectangle(titleLeft, 0, Math.Max(1, titleRight - titleLeft), Height);
-        TextRenderer.DrawText(
-            graphics,
-            paneTitle,
-            TitleFont,
-            titleRect,
-            textColor,
-            TextFormatFlags.Left
+        var availableTitleWidth = Math.Max(1, titleRight - titleLeft);
+        const TextFormatFlags titleFlags = TextFormatFlags.Left
             | TextFormatFlags.VerticalCenter
             | TextFormatFlags.EndEllipsis
             | TextFormatFlags.NoPadding
             | TextFormatFlags.NoPrefix
-            | TextFormatFlags.SingleLine);
+            | TextFormatFlags.SingleLine;
+
+        var drewHostPill = false;
+        if (hostLabel.Length > 0 && availableTitleWidth >= (int)Math.Ceiling(110 * scale))
+        {
+            var hostText = "\u00B7 " + hostLabel;
+            var titleMeasured = TextRenderer.MeasureText(
+                graphics,
+                paneTitle,
+                TitleFont,
+                new Size(availableTitleWidth, Height),
+                titleFlags);
+            var hostMeasured = TextRenderer.MeasureText(
+                graphics,
+                hostText,
+                HostFont,
+                new Size(availableTitleWidth, Height),
+                titleFlags);
+            var gapPx = (int)Math.Ceiling(6f * scale);
+            var minHostWidth = Math.Min(hostMeasured.Width, (int)Math.Ceiling(64f * scale));
+            var maxTitleWidth = availableTitleWidth - gapPx - minHostWidth;
+            if (maxTitleWidth >= (int)Math.Ceiling(44f * scale))
+            {
+                var actualTitleWidth = Math.Min(titleMeasured.Width, maxTitleWidth);
+                var titleRect = new Rectangle(titleLeft, 0, Math.Max(1, actualTitleWidth), Height);
+                TextRenderer.DrawText(graphics, paneTitle, TitleFont, titleRect, textColor, titleFlags);
+
+                var hostLeft = titleRect.Right + gapPx;
+                var hostWidth = Math.Max(1, titleRight - hostLeft);
+                var hostRect = new Rectangle(hostLeft, 0, hostWidth, Height);
+                var hostColor = highContrast
+                    ? textColor
+                    : Color.FromArgb(196, NativeUiTheme.Muted);
+                TextRenderer.DrawText(graphics, hostText, HostFont, hostRect, hostColor, titleFlags);
+                drewHostPill = true;
+            }
+        }
+
+        if (!drewHostPill)
+        {
+            var titleRect = new Rectangle(titleLeft, 0, availableTitleWidth, Height);
+            TextRenderer.DrawText(graphics, paneTitle, TitleFont, titleRect, textColor, titleFlags);
+        }
 
         if (!audioBounds.IsEmpty)
         {
@@ -601,6 +690,51 @@ internal sealed class PaneHeaderBar : Control
             ]);
         }
 
+        if (maximizeBounds.Width > 0)
+        {
+            if (maximizeHovered)
+            {
+                using var hoverPath = NativeUiTheme.CreateRoundedPath(maximizeBounds, 4f * scale);
+                using var hoverBrush = new SolidBrush(highContrast ? SystemColors.Highlight : NativeUiTheme.Hover);
+                graphics.FillPath(hoverBrush, hoverPath);
+            }
+            var glyphColor = isMaximized && !highContrast ? NativeUiTheme.Accent : textColor;
+            using var maxPen = new Pen(glyphColor, Math.Max(1.15f, 1.25f * scale))
+            {
+                StartCap = LineCap.Round,
+                EndCap = LineCap.Round,
+                LineJoin = LineJoin.Round
+            };
+            var cx = maximizeBounds.Left + (maximizeBounds.Width / 2f);
+            var cy = maximizeBounds.Top + (maximizeBounds.Height / 2f);
+            var half = 4.0f * scale;
+            var glyphRect = new RectangleF(cx - half, cy - half, half * 2f, half * 2f);
+            if (isMaximized)
+            {
+                // Restore grid glyph: rounded frame divided vertically.
+                using var framePath = NativeUiTheme.CreateRoundedPath(glyphRect, 1.8f * scale);
+                graphics.DrawPath(maxPen, framePath);
+                graphics.DrawLine(maxPen, cx, glyphRect.Top + 1f, cx, glyphRect.Bottom - 1f);
+            }
+            else
+            {
+                // Expand glyph: opposing top-right and bottom-left corner chevrons.
+                var arm = 2.8f * scale;
+                graphics.DrawLines(maxPen,
+                [
+                    new PointF(glyphRect.Right - arm, glyphRect.Top),
+                    new PointF(glyphRect.Right, glyphRect.Top),
+                    new PointF(glyphRect.Right, glyphRect.Top + arm)
+                ]);
+                graphics.DrawLines(maxPen,
+                [
+                    new PointF(glyphRect.Left + arm, glyphRect.Bottom),
+                    new PointF(glyphRect.Left, glyphRect.Bottom),
+                    new PointF(glyphRect.Left, glyphRect.Bottom - arm)
+                ]);
+            }
+        }
+
         if (closeBounds.Width > 0)
         {
             if (closeHovered)
@@ -653,10 +787,13 @@ internal sealed class PaneHeaderBar : Control
         closeBounds = Width >= buttonSize * 2 + (int)Math.Round(24 * scale)
             ? new Rectangle(closeRight - buttonSize, y, buttonSize, buttonSize)
             : Rectangle.Empty;
-        switchBounds = Width >= buttonSize * 3 + (int)Math.Round(32 * scale)
+        maximizeBounds = !closeBounds.IsEmpty && Width >= buttonSize * 3 + (int)Math.Round(32 * scale)
             ? new Rectangle(closeBounds.Left - buttonSize - gap, y, buttonSize, buttonSize)
             : Rectangle.Empty;
-        audioBounds = (isAudible || isMuted) && Width >= buttonSize * 4 + (int)Math.Round(40 * scale) && !switchBounds.IsEmpty
+        switchBounds = !maximizeBounds.IsEmpty && Width >= buttonSize * 4 + (int)Math.Round(40 * scale)
+            ? new Rectangle(maximizeBounds.Left - buttonSize - gap, y, buttonSize, buttonSize)
+            : Rectangle.Empty;
+        audioBounds = (isAudible || isMuted) && !switchBounds.IsEmpty && Width >= buttonSize * 5 + (int)Math.Round(48 * scale)
             ? new Rectangle(switchBounds.Left - buttonSize - gap, y, buttonSize, buttonSize)
             : Rectangle.Empty;
     }
@@ -665,14 +802,16 @@ internal sealed class PaneHeaderBar : Control
     {
         Audio,
         SwitchTab,
+        Maximize,
         Close
     }
 
     private List<HeaderActionKind> GetVisibleActions()
     {
-        var actions = new List<HeaderActionKind>(3);
+        var actions = new List<HeaderActionKind>(4);
         if (!audioBounds.IsEmpty) actions.Add(HeaderActionKind.Audio);
         if (!switchBounds.IsEmpty) actions.Add(HeaderActionKind.SwitchTab);
+        if (!maximizeBounds.IsEmpty) actions.Add(HeaderActionKind.Maximize);
         if (!closeBounds.IsEmpty) actions.Add(HeaderActionKind.Close);
         return actions;
     }
@@ -681,6 +820,7 @@ internal sealed class PaneHeaderBar : Control
     {
         HeaderActionKind.Audio => audioBounds,
         HeaderActionKind.SwitchTab => switchBounds,
+        HeaderActionKind.Maximize => maximizeBounds,
         HeaderActionKind.Close => closeBounds,
         _ => Rectangle.Empty
     };
@@ -695,6 +835,9 @@ internal sealed class PaneHeaderBar : Control
             case HeaderActionKind.SwitchTab:
                 PaneActivated?.Invoke(this, EventArgs.Empty);
                 TabSwitchRequested?.Invoke(this, PointToScreen(new Point(switchBounds.Left, Height)));
+                break;
+            case HeaderActionKind.Maximize:
+                MaximizeToggleRequested?.Invoke(this, EventArgs.Empty);
                 break;
             case HeaderActionKind.Close:
                 CloseRequested?.Invoke(this, EventArgs.Empty);
@@ -756,6 +899,9 @@ internal sealed class PaneHeaderBar : Control
         {
             HeaderActionKind.Audio => owner.isMuted ? $"Unmute pane {owner.PaneIndex + 1}" : $"Mute pane {owner.PaneIndex + 1}",
             HeaderActionKind.SwitchTab => $"Switch tab in pane {owner.PaneIndex + 1}",
+            HeaderActionKind.Maximize => owner.isMaximized
+                ? $"Restore pane grid from pane {owner.PaneIndex + 1}"
+                : $"Maximize pane {owner.PaneIndex + 1}",
             HeaderActionKind.Close => $"Close pane {owner.PaneIndex + 1}",
             _ => string.Empty
         };
@@ -764,6 +910,7 @@ internal sealed class PaneHeaderBar : Control
         {
             HeaderActionKind.Audio => owner.isMuted ? "Unmute" : "Mute",
             HeaderActionKind.SwitchTab => "Switch tab",
+            HeaderActionKind.Maximize => owner.isMaximized ? "Restore grid" : "Maximize",
             HeaderActionKind.Close => "Close",
             _ => "Press"
         };
@@ -925,10 +1072,49 @@ internal sealed class MultiViewSplitter : Control
 
     protected override void OnPaint(PaintEventArgs e)
     {
-        var color = SystemInformation.HighContrast
-            ? (dragging || hovered ? SystemColors.Highlight : SystemColors.WindowFrame)
-            : (dragging || hovered ? NativeUiTheme.Accent : NativeUiTheme.Border);
-        using var brush = new SolidBrush(color);
-        e.Graphics.FillRectangle(brush, ClientRectangle);
+        if (ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
+
+        var graphics = e.Graphics;
+        var hc = SystemInformation.HighContrast;
+        var active = dragging || hovered;
+        var trackColor = hc
+            ? (active ? SystemColors.Highlight : SystemColors.WindowFrame)
+            : (active ? Color.FromArgb(62, 24, 56) : NativeUiTheme.Border);
+        using (var trackBrush = new SolidBrush(trackColor))
+        {
+            graphics.FillRectangle(trackBrush, ClientRectangle);
+        }
+
+        var scale = Math.Max(1f, DeviceDpi / 96f);
+        var pillLength = (active ? 36f : 28f) * scale;
+        var pillThickness = (active ? 3f : 2f) * scale;
+        float pillW;
+        float pillH;
+        if (isVertical)
+        {
+            pillW = Math.Min(Math.Max(1f, ClientSize.Width - 1f), pillThickness);
+            pillH = Math.Min(Math.Max(4f, ClientSize.Height - 4f), pillLength);
+        }
+        else
+        {
+            pillW = Math.Min(Math.Max(4f, ClientSize.Width - 4f), pillLength);
+            pillH = Math.Min(Math.Max(1f, ClientSize.Height - 1f), pillThickness);
+        }
+
+        if (pillW >= 1f && pillH >= 1f)
+        {
+            var pillRect = new RectangleF(
+                (ClientSize.Width - pillW) / 2f,
+                (ClientSize.Height - pillH) / 2f,
+                pillW,
+                pillH);
+            var pillColor = hc
+                ? (active ? SystemColors.HighlightText : SystemColors.ControlText)
+                : (active ? NativeUiTheme.Accent : Color.FromArgb(170, 200, 166, 192));
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using var pillPath = NativeUiTheme.CreateRoundedPath(pillRect, Math.Min(pillW, pillH) / 2f);
+            using var pillBrush = new SolidBrush(pillColor);
+            graphics.FillPath(pillBrush, pillPath);
+        }
     }
 }

@@ -240,7 +240,23 @@ internal sealed class SearchSuggestionService
     {
         if (string.IsNullOrWhiteSpace(query)) return string.Empty;
         var trimmed = TextSafety.RemoveUnpairedSurrogates(query.Trim());
-        return trimmed.Length == 0 || trimmed.Length > 100 ? string.Empty : trimmed;
+        if (trimmed.Length == 0 || trimmed.Length > 100) return string.Empty;
+
+        // Never leak typed URLs, internal schemes, hosts, or IP addresses to a search suggest endpoint.
+        if (trimmed.Contains("://", StringComparison.Ordinal)
+            || trimmed.StartsWith("about:", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("edge:", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("chrome:", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("file:", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("javascript:", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("data:", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("misha:", StringComparison.OrdinalIgnoreCase)
+            || BrowserPolicy.IsRecognizedAddressInput(trimmed))
+        {
+            return string.Empty;
+        }
+
+        return trimmed;
     }
 
     private static string BuildCacheKey(string? providerId, string normalizedQuery)
@@ -271,11 +287,7 @@ internal sealed class SearchSuggestionService
                 {
                     if (totalRead >= maxBytes)
                     {
-                        var overflowProbe = new byte[1];
-                        var extra = await stream.ReadAsync(
-                            overflowProbe.AsMemory(0, 1),
-                            cancellationToken).ConfigureAwait(false);
-                        if (extra > 0)
+                        if (await HasOverflowByteAsync(stream, cancellationToken).ConfigureAwait(false))
                         {
                             ArrayPool<byte>.Shared.Return(buffer);
                             return (null, 0);
@@ -298,11 +310,7 @@ internal sealed class SearchSuggestionService
 
                 if (totalRead == maxBytes)
                 {
-                    var overflowProbe = new byte[1];
-                    var extra = await stream.ReadAsync(
-                        overflowProbe.AsMemory(0, 1),
-                        cancellationToken).ConfigureAwait(false);
-                    if (extra > 0)
+                    if (await HasOverflowByteAsync(stream, cancellationToken).ConfigureAwait(false))
                     {
                         ArrayPool<byte>.Shared.Return(buffer);
                         return (null, 0);
@@ -318,6 +326,22 @@ internal sealed class SearchSuggestionService
         }
     }
 
+    private static async Task<bool> HasOverflowByteAsync(Stream stream, CancellationToken cancellationToken)
+    {
+        var probe = ArrayPool<byte>.Shared.Rent(1);
+        try
+        {
+            var extra = await stream.ReadAsync(
+                probe.AsMemory(0, 1),
+                cancellationToken).ConfigureAwait(false);
+            return extra > 0;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(probe);
+        }
+    }
+
     private static string[] ParseSuggestions(JsonElement root)
     {
         if (root.ValueKind != JsonValueKind.Array || root.GetArrayLength() < 2)
@@ -326,7 +350,7 @@ internal sealed class SearchSuggestionService
         }
 
         var itemsElement = root[1];
-        if (itemsElement.ValueKind != JsonValueKind.Array)
+        if (itemsElement.ValueKind != JsonValueKind.Array || itemsElement.GetArrayLength() == 0)
         {
             return Array.Empty<string>();
         }
@@ -358,20 +382,22 @@ internal sealed class SearchSuggestionService
                     }
                 }
 
-                while (cache.Count >= MaximumCacheEntries)
+                if (cache.Count >= MaximumCacheEntries)
                 {
-                    string? oldestKey = null;
-                    var oldestTime = DateTimeOffset.MaxValue;
+                    // Batch-evict the oldest quarter so subsequent inserts do not re-scan every time.
+                    var targetCount = Math.Max(1, MaximumCacheEntries - Math.Max(16, MaximumCacheEntries / 4));
+                    var toEvictCount = cache.Count - targetCount + 1;
+                    var ordered = new List<(string Key, DateTimeOffset FetchedAt)>(cache.Count);
                     foreach (var entry in cache)
                     {
-                        if (entry.Value.FetchedAt < oldestTime)
-                        {
-                            oldestTime = entry.Value.FetchedAt;
-                            oldestKey = entry.Key;
-                        }
+                        ordered.Add((entry.Key, entry.Value.FetchedAt));
                     }
-                    if (oldestKey is null) break;
-                    cache.TryRemove(oldestKey, out _);
+                    ordered.Sort(static (left, right) => left.FetchedAt.CompareTo(right.FetchedAt));
+                    var removeLimit = Math.Min(toEvictCount, ordered.Count);
+                    for (var i = 0; i < removeLimit; i++)
+                    {
+                        cache.TryRemove(ordered[i].Key, out _);
+                    }
                 }
             }
 

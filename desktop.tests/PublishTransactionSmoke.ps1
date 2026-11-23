@@ -88,6 +88,7 @@ foreach ($functionName in @(
     'Move-OneClickRelease',
     'Move-FolderRelease',
     'Get-FileRecord',
+    'Get-ReleaseMetadata',
     'Add-ReleaseMetadata'
 )) {
     Import-AstFunction -Ast $publishAst -FunctionName $functionName
@@ -369,6 +370,19 @@ try {
     if ($hasBuiltExe) {
         $verifiedOut = Invoke-RealTestReleaseOutput -OutputPath $validationDir -Definition $fdDefinition
         Assert-True -Condition ($verifiedOut.Bytes -gt 0 -and $verifiedOut.Sha256 -match '^[0-9a-f]{64}$') -Message 'Real Test-ReleaseOutput positive check failed.'
+
+        # Post-move fast verification (presence + byte length without full re-hash)
+        $postMoveOut = Invoke-RealTestReleaseOutput -OutputPath $validationDir -Definition $fdDefinition -StagingValidation $verifiedOut
+        Assert-True -Condition ($postMoveOut.Bytes -eq $verifiedOut.Bytes -and $postMoveOut.Sha256 -eq $verifiedOut.Sha256) -Message 'Post-move fast verification failed on intact release.'
+
+        $noticePathForSizeCheck = Join-Path $validationDir 'THIRD-PARTY-NOTICES.txt'
+        $origNoticeForSizeCheck = Get-Content -Raw -LiteralPath $noticePathForSizeCheck
+        Set-Content -NoNewline -LiteralPath $noticePathForSizeCheck -Value ($origNoticeForSizeCheck + 'x')
+        Assert-Throws `
+            -Action { [void](Invoke-RealTestReleaseOutput -OutputPath $validationDir -Definition $fdDefinition -StagingValidation $verifiedOut) } `
+            -Message 'Post-move fast verification accepted a size-drifted file.' `
+            -Pattern 'Post-move size mismatch'
+        Set-Content -NoNewline -LiteralPath $noticePathForSizeCheck -Value $origNoticeForSizeCheck
     }
 
     # Tamper sha256
@@ -429,7 +443,7 @@ try {
     Assert-Throws -Action { [void](Assert-ValidGitHubRepoUrl -Url 'https://user:pass@github.com/MishaelOliva/browser-engine') } -Message 'Accepted RepoUrl with credentials.'
     Assert-Throws -Action { [void](Assert-ValidGitHubRepoUrl -Url 'https://github.com/MishaelOliva/browser-engine?foo=bar') } -Message 'Accepted RepoUrl with query.'
 
-    Assert-True -Condition ((Assert-ValidGitRef -Ref 'v2.5.0' -Label 'ReleaseTag') -eq 'v2.5.0') -Message 'Assert-ValidGitRef rejected v2.5.0.'
+    Assert-True -Condition ((Assert-ValidGitRef -Ref 'v2.6.0' -Label 'ReleaseTag') -eq 'v2.6.0') -Message 'Assert-ValidGitRef rejected v2.6.0.'
     Assert-Throws -Action { [void](Assert-ValidGitRef -Ref '../evil' -Label 'Branch') } -Message 'Accepted traversal in git ref.'
     Assert-Throws -Action { [void](Assert-ValidGitRef -Ref 'main;calc' -Label 'Branch') } -Message 'Accepted shell metacharacters in git ref.'
 
@@ -442,7 +456,62 @@ try {
     Assert-True -Condition ($batText -match 'MISHAWEB_CLI_ARGS=%\*') -Message 'Install-MishaWeb.bat does not forward %* via MISHAWEB_CLI_ARGS.'
     Assert-True -Condition ($batText -notmatch 'raw\.githubusercontent\.com/.+/(main|master)/') -Message 'Install-MishaWeb.bat still references unpinned main/master branch URLs.'
 
-    Write-Host 'PASS: Publish transaction, stale backup sweep, Test-ReleaseOutput, and Install-MishaWeb guards verified.'
+    # 6. Installer ReleaseTag & package version drift gate checks
+    $sourceProjectPath = Join-Path $sourceRepositoryRoot 'desktop\MishaWeb.csproj'
+    $sourcePackagePath = Join-Path $sourceRepositoryRoot 'package.json'
+    $liveMeta = Get-ReleaseMetadata `
+        -ProjectPath $sourceProjectPath `
+        -PackagePath $sourcePackagePath `
+        -InstallScriptPath $installScriptPath `
+        -InstallBatPath $installBatPath
+    Assert-True `
+        -Condition ($liveMeta.ExpectedReleaseTag -eq "v$($liveMeta.ProductVersion)") `
+        -Message 'Get-ReleaseMetadata did not return matching ExpectedReleaseTag.'
+
+    $driftDir = Join-Path $script:fixtureRoot 'release-tag-drift'
+    New-Item -ItemType Directory -Path $driftDir | Out-Null
+    $driftedPs1 = Join-Path $driftDir 'Install-MishaWeb.ps1'
+    $driftedBat = Join-Path $driftDir 'Install-MishaWeb.bat'
+    $driftedPkg = Join-Path $driftDir 'package.json'
+
+    Set-Content -NoNewline -LiteralPath $driftedPs1 -Value ($installText -replace "ReleaseTag\s*=\s*'[^']+'", "ReleaseTag = 'v0.0.1'")
+    Assert-Throws `
+        -Action {
+            [void](Get-ReleaseMetadata `
+                -ProjectPath $sourceProjectPath `
+                -PackagePath $sourcePackagePath `
+                -InstallScriptPath $driftedPs1 `
+                -InstallBatPath $installBatPath)
+        } `
+        -Message 'Get-ReleaseMetadata accepted mismatched Install-MishaWeb.ps1 ReleaseTag.' `
+        -Pattern 'Install-MishaWeb\.ps1 default ReleaseTag'
+
+    Set-Content -NoNewline -LiteralPath $driftedBat -Value ($batText -replace 'DEFAULT_RELEASE_TAG=[^"]+', 'DEFAULT_RELEASE_TAG=v0.0.1')
+    Assert-Throws `
+        -Action {
+            [void](Get-ReleaseMetadata `
+                -ProjectPath $sourceProjectPath `
+                -PackagePath $sourcePackagePath `
+                -InstallScriptPath $installScriptPath `
+                -InstallBatPath $driftedBat)
+        } `
+        -Message 'Get-ReleaseMetadata accepted mismatched Install-MishaWeb.bat DEFAULT_RELEASE_TAG.' `
+        -Pattern 'Install-MishaWeb\.bat DEFAULT_RELEASE_TAG'
+
+    $pkgText = Get-Content -Raw -LiteralPath $sourcePackagePath
+    Set-Content -NoNewline -LiteralPath $driftedPkg -Value ($pkgText -replace '"version"\s*:\s*"[^"]+"', '"version": "0.0.1"')
+    Assert-Throws `
+        -Action {
+            [void](Get-ReleaseMetadata `
+                -ProjectPath $sourceProjectPath `
+                -PackagePath $driftedPkg `
+                -InstallScriptPath $installScriptPath `
+                -InstallBatPath $installBatPath)
+        } `
+        -Message 'Get-ReleaseMetadata accepted mismatched package.json version.' `
+        -Pattern 'package\.json version'
+
+    Write-Host 'PASS: Publish transaction, stale backup sweep, Test-ReleaseOutput, ReleaseTag drift gate, and Install-MishaWeb guards verified.'
 }
 finally {
     $safeFixtureRoot = [System.IO.Path]::GetFullPath($script:fixtureRoot).TrimEnd('\', '/')

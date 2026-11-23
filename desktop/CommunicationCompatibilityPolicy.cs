@@ -96,7 +96,21 @@ internal static class CommunicationCompatibilityPolicy
         if (!TryGetProvider(topLevelUrl, out var provider)) return false;
 
         if (string.IsNullOrWhiteSpace(requestUrl)
-            || !Uri.TryCreate(requestUrl, UriKind.Absolute, out var requestUri)
+            || (!requestUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+                && !requestUrl.StartsWith("wss://", StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        if (TryExtractSimpleAsciiHost(requestUrl, out var quickRequestHost))
+        {
+            if (!MatchesAnyProviderHost(quickRequestHost, ProviderTransportHosts[provider]))
+            {
+                return false;
+            }
+        }
+
+        if (!Uri.TryCreate(requestUrl, UriKind.Absolute, out var requestUri)
             || requestUri.Scheme is not ("https" or "wss"))
         {
             return false;
@@ -133,12 +147,38 @@ internal static class CommunicationCompatibilityPolicy
             return false;
         }
 
-        if (allowBlob && url.StartsWith("blob:", StringComparison.OrdinalIgnoreCase))
+        var candidate = url.AsSpan();
+        if (allowBlob && candidate.StartsWith("blob:", StringComparison.OrdinalIgnoreCase))
         {
-            url = url[5..];
+            candidate = candidate[5..];
         }
 
-        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)
+        if (!candidate.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // Fast-reject non-call-site ASCII hosts before allocating a Uri.
+        if (TryExtractSimpleAsciiHost(candidate, out var quickHost))
+        {
+            var matchedQuickProvider = -1;
+            for (var providerIndex = 0; providerIndex < ProviderHosts.Length; providerIndex++)
+            {
+                if (MatchesAnyProviderHost(quickHost, ProviderHosts[providerIndex]))
+                {
+                    matchedQuickProvider = providerIndex;
+                    break;
+                }
+            }
+
+            if (matchedQuickProvider < 0)
+            {
+                return false;
+            }
+        }
+
+        var uriInput = candidate.Length == url.Length ? url : candidate.ToString();
+        if (!Uri.TryCreate(uriInput, UriKind.Absolute, out var uri)
             || uri.Scheme != Uri.UriSchemeHttps
             || string.IsNullOrWhiteSpace(uri.Host))
         {
@@ -156,6 +196,38 @@ internal static class CommunicationCompatibilityPolicy
         }
 
         return false;
+    }
+
+    private static bool TryExtractSimpleAsciiHost(ReadOnlySpan<char> url, out ReadOnlySpan<char> host)
+    {
+        host = default;
+        var schemeEnd = url.IndexOf("://", StringComparison.Ordinal);
+        if (schemeEnd < 0) return false;
+        var authorityStart = schemeEnd + 3;
+        if (authorityStart >= url.Length) return false;
+
+        var authorityEnd = url.Length;
+        for (var i = authorityStart; i < url.Length; i++)
+        {
+            var c = url[i];
+            if (c is '/' or '?' or '#')
+            {
+                authorityEnd = i;
+                break;
+            }
+            if (c is '@' or '[' or ']' or '\\' or '%' || c <= 0x20 || c >= 0x7F)
+            {
+                return false;
+            }
+        }
+
+        var authority = url[authorityStart..authorityEnd];
+        var colonIndex = authority.IndexOf(':');
+        var rawHost = colonIndex >= 0 ? authority[..colonIndex] : authority;
+        rawHost = rawHost.TrimEnd('.');
+        if (rawHost.IsEmpty) return false;
+        host = rawHost;
+        return true;
     }
 
     private static bool MatchesAnyProviderHost(ReadOnlySpan<char> host, string[] roots)

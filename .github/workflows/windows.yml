@@ -41,20 +41,41 @@ jobs:
       - name: Check vulnerable NuGet packages
         shell: pwsh
         run: |
-          $vulnOutput = dotnet list desktop/MishaWeb.csproj package --vulnerable --include-transitive 2>&1 | Out-String
+          $vulnOutput = dotnet list desktop/MishaWeb.csproj package --vulnerable --include-transitive --format json | Out-String
           Write-Host $vulnOutput
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if ($vulnOutput -match 'has the following vulnerable packages') {
-            throw 'Vulnerable NuGet packages detected.'
+          $vulnJson = $vulnOutput | ConvertFrom-Json
+          if ($vulnJson.PSObject.Properties.Name -contains 'problems') {
+            $errors = @($vulnJson.problems | Where-Object { $_ -and $_.level -eq 'error' })
+            if ($errors.Count -gt 0) {
+              throw ('NuGet vulnerability check reported errors: ' + (($errors | ForEach-Object { $_.text }) -join '; '))
+            }
+          }
+          $vulnerable = @()
+          foreach ($project in @($vulnJson.projects)) {
+            if ($null -eq $project -or -not ($project.PSObject.Properties.Name -contains 'frameworks')) { continue }
+            foreach ($framework in @($project.frameworks)) {
+              foreach ($listName in @('topLevelPackages', 'transitivePackages')) {
+                if (-not ($framework.PSObject.Properties.Name -contains $listName)) { continue }
+                foreach ($pkg in @($framework.$listName)) {
+                  if ($pkg -and ($pkg.PSObject.Properties.Name -contains 'vulnerabilities') -and @($pkg.vulnerabilities).Count -gt 0) {
+                    $vulnerable += "$($pkg.id) $($pkg.resolvedVersion)"
+                  }
+                }
+              }
+            }
+          }
+          if ($vulnerable.Count -gt 0) {
+            throw ('Vulnerable NuGet packages detected: ' + ($vulnerable -join ', '))
           }
 
       - name: Strict build
         shell: pwsh
-        run: dotnet build desktop.tests/MishaWeb.SmokeTests.csproj --configuration Release --no-restore --warnaserror -p:ContinuousIntegrationBuild=true
+        run: dotnet build desktop.tests/MishaWeb.SmokeTests.csproj -c Release --no-restore --warnaserror -p:ContinuousIntegrationBuild=true
 
       - name: Smoke and policy tests
         shell: pwsh
-        run: dotnet run --project desktop.tests/MishaWeb.SmokeTests.csproj --configuration Release --no-build --no-restore
+        run: dotnet run --project desktop.tests/MishaWeb.SmokeTests.csproj -c Release --no-build --no-restore
 
       - name: Set up pinned Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -63,18 +84,7 @@ jobs:
 
       - name: Node contract and script tests
         shell: pwsh
-        run: |
-          $tests = @(
-            'desktop.tests/ProbeLaunchContract.test.mjs',
-            'desktop.tests/MemoryChurnAnalysis.test.mjs',
-            'desktop.tests/MemoryAcceptanceProbe.test.mjs',
-            'desktop.tests/ReaderModeScript.test.mjs',
-            'desktop.tests/AdBlockDocumentScript.test.mjs'
-          )
-          foreach ($test in $tests) {
-            node $test
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+        run: npm run desktop:test:node
 
       - name: Publish and installer script checks
         shell: powershell

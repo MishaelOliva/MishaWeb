@@ -1,35 +1,35 @@
 # MishaWeb
 
-MishaWeb 2.5.1 is a compact native Windows browser built with WinForms and the installed Microsoft Edge WebView2 Runtime. It has no frontend framework, background service, telemetry client, or bundled browser engine.
+MishaWeb 2.6.0 is a compact native Windows browser built with WinForms and the installed Microsoft Edge WebView2 Runtime. It has no frontend framework, background service, telemetry client, or bundled browser engine.
 
 ## Highlights
 
-- Renderer-free native start page with search, three focused continue cards, and a modern bunny night-garden backdrop inspired by v1
-- New generated kawaii bunny identity shared by the start page, title bar, executable, and Windows shell icon sizes, with a native high-contrast fallback
-- One optimized 275 KB static backdrop and one compact embedded logo, each decoded once and shared; a bounded 24-bit viewport frame lets child surfaces copy exact background slices without repeated JPEG scaling, reuses the frame across start-page tab switches, and releases it when the last page is hidden, minimized, or disposed
-- Modern captionless deep-berry frame with blush-pink/orchid accents, several cute bunny motifs, vector window controls, and accessible tab controls
-- Native smart command bar with local favorites/history suggestions and a consistent Google search action
-- Allocation-light local suggestion index that rebuilds only when favorites, history, dismissals, or learned ranking data changes
-- Responsive low-glare toolbar, tabs, menus, and focus states
-- Tabs, middle-click close, duplicate/close-others menu, reopen-closed-tab, per-tab site favicons, clickable tab-header audio mute indicators, and Picture-in-Picture support
-- Multi-View workspace (`Single`, `Split`, `Tri`, `Quad`) with draggable horizontal and vertical splitters, per-pane header bars, unique pane-to-tab assignment, and persisted split ratios
-- Text-only command palette with bounded local ranking, MRU tab switching, and persistent pinned tabs
-- Native named sessions, restart-persistent recently closed tabs, unclean-shutdown tab restoration prompt, and lazy 64-tab session restoration
+- Renderer-free native Start Page 2.0 with smart search (inline error feedback and clear button), a responsive 6-tile quick-link grid with vector brand icons and middle/Ctrl+click new-tab opening, a live status pill bar, and a bunny night-garden backdrop
+- Kawaii bunny identity shared by the start page, title bar, executable, and Windows shell icon sizes (optimized 110 KB multi-size `.ico`), with a native high-contrast fallback
+- One optimized 201 KB static backdrop and one compact embedded logo, each decoded once and shared; a bounded 24-bit viewport frame lets child surfaces copy exact background slices without repeated JPEG scaling, releases the full-resolution source bitmap after 3 seconds idle on all machines, and clears the frame cache when hidden, minimized, or disposed
+- Liquid Glass captionless deep-berry frame with clipped specular highlights, rounded caption hover pills, per-monitor DPI scaling, clickable Incognito badge, and compact icon-only pinned tabs with bottom loading bars
+- Native smart command bar with local favorites/history/open-tab suggestions (retaining up to three local matches when live search arrives) and a consistent Google search action
+- Allocation-light local suggestion index with $O(1)$ state-revision checks that avoids sending typed URLs or IP addresses to external suggest endpoints
+- Responsive low-glare toolbar, tabs, lazily populated menus, and focus states
+- Tabs, middle-click close, duplicate/close-others menu, reopen-closed-tab, cached per-tab site favicons, clickable tab-header audio mute indicators, and Picture-in-Picture support
+- Multi-View 2.0 workspace (`Single`, `Split`, `Tri`, `Quad`) with 6px grab-pill splitters, per-pane header bars with domain pills and Maximize/Restore buttons, live drag drop-zone previews, compact non-clipping overlays, unique pane-to-tab assignment, and persisted split ratios
+- Text-only command palette with stable keyboard focus, MRU tab switching, and persistent pinned tabs
+- Native named sessions, restart-persistent recently closed tabs, unclean-shutdown tab restoration prompt, and direct-discarded background tabs during lazy 64-tab session restoration
 - Bare-domain, localhost, IP-address, and search-aware address parsing
-- Back, forward, reload/stop, home, in-page find, zoom, and fullscreen
+- Back, forward, reload/stop, home, in-page find with zero-match alert tint, zoom, and fullscreen
 - Exact-origin microphone and camera controls, voice and audio input/output settings with strict whitelist policies, saved-permission management, and Windows device/privacy-settings shortcuts
 - Explicit clean-link copy, link-context cleanup, and address-bar Paste and go
-- On-demand dependency-free reader mode and manual tab unloading
+- On-demand dependency-free Reader Mode 2.0 (single-pass extraction, lazy-image promotion, editorial header, collapsible table of contents, and GPU-composited reading progress bar) and manual tab unloading
 - Favorites plus a capped, local browsing-history list
-- Three ordered pinned quick links, with local filtering and management in **Saved items…**
-- Searchable tab switcher and a saved-items dialog that never loads WebView2 or favicons
+- Six ordered pinned quick links, with local filtering, renaming, and management in **Saved items…**
+- Searchable tab switcher with favicons and state tags, plus a saved-items dialog that never loads WebView2
 - Private windows with isolated WebView2 InPrivate profiles and no MishaWeb-managed history, favorites, pins, extensions, or session persistence
-- Anchored site information and exact-host shield exceptions with reload guidance
-- Adaptive download popup with pause/resume, open, reveal, cancel, copy-address, remove, and folder actions, plus a non-activating download notification toast below the toolbar Downloads button, high-risk executable prompts, and persisted recent download history
-- Native browser-extension manager with Chrome Web Store URL/ID import, local CRX/ZIP and unpacked-package loading, enable/disable, removal, and popup/options access
+- Anchored site information with blocked-request category breakdown (`Ads`, `Trackers`, `Privacy`, `Scripts`), top blocked domains, and exact-host shield exceptions with reload guidance
+- Adaptive download popup with pause/resume, open, reveal, cancel, copy-address, remove, and folder actions, plus a non-activating download notification toast with live transfer speed (`KB/s`, `MB/s`), high-risk executable prompts, and persisted recent download history
+- Native browser-extension manager with active-profile reuse, in-place card updates, Chrome Web Store URL/ID import, local CRX/ZIP and unpacked-package loading, enable/disable, removal, folder/Store/ID actions, and popup/options access
 - Native print support and PNG viewport capture without an extra renderer or capture library
 - Balanced WebView2 tracking prevention plus EasyList, EasyPrivacy, uBO, and Brave-aligned network and cosmetic filtering
-- Bounded blocker URI/suffix caches, binary compiled-rule snapshot cache (`compiled-rules-v1.bin`), per-request rule attribution, allocation-free candidate traversal, compile diagnostics, and conditional HTTP list refresh
+- Compact 40-byte `FilterRule` storage, rolling-hash candidate indexing, cached full cosmetic wrapper scripts, binary compiled-rule snapshot cache (`compiled-rules-v1.bin`), per-request rule attribution, compile diagnostics, and conditional HTTP list refresh
 - Document-start YouTube protection for first-party player ad metadata, feed/player cosmetics, skip controls, and guarded SSAP markers
 - Standard Memory Saver keeps the three most recently used ordinary sites ready without automatic discard or reload, then releases older inactive pages on a bounded schedule
 - Ultra-light may suspend those three recent sites without refreshing them, while discard-first pressure handling trims only older eligible pages and skips audible, downloading, and explicitly protected work
@@ -146,7 +146,7 @@ npm run desktop:portable  # larger self-contained output in desktop/portable
 
 Dependencies are restored from committed NuGet lock files. All three publish commands run the strict build and smoke suite first, publish into a unique staging directory, reject anything outside the expected single-file payload, and only then replace the destination. This prevents a successful release from retaining files left by an older build.
 
-Each release includes `MishaWeb.release.json`, `MishaWeb.sha256`, and the applicable third-party notices. The manifest records the target, deployment model, executable version, byte size, SHA-256 hashes, and Authenticode status; validation is repeated after the staged output is promoted. Use `npm run desktop:verify-publish` or `npm run desktop:verify-portable` to recheck an existing output without rebuilding it.
+Each release includes `MishaWeb.release.json`, `MishaWeb.sha256`, and the applicable third-party notices. The manifest records the target, deployment model, executable version, byte size, SHA-256 hashes, and Authenticode status. Staging output receives full SHA-256 verification before promotion, file presence and byte lengths are re-verified after promotion, and `build/Publish-MishaWeb.ps1` verifies that `package.json`, `build/Install-MishaWeb.ps1`, and `Install-MishaWeb.bat` match the project version before publishing. Use `npm run desktop:verify-publish` or `npm run desktop:verify-portable` to repeat full SHA-256 validation on an existing output without rebuilding it.
 
 CI performs a locked restore, warning-as-error build, smoke suite, clean publish of both deployment models, manifest/hash verification, and artifact upload on Windows.
 

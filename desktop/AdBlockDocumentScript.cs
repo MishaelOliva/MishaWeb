@@ -16,7 +16,7 @@ internal static class AdBlockDocumentScript
         "youtube.com", "youtube-nocookie.com", "youtubekids.com"
     ];
 
-    public const string UniversalBootstrapSource =
+    public static readonly string UniversalBootstrapSource =
         """
         (() => {
             const styleId = '__misha_adblock_style';
@@ -45,13 +45,13 @@ internal static class AdBlockDocumentScript
         })();
         """;
 
-    private const string SharedYouTubeBootstrapPrefix =
+    private static readonly string SharedYouTubeBootstrapPrefix =
         """
             const styleId = '__misha_adblock_style';
             const remoteStyleId = '__misha_adblock_remote_style';
         """;
 
-    private const string SharedYouTubeBody =
+    private static readonly string SharedYouTubeBody =
         """
             const isYouTubeHost = value => value === 'youtube.com'
                 || value.endsWith('.youtube.com')
@@ -160,74 +160,7 @@ internal static class AdBlockDocumentScript
                 };
         """;
 
-    public static readonly string Source =
-        "(() => {\n"
-        + SharedYouTubeBootstrapPrefix
-        + "\n"
-        + """
-            const controlChannel = '__MISHA_ADBLOCK_CONTROL_CHANNEL__';
-            let enabledForDocument = window.__mishaAdBlockEnabled !== false;
-            let stopYouTubeRuntime = () => {};
-            let syncYouTubeRecoveryMask = () => {};
-            const bootstrapObservers = [];
-            const stopBootstrapObservers = () => {
-                for (const observer of bootstrapObservers) observer.disconnect();
-                bootstrapObservers.length = 0;
-            };
-            const isEnabled = () => enabledForDocument;
-            const disableForDocument = () => {
-                enabledForDocument = false;
-                stopBootstrapObservers();
-                stopYouTubeRuntime();
-                document.getElementById(styleId)?.remove();
-                document.getElementById(remoteStyleId)?.remove();
-            };
-            try {
-                // The setter is deliberately inert: this property is writable from
-                // page script, and a live setter would let any site turn the
-                // shield off for itself. The host reaches the runtime through the
-                // private control channel instead, and the site-exception policy
-                // script is registered before this one so its assignment to false
-                // is observed by the enabledForDocument initializer above.
-                Object.defineProperty(window, '__mishaAdBlockEnabled', {
-                    configurable: false,
-                    enumerable: false,
-                    get: () => enabledForDocument,
-                    set: () => {}
-                });
-            } catch (_) { }
-            window.addEventListener(controlChannel, disableForDocument);
-        """
-        + "\n"
-        + SharedYouTubeBody
-        + "\n"
-        + SharedYouTubeTrailer;
-
-    public const string YouTubeRuntimeSource =
-        "(() => {\n"
-        + SharedYouTubeBootstrapPrefix
-        + "\n"
-        + """
-            let stopYouTubeRuntime = () => {};
-            let syncYouTubeRecoveryMask = () => {};
-            const bootstrapObservers = [];
-            const stopBootstrapObservers = () => {
-                for (const observer of bootstrapObservers) observer.disconnect();
-                bootstrapObservers.length = 0;
-            };
-            const controlChannel = '__MISHA_ADBLOCK_CONTROL_CHANNEL__';
-            const isEnabled = () => window.__mishaAdBlockEnabled !== false;
-            window.addEventListener(controlChannel, () => {
-                stopBootstrapObservers();
-                stopYouTubeRuntime();
-            });
-        """
-        + "\n"
-        + SharedYouTubeBody
-        + "\n"
-        + SharedYouTubeTrailer;
-
-    private const string SharedYouTubeTrailer =
+    private static readonly string SharedYouTubeTrailer =
         """
                 const isYouTubeWatch = () => host === 'www.youtube.com'
                     && location.pathname === '/watch';
@@ -328,7 +261,9 @@ internal static class AdBlockDocumentScript
             const sanitizedObjects = new WeakSet();
             const skippedSanitizeKeys = new Set([
                 'adaptiveFormats', 'formats', 'storyboards', 'thumbnails',
-                'captions', 'heatmap', 'playerConfig'
+                'captions', 'heatmap', 'playerConfig',
+                'microformat', 'frameworkUpdates', 'attestation',
+                'endscreen', 'cards', 'annotations'
             ]);
 
             const sanitize = value => {
@@ -425,8 +360,10 @@ internal static class AdBlockDocumentScript
                 return obj;
             };
 
+            const payloadSanitizeSignal = /"(?:adPlacements|playerAds|adSlots|adBreak|instreamAd|instreamVideoAdRenderer|playerAdParams|adLayoutLoggingData|paidContentOverlayRenderer|adSlotRenderer|adPlacement|adSafetyReason|linearAdSequenceRenderer|playerLegacyDesktopWatchAdsRenderer|videoAdRenderer|adEngagementPanelContent|adsEngagementPanelContentRenderer|adClientParams|playabilityStatus)"/;
             const sanitizePayload = value => {
                 if (!isEnabled() || typeof value !== 'string') return value;
+                if (!payloadSanitizeSignal.test(value)) return value;
                 try {
                     const parsed = JSON.parse(value);
                     const sanitized = sanitize(parsed);
@@ -1978,7 +1915,14 @@ internal static class AdBlockDocumentScript
                     return;
                 }
                 const player = document.getElementById('movie_player');
-                hookVideoElement(document.querySelector('video.html5-main-video, video'));
+                if (player) {
+                    hookVideoElement(player.querySelector?.('video.html5-main-video, video')
+                        || document.querySelector('video.html5-main-video, video'));
+                } else if (!observedPlayer) {
+                    return;
+                } else {
+                    hookVideoElement(document.querySelector('video.html5-main-video, video'));
+                }
                 if (player === observedPlayer) return;
                 playerObserver?.disconnect();
                 observedPlayer = player;
@@ -1991,14 +1935,29 @@ internal static class AdBlockDocumentScript
                     queueUrgentCleanup();
                 }
             };
+            let playerBootstrapQueued = false;
             const startPlayerBootstrapObservation = () => {
                 if (!isEnabled() || observedPlayer || playerBootstrapObserver
                     || !document.documentElement || !isYouTubeWatch()) return;
                 playerBootstrapObserver = new MutationObserver(() => {
-                    observePlayer();
-                    if (observedPlayer) {
-                        cleanPlayerAds();
-                        queueCleanup();
+                    if (playerBootstrapQueued) return;
+                    playerBootstrapQueued = true;
+                    const runBootstrapCheck = () => {
+                        playerBootstrapQueued = false;
+                        if (!isEnabled() || observedPlayer) {
+                            stopPlayerBootstrapObservation();
+                            return;
+                        }
+                        observePlayer();
+                        if (observedPlayer) {
+                            cleanPlayerAds();
+                            queueCleanup();
+                        }
+                    };
+                    if (typeof queueMicrotask === 'function') {
+                        queueMicrotask(runBootstrapCheck);
+                    } else {
+                        runBootstrapCheck();
                     }
                 });
                 playerBootstrapObserver.observe(document.documentElement, {
@@ -2191,4 +2150,71 @@ internal static class AdBlockDocumentScript
             void remoteStyleId;
         })();
         """;
+
+    public static readonly string Source =
+        "(() => {\n"
+        + SharedYouTubeBootstrapPrefix
+        + "\n"
+        + """
+            const controlChannel = '__MISHA_ADBLOCK_CONTROL_CHANNEL__';
+            let enabledForDocument = window.__mishaAdBlockEnabled !== false;
+            let stopYouTubeRuntime = () => {};
+            let syncYouTubeRecoveryMask = () => {};
+            const bootstrapObservers = [];
+            const stopBootstrapObservers = () => {
+                for (const observer of bootstrapObservers) observer.disconnect();
+                bootstrapObservers.length = 0;
+            };
+            const isEnabled = () => enabledForDocument;
+            const disableForDocument = () => {
+                enabledForDocument = false;
+                stopBootstrapObservers();
+                stopYouTubeRuntime();
+                document.getElementById(styleId)?.remove();
+                document.getElementById(remoteStyleId)?.remove();
+            };
+            try {
+                // The setter is deliberately inert: this property is writable from
+                // page script, and a live setter would let any site turn the
+                // shield off for itself. The host reaches the runtime through the
+                // private control channel instead, and the site-exception policy
+                // script is registered before this one so its assignment to false
+                // is observed by the enabledForDocument initializer above.
+                Object.defineProperty(window, '__mishaAdBlockEnabled', {
+                    configurable: false,
+                    enumerable: false,
+                    get: () => enabledForDocument,
+                    set: () => {}
+                });
+            } catch (_) { }
+            window.addEventListener(controlChannel, disableForDocument);
+        """
+        + "\n"
+        + SharedYouTubeBody
+        + "\n"
+        + SharedYouTubeTrailer;
+
+    public static readonly string YouTubeRuntimeSource =
+        "(() => {\n"
+        + SharedYouTubeBootstrapPrefix
+        + "\n"
+        + """
+            let stopYouTubeRuntime = () => {};
+            let syncYouTubeRecoveryMask = () => {};
+            const bootstrapObservers = [];
+            const stopBootstrapObservers = () => {
+                for (const observer of bootstrapObservers) observer.disconnect();
+                bootstrapObservers.length = 0;
+            };
+            const controlChannel = '__MISHA_ADBLOCK_CONTROL_CHANNEL__';
+            const isEnabled = () => window.__mishaAdBlockEnabled !== false;
+            window.addEventListener(controlChannel, () => {
+                stopBootstrapObservers();
+                stopYouTubeRuntime();
+            });
+        """
+        + "\n"
+        + SharedYouTubeBody
+        + "\n"
+        + SharedYouTubeTrailer;
 }

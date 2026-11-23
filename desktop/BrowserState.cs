@@ -1,8 +1,32 @@
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace MishaWeb;
+
+[Flags]
+internal enum BrowserStateDirtySections
+{
+    None = 0,
+    Bookmarks = 1 << 0,
+    History = 1 << 1,
+    PinnedStartPageLinks = 1 << 2,
+    NamedSessions = 1 << 3,
+    RecentlyClosed = 1 << 4,
+    SiteZoom = 1 << 5,
+    MutedHosts = 1 << 6,
+    AllowedAudioHosts = 1 << 7,
+    AllowedMicrophoneHosts = 1 << 8,
+    BlockedMicrophoneHosts = 1 << 9,
+    AdBlockExceptionHosts = 1 << 10,
+    DismissedSuggestionUrls = 1 << 11,
+    SuggestionUsage = 1 << 12,
+    KeepAwakeHosts = 1 << 13,
+    RecentDownloads = 1 << 14,
+    DarkModeExcludedHosts = 1 << 15,
+    All = ~0
+}
 
 [JsonSourceGenerationOptions(WriteIndented = false)]
 [JsonSerializable(typeof(BrowserState))]
@@ -13,6 +37,25 @@ internal sealed partial class BrowserStateJsonContext : JsonSerializerContext;
 
 internal sealed class BrowserState
 {
+    internal long StateRevision { get; private set; }
+    internal BrowserStateDirtySections DirtySections { get; private set; } = BrowserStateDirtySections.All;
+    internal BrowserStateNormalizationCache? NormalizationCache { get; set; }
+
+    internal void MarkDirty(BrowserStateDirtySections sections = BrowserStateDirtySections.All)
+    {
+        DirtySections |= sections;
+        StateRevision++;
+    }
+
+    internal void ClearDirtySections(BrowserStateDirtySections sections)
+    {
+        DirtySections &= ~sections;
+    }
+
+    internal void BumpRevision()
+    {
+        StateRevision++;
+    }
     public string SearchProviderId { get; set; } = BrowserPolicy.DefaultSearchProviderId;
     public bool ReduceWebsiteMotionEnabled { get; set; }
     public bool MemorySaverEnabled { get; set; } = true;
@@ -137,6 +180,44 @@ internal sealed record SavedMultiViewLayout(
     float HorizontalRatio = 0.5f,
     float VerticalRatio = 0.5f);
 
+internal sealed class BrowserStateNormalizationCache
+{
+    public List<BookmarkEntry>? BookmarksList;
+    public BookmarkEntry[]? BookmarksItems;
+    public List<HistoryEntry>? HistoryList;
+    public HistoryEntry[]? HistoryItems;
+    public List<PinnedStartPageLink>? PinnedStartPageLinksList;
+    public PinnedStartPageLink[]? PinnedStartPageLinksItems;
+    public List<SavedSessionEntry>? NamedSessionsList;
+    public SavedSessionEntry[]? NamedSessionsItems;
+    public List<SavedSessionTab>[]? NamedSessionTabLists;
+    public SavedSessionTab[][]? NamedSessionTabItems;
+    public List<ClosedTabEntry>? RecentlyClosedList;
+    public ClosedTabEntry[]? RecentlyClosedItems;
+    public List<SiteZoomEntry>? SiteZoomList;
+    public SiteZoomEntry[]? SiteZoomItems;
+    public List<string>? MutedHostsList;
+    public string[]? MutedHostsItems;
+    public List<string>? AllowedAudioHostsList;
+    public string[]? AllowedAudioHostsItems;
+    public List<string>? AllowedMicrophoneHostsList;
+    public string[]? AllowedMicrophoneHostsItems;
+    public List<string>? BlockedMicrophoneHostsList;
+    public string[]? BlockedMicrophoneHostsItems;
+    public List<string>? AdBlockExceptionHostsList;
+    public string[]? AdBlockExceptionHostsItems;
+    public List<string>? DismissedSuggestionUrlsList;
+    public string[]? DismissedSuggestionUrlsItems;
+    public List<AddressSuggestionUsage>? SuggestionUsageList;
+    public AddressSuggestionUsage[]? SuggestionUsageItems;
+    public List<string>? KeepAwakeHostsList;
+    public string[]? KeepAwakeHostsItems;
+    public List<RecentDownloadEntry>? RecentDownloadsList;
+    public RecentDownloadEntry[]? RecentDownloadsItems;
+    public List<string>? DarkModeExcludedHostsList;
+    public string[]? DarkModeExcludedHostsItems;
+}
+
 internal sealed class BrowserStateStore : IDisposable
 {
     internal const int MaximumOpenTabs = 128;
@@ -214,14 +295,17 @@ internal sealed class BrowserStateStore : IDisposable
     {
         try
         {
-            var primary = TryLoadFrom(settingsPath);
+            var primary = TryLoadFrom(settingsPath, out var primaryRawBytes, out var primaryFileInfo);
             if (primary is not null)
             {
-                RememberPersistedState(JsonSerializer.SerializeToUtf8Bytes(primary, BrowserStateJsonContext.Default.BrowserState));
+                if (primaryRawBytes is not null)
+                {
+                    RememberPersistedState(primaryRawBytes, loadedFileInfo: primaryFileInfo);
+                }
                 return primary;
             }
 
-            var backup = TryLoadFrom(backupPath);
+            var backup = TryLoadFrom(backupPath, out _, out _);
             if (backup is not null)
             {
                 RestoreFromBackupToPrimary(backup);
@@ -241,7 +325,7 @@ internal sealed class BrowserStateStore : IDisposable
         byte[] serializedState;
         try
         {
-            NormalizeForPersistence(state);
+            NormalizeForPersistenceCore(state, forceFull: false);
             serializedState = SerializeWithinLimit(state);
         }
         catch (Exception error)
@@ -258,7 +342,7 @@ internal sealed class BrowserStateStore : IDisposable
         byte[] serializedState;
         try
         {
-            NormalizeForPersistence(state);
+            NormalizeForPersistenceCore(state, forceFull: false);
             serializedState = SerializeWithinLimit(state);
         }
         catch (Exception error)
@@ -278,7 +362,7 @@ internal sealed class BrowserStateStore : IDisposable
             // The WinForms thread owns BrowserState. Normalize and serialize it
             // before handing an immutable snapshot to the writer so the worker
             // never races later UI mutations.
-            NormalizeForPersistence(state);
+            NormalizeForPersistenceCore(state, forceFull: false);
             serializedState = SerializeWithinLimit(state);
         }
         catch (Exception error)
@@ -402,9 +486,10 @@ internal sealed class BrowserStateStore : IDisposable
             var folder = Path.GetDirectoryName(settingsPath)!;
             Directory.CreateDirectory(folder);
             WriteFileAtomically(settingsPath, serializedState);
-            // The recovery copy mirrors the committed state. Keeping a prior
-            // generation here could resurrect history after privacy deletion.
-            WriteFileAtomically(backupPath, serializedState);
+            // The recovery copy mirrors the committed state. Copying after the
+            // atomic WriteThrough commit avoids a second FlushFileBuffers barrier
+            // while still ensuring backup never retains stale pre-deletion history.
+            File.Copy(settingsPath, backupPath, overwrite: true);
             RememberPersistedState(serializedState, fingerprint);
             return true;
         }
@@ -470,18 +555,24 @@ internal sealed class BrowserStateStore : IDisposable
         }
     }
 
-    private BrowserState? TryLoadFrom(string path)
+    private BrowserState? TryLoadFrom(string path, out byte[]? rawBytes, out FileInfo? loadedFile)
     {
+        rawBytes = null;
+        loadedFile = null;
         try
         {
             var file = new FileInfo(path);
             if (!file.Exists || file.Length > MaximumSettingsBytes) return null;
 
-            using var settingsStream = File.OpenRead(path);
-            var state = JsonSerializer.Deserialize(settingsStream, BrowserStateJsonContext.Default.BrowserState);
+            var bytes = File.ReadAllBytes(path);
+            if (bytes.LongLength > MaximumSettingsBytes) return null;
+
+            var state = JsonSerializer.Deserialize(bytes, BrowserStateJsonContext.Default.BrowserState);
             if (state is null) return null;
 
             NormalizeForPersistence(state);
+            rawBytes = bytes;
+            loadedFile = file;
             return state;
         }
         catch
@@ -512,6 +603,7 @@ internal sealed class BrowserStateStore : IDisposable
             + "."
             + Guid.NewGuid().ToString("N")
             + ".tmp";
+        var moved = false;
         try
         {
             using (var stream = new FileStream(
@@ -526,16 +618,20 @@ internal sealed class BrowserStateStore : IDisposable
                 stream.Flush(flushToDisk: true);
             }
             File.Move(temporaryPath, destinationPath, true);
+            moved = true;
         }
         finally
         {
-            try
+            if (!moved)
             {
-                if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
-            }
-            catch
-            {
-                // A uniquely named stale temp does not endanger either state copy.
+                try
+                {
+                    if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+                }
+                catch
+                {
+                    // A uniquely named stale temp does not endanger either state copy.
+                }
             }
         }
     }
@@ -562,11 +658,14 @@ internal sealed class BrowserStateStore : IDisposable
         }
     }
 
-    private void RememberPersistedState(byte[] serializedState, ulong? fingerprint = null)
+    private void RememberPersistedState(
+        byte[] serializedState,
+        ulong? fingerprint = null,
+        FileInfo? loadedFileInfo = null)
     {
         try
         {
-            var file = new FileInfo(settingsPath);
+            var file = loadedFileInfo ?? new FileInfo(settingsPath);
             if (!file.Exists)
             {
                 hasPersistedFingerprint = false;
@@ -587,12 +686,21 @@ internal sealed class BrowserStateStore : IDisposable
 
     private static ulong ComputeFingerprint(ReadOnlySpan<byte> value)
     {
-        const ulong offsetBasis = 14_695_981_039_346_656_037;
-        const ulong prime = 1_099_511_628_211;
-        var fingerprint = offsetBasis;
-        foreach (var item in value)
+        const ulong offsetBasis = 14_695_981_039_346_656_037UL;
+        const ulong prime = 1_099_511_628_211UL;
+        var fingerprint = offsetBasis ^ (ulong)value.Length;
+        var chunks = MemoryMarshal.Cast<byte, ulong>(value);
+        for (var index = 0; index < chunks.Length; index++)
         {
-            fingerprint ^= item;
+            fingerprint ^= chunks[index];
+            fingerprint = unchecked(fingerprint * prime);
+            fingerprint ^= fingerprint >> 33;
+        }
+
+        var tailStart = chunks.Length * sizeof(ulong);
+        for (var index = tailStart; index < value.Length; index++)
+        {
+            fingerprint ^= value[index];
             fingerprint = unchecked(fingerprint * prime);
         }
         return fingerprint;
@@ -654,6 +762,7 @@ internal sealed class BrowserStateStore : IDisposable
     internal static string SanitizeTitle(string? value)
     {
         if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+        if (IsAlreadyCleanTitle(value)) return value;
 
         var title = new StringBuilder(Math.Min(value.Length, MaximumTitleLength));
         var pendingSpace = false;
@@ -694,6 +803,46 @@ internal sealed class BrowserStateStore : IDisposable
         }
 
         return title.ToString().TrimEnd();
+    }
+
+    private static bool IsAlreadyCleanTitle(string value)
+    {
+        if (value.Length > MaximumTitleLength) return false;
+        var first = value[0];
+        var last = value[^1];
+        if (first <= ' ' || last <= ' ' || char.IsWhiteSpace(first) || char.IsWhiteSpace(last))
+        {
+            return false;
+        }
+
+        var previousWasSpace = false;
+        for (var index = 0; index < value.Length; index++)
+        {
+            var character = value[index];
+            if (character > ' ' && character < 0x7F)
+            {
+                previousWasSpace = false;
+                continue;
+            }
+            if (character == ' ')
+            {
+                if (previousWasSpace) return false;
+                previousWasSpace = true;
+                continue;
+            }
+            if (character < ' '
+                || char.IsControl(character)
+                || char.IsWhiteSpace(character)
+                || char.IsSurrogate(character)
+                || (character >= 0x00AD
+                    && char.GetUnicodeCategory(character) == System.Globalization.UnicodeCategory.Format))
+            {
+                return false;
+            }
+            previousWasSpace = false;
+        }
+
+        return true;
     }
 
     private static IEnumerable<BookmarkEntry> NormalizeBookmarks(IEnumerable<BookmarkEntry>? entries)
@@ -1012,65 +1161,260 @@ internal sealed class BrowserStateStore : IDisposable
 
     internal static void NormalizeForPersistence(BrowserState state)
     {
+        NormalizeForPersistenceCore(state, forceFull: true);
+    }
+
+    private static void NormalizeForPersistenceCore(BrowserState state, bool forceFull)
+    {
         ArgumentNullException.ThrowIfNull(state);
+
+        var cache = state.NormalizationCache ??= new BrowserStateNormalizationCache();
+        var dirty = forceFull ? BrowserStateDirtySections.All : state.DirtySections;
+        var anyCollectionMutated = false;
 
         state.SearchProviderId = BrowserPolicy.NormalizeSearchProviderId(state.SearchProviderId);
         NormalizeOpenTabs(state);
-        state.Bookmarks = NormalizeBookmarks(state.Bookmarks)
-            .DistinctBy(item => item.Url, BrowserPolicy.UrlComparer)
-            .Take(MaximumBookmarks)
-            .ToList();
-        state.History = NormalizeHistory(state.History)
-            .OrderByDescending(item => item.VisitedUtc)
-            .DistinctBy(item => item.Url, BrowserPolicy.UrlComparer)
-            .Take(MaximumHistoryEntries)
-            .ToList();
-        state.PinnedStartPageLinks = NormalizePinnedStartPageLinks(state.PinnedStartPageLinks)
-            .DistinctBy(item => item.Url, BrowserPolicy.UrlComparer)
-            .Take(MaximumPinnedStartPageLinks)
-            .ToList();
-        state.NamedSessions = NormalizeSessions(state.NamedSessions).ToList();
-        state.RecentlyClosed = NormalizeRecentlyClosed(state.RecentlyClosed).ToList();
-        state.SiteZoom = NormalizeSiteZoom(state.SiteZoom).ToList();
-        state.MutedHosts = NormalizeMutedHosts(state.MutedHosts).ToList();
+
+        if (ShouldNormalizeCollection(dirty, BrowserStateDirtySections.Bookmarks, state.Bookmarks, cache.BookmarksList, cache.BookmarksItems))
+        {
+            state.Bookmarks = NormalizeBookmarks(state.Bookmarks)
+                .DistinctBy(item => item.Url, BrowserPolicy.UrlComparer)
+                .Take(MaximumBookmarks)
+                .ToList();
+            CaptureSnapshot(state.Bookmarks, out cache.BookmarksList, out cache.BookmarksItems);
+            anyCollectionMutated = true;
+        }
+
+        if (ShouldNormalizeCollection(dirty, BrowserStateDirtySections.History, state.History, cache.HistoryList, cache.HistoryItems))
+        {
+            state.History = NormalizeHistory(state.History)
+                .OrderByDescending(item => item.VisitedUtc)
+                .DistinctBy(item => item.Url, BrowserPolicy.UrlComparer)
+                .Take(MaximumHistoryEntries)
+                .ToList();
+            CaptureSnapshot(state.History, out cache.HistoryList, out cache.HistoryItems);
+            anyCollectionMutated = true;
+        }
+
+        if (ShouldNormalizeCollection(dirty, BrowserStateDirtySections.PinnedStartPageLinks, state.PinnedStartPageLinks, cache.PinnedStartPageLinksList, cache.PinnedStartPageLinksItems))
+        {
+            state.PinnedStartPageLinks = NormalizePinnedStartPageLinks(state.PinnedStartPageLinks)
+                .DistinctBy(item => item.Url, BrowserPolicy.UrlComparer)
+                .Take(MaximumPinnedStartPageLinks)
+                .ToList();
+            CaptureSnapshot(state.PinnedStartPageLinks, out cache.PinnedStartPageLinksList, out cache.PinnedStartPageLinksItems);
+            anyCollectionMutated = true;
+        }
+
+        if (ShouldNormalizeSessions(dirty, state.NamedSessions, cache))
+        {
+            state.NamedSessions = NormalizeSessions(state.NamedSessions).ToList();
+            CaptureSessionsSnapshot(state.NamedSessions, cache);
+            anyCollectionMutated = true;
+        }
+
+        if (ShouldNormalizeCollection(dirty, BrowserStateDirtySections.RecentlyClosed, state.RecentlyClosed, cache.RecentlyClosedList, cache.RecentlyClosedItems))
+        {
+            state.RecentlyClosed = NormalizeRecentlyClosed(state.RecentlyClosed).ToList();
+            CaptureSnapshot(state.RecentlyClosed, out cache.RecentlyClosedList, out cache.RecentlyClosedItems);
+            anyCollectionMutated = true;
+        }
+
+        if (ShouldNormalizeCollection(dirty, BrowserStateDirtySections.SiteZoom, state.SiteZoom, cache.SiteZoomList, cache.SiteZoomItems))
+        {
+            state.SiteZoom = NormalizeSiteZoom(state.SiteZoom).ToList();
+            CaptureSnapshot(state.SiteZoom, out cache.SiteZoomList, out cache.SiteZoomItems);
+            anyCollectionMutated = true;
+        }
+
+        if (ShouldNormalizeCollection(dirty, BrowserStateDirtySections.MutedHosts, state.MutedHosts, cache.MutedHostsList, cache.MutedHostsItems))
+        {
+            state.MutedHosts = NormalizeMutedHosts(state.MutedHosts).ToList();
+            CaptureSnapshot(state.MutedHosts, out cache.MutedHostsList, out cache.MutedHostsItems);
+            anyCollectionMutated = true;
+        }
+
         state.AudioOutputPolicy = Enum.IsDefined(state.AudioOutputPolicy)
             ? state.AudioOutputPolicy
             : AudioOutputPolicy.AllowAll;
-        state.AllowedAudioHosts = NormalizeExactHostList(state.AllowedAudioHosts, MaximumAudioHosts).ToList();
+
+        if (ShouldNormalizeCollection(dirty, BrowserStateDirtySections.AllowedAudioHosts, state.AllowedAudioHosts, cache.AllowedAudioHostsList, cache.AllowedAudioHostsItems))
+        {
+            state.AllowedAudioHosts = NormalizeExactHostList(state.AllowedAudioHosts, MaximumAudioHosts).ToList();
+            CaptureSnapshot(state.AllowedAudioHosts, out cache.AllowedAudioHostsList, out cache.AllowedAudioHostsItems);
+            anyCollectionMutated = true;
+        }
+
         state.AudioInputPolicy = Enum.IsDefined(state.AudioInputPolicy)
             ? state.AudioInputPolicy
             : AudioInputPolicy.AskEveryTime;
-        state.AllowedMicrophoneHosts = NormalizeExactHostList(state.AllowedMicrophoneHosts, MaximumMicrophoneHosts).ToList();
-        state.BlockedMicrophoneHosts = NormalizeExactHostList(state.BlockedMicrophoneHosts, MaximumMicrophoneHosts).ToList();
-        state.AdBlockExceptionHosts = NormalizeAdBlockExceptionHosts(state.AdBlockExceptionHosts)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Take(MaximumAdBlockExceptionHosts)
-            .ToList();
-        state.DismissedSuggestionUrls = (state.DismissedSuggestionUrls ?? [])
-            .OfType<string>()
-            .Select(NormalizeHttpUrl)
-            .OfType<string>()
-            .Distinct(BrowserPolicy.UrlComparer)
-            .Take(MaximumDismissedSuggestions)
-            .ToList();
-        state.SuggestionUsage = NormalizeSuggestionUsage(state.SuggestionUsage)
-            .OrderByDescending(item => item.AcceptedCount)
-            .ThenByDescending(item => item.LastAcceptedUtc)
-            .Take(MaximumSuggestionUsageEntries)
-            .ToList();
-        state.KeepAwakeHosts = NormalizeKeepAwakeHosts(state.KeepAwakeHosts)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Take(MaximumKeepAwakeHosts)
-            .ToList();
-        state.RecentDownloads = NormalizeRecentDownloads(state.RecentDownloads)
-            .OrderByDescending(item => item.CompletedAtUtc)
-            .Take(MaximumRecentDownloads)
-            .ToList();
-        state.DarkModeExcludedHosts = NormalizeExactHostList(
-                state.DarkModeExcludedHosts,
-                MaximumDarkModeExcludedHosts)
-            .ToList();
+
+        if (ShouldNormalizeCollection(dirty, BrowserStateDirtySections.AllowedMicrophoneHosts, state.AllowedMicrophoneHosts, cache.AllowedMicrophoneHostsList, cache.AllowedMicrophoneHostsItems))
+        {
+            state.AllowedMicrophoneHosts = NormalizeExactHostList(state.AllowedMicrophoneHosts, MaximumMicrophoneHosts).ToList();
+            CaptureSnapshot(state.AllowedMicrophoneHosts, out cache.AllowedMicrophoneHostsList, out cache.AllowedMicrophoneHostsItems);
+            anyCollectionMutated = true;
+        }
+
+        if (ShouldNormalizeCollection(dirty, BrowserStateDirtySections.BlockedMicrophoneHosts, state.BlockedMicrophoneHosts, cache.BlockedMicrophoneHostsList, cache.BlockedMicrophoneHostsItems))
+        {
+            state.BlockedMicrophoneHosts = NormalizeExactHostList(state.BlockedMicrophoneHosts, MaximumMicrophoneHosts).ToList();
+            CaptureSnapshot(state.BlockedMicrophoneHosts, out cache.BlockedMicrophoneHostsList, out cache.BlockedMicrophoneHostsItems);
+            anyCollectionMutated = true;
+        }
+
+        if (ShouldNormalizeCollection(dirty, BrowserStateDirtySections.AdBlockExceptionHosts, state.AdBlockExceptionHosts, cache.AdBlockExceptionHostsList, cache.AdBlockExceptionHostsItems))
+        {
+            state.AdBlockExceptionHosts = NormalizeAdBlockExceptionHosts(state.AdBlockExceptionHosts)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(MaximumAdBlockExceptionHosts)
+                .ToList();
+            CaptureSnapshot(state.AdBlockExceptionHosts, out cache.AdBlockExceptionHostsList, out cache.AdBlockExceptionHostsItems);
+            anyCollectionMutated = true;
+        }
+
+        if (ShouldNormalizeCollection(dirty, BrowserStateDirtySections.DismissedSuggestionUrls, state.DismissedSuggestionUrls, cache.DismissedSuggestionUrlsList, cache.DismissedSuggestionUrlsItems))
+        {
+            state.DismissedSuggestionUrls = (state.DismissedSuggestionUrls ?? [])
+                .OfType<string>()
+                .Select(NormalizeHttpUrl)
+                .OfType<string>()
+                .Distinct(BrowserPolicy.UrlComparer)
+                .Take(MaximumDismissedSuggestions)
+                .ToList();
+            CaptureSnapshot(state.DismissedSuggestionUrls, out cache.DismissedSuggestionUrlsList, out cache.DismissedSuggestionUrlsItems);
+            anyCollectionMutated = true;
+        }
+
+        if (ShouldNormalizeCollection(dirty, BrowserStateDirtySections.SuggestionUsage, state.SuggestionUsage, cache.SuggestionUsageList, cache.SuggestionUsageItems))
+        {
+            state.SuggestionUsage = NormalizeSuggestionUsage(state.SuggestionUsage)
+                .OrderByDescending(item => item.AcceptedCount)
+                .ThenByDescending(item => item.LastAcceptedUtc)
+                .Take(MaximumSuggestionUsageEntries)
+                .ToList();
+            CaptureSnapshot(state.SuggestionUsage, out cache.SuggestionUsageList, out cache.SuggestionUsageItems);
+            anyCollectionMutated = true;
+        }
+
+        if (ShouldNormalizeCollection(dirty, BrowserStateDirtySections.KeepAwakeHosts, state.KeepAwakeHosts, cache.KeepAwakeHostsList, cache.KeepAwakeHostsItems))
+        {
+            state.KeepAwakeHosts = NormalizeKeepAwakeHosts(state.KeepAwakeHosts)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(MaximumKeepAwakeHosts)
+                .ToList();
+            CaptureSnapshot(state.KeepAwakeHosts, out cache.KeepAwakeHostsList, out cache.KeepAwakeHostsItems);
+            anyCollectionMutated = true;
+        }
+
+        if (ShouldNormalizeCollection(dirty, BrowserStateDirtySections.RecentDownloads, state.RecentDownloads, cache.RecentDownloadsList, cache.RecentDownloadsItems))
+        {
+            state.RecentDownloads = NormalizeRecentDownloads(state.RecentDownloads)
+                .OrderByDescending(item => item.CompletedAtUtc)
+                .Take(MaximumRecentDownloads)
+                .ToList();
+            CaptureSnapshot(state.RecentDownloads, out cache.RecentDownloadsList, out cache.RecentDownloadsItems);
+            anyCollectionMutated = true;
+        }
+
+        if (ShouldNormalizeCollection(dirty, BrowserStateDirtySections.DarkModeExcludedHosts, state.DarkModeExcludedHosts, cache.DarkModeExcludedHostsList, cache.DarkModeExcludedHostsItems))
+        {
+            state.DarkModeExcludedHosts = NormalizeExactHostList(
+                    state.DarkModeExcludedHosts,
+                    MaximumDarkModeExcludedHosts)
+                .ToList();
+            CaptureSnapshot(state.DarkModeExcludedHosts, out cache.DarkModeExcludedHostsList, out cache.DarkModeExcludedHostsItems);
+            anyCollectionMutated = true;
+        }
+
         state.WindowPlacement = NormalizeWindowPlacement(state.WindowPlacement);
+        state.ClearDirtySections(BrowserStateDirtySections.All);
+        if (anyCollectionMutated) state.BumpRevision();
+    }
+
+    private static bool ShouldNormalizeCollection<T>(
+        BrowserStateDirtySections dirty,
+        BrowserStateDirtySections section,
+        List<T>? current,
+        List<T>? expectedList,
+        T[]? expectedItems)
+        where T : class
+    {
+        if ((dirty & section) != 0) return true;
+        return !IsListReferenceUnchanged(current, expectedList, expectedItems);
+    }
+
+    private static bool IsListReferenceUnchanged<T>(
+        List<T>? current,
+        List<T>? expectedList,
+        T[]? expectedItems)
+        where T : class
+    {
+        if (current is null || !ReferenceEquals(current, expectedList) || expectedItems is null)
+        {
+            return false;
+        }
+
+        var span = CollectionsMarshal.AsSpan(current);
+        if (span.Length != expectedItems.Length) return false;
+        for (var index = 0; index < span.Length; index++)
+        {
+            if (!ReferenceEquals(span[index], expectedItems[index])) return false;
+        }
+        return true;
+    }
+
+    private static void CaptureSnapshot<T>(List<T> list, out List<T> targetList, out T[] targetItems)
+        where T : class
+    {
+        targetList = list;
+        targetItems = list.Count == 0 ? Array.Empty<T>() : list.ToArray();
+    }
+
+    private static bool ShouldNormalizeSessions(
+        BrowserStateDirtySections dirty,
+        List<SavedSessionEntry>? current,
+        BrowserStateNormalizationCache cache)
+    {
+        if ((dirty & BrowserStateDirtySections.NamedSessions) != 0) return true;
+        if (!IsListReferenceUnchanged(current, cache.NamedSessionsList, cache.NamedSessionsItems)) return true;
+        if (current is null || cache.NamedSessionTabLists is null || cache.NamedSessionTabItems is null) return true;
+        if (current.Count != cache.NamedSessionTabLists.Length) return true;
+        for (var index = 0; index < current.Count; index++)
+        {
+            if (!IsListReferenceUnchanged(
+                current[index].Tabs,
+                cache.NamedSessionTabLists[index],
+                cache.NamedSessionTabItems[index]))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void CaptureSessionsSnapshot(
+        List<SavedSessionEntry> sessions,
+        BrowserStateNormalizationCache cache)
+    {
+        CaptureSnapshot(sessions, out cache.NamedSessionsList, out cache.NamedSessionsItems);
+        if (sessions.Count == 0)
+        {
+            cache.NamedSessionTabLists = Array.Empty<List<SavedSessionTab>>();
+            cache.NamedSessionTabItems = Array.Empty<SavedSessionTab[]>();
+            return;
+        }
+
+        var tabLists = new List<SavedSessionTab>[sessions.Count];
+        var tabItems = new SavedSessionTab[sessions.Count][];
+        for (var index = 0; index < sessions.Count; index++)
+        {
+            var tabs = sessions[index].Tabs;
+            tabLists[index] = tabs;
+            tabItems[index] = tabs.Count == 0 ? Array.Empty<SavedSessionTab>() : tabs.ToArray();
+        }
+        cache.NamedSessionTabLists = tabLists;
+        cache.NamedSessionTabItems = tabItems;
     }
 
     private static SavedWindowPlacement? NormalizeWindowPlacement(SavedWindowPlacement? placement)

@@ -334,8 +334,76 @@ public sealed partial class MainForm : Form
     private bool browserRuntimeUpdateAvailable;
     private MruSwitcherSnapshot<BrowserTab>? mruSnapshot;
     private bool openingMruSwitcher;
-    private static readonly Lazy<Icon> SharedWindowIcon = new(() =>
-        System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application);
+    private static readonly Lazy<Icon> SharedWindowIcon = new(LoadSharedWindowIcon);
+    private bool adBlockerLoadStarted;
+    private bool profileMediaPermissionsSeeded;
+    private bool hasGrantedMediaPermissionOrigins;
+    private readonly HashSet<string> profileGrantedMediaPermissionOrigins = new(StringComparer.OrdinalIgnoreCase);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string? lpModuleName);
+
+    [DllImport("comctl32.dll", CharSet = CharSet.Unicode)]
+    private static extern int LoadIconWithScaleDown(IntPtr hinst, IntPtr pszName, int cx, int cy, out IntPtr phico);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr LoadImage(IntPtr hinst, IntPtr lpszName, uint uType, int cxDesired, int cyDesired, uint fuLoad);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DestroyIcon(IntPtr hIcon);
+
+    private static Icon LoadSharedWindowIcon()
+    {
+        const int IdiApplicationResourceId = 32512;
+        const uint ImageIcon = 1;
+        const uint LrDefaultSize = 0x0040;
+        var moduleHandle = GetModuleHandle(null);
+        if (moduleHandle != IntPtr.Zero)
+        {
+            var iconHandle = IntPtr.Zero;
+            try
+            {
+                if (LoadIconWithScaleDown(moduleHandle, (IntPtr)IdiApplicationResourceId, 32, 32, out var scaledHandle) == 0
+                    && scaledHandle != IntPtr.Zero)
+                {
+                    iconHandle = scaledHandle;
+                }
+            }
+            catch (EntryPointNotFoundException)
+            {
+            }
+            catch (DllNotFoundException)
+            {
+            }
+
+            if (iconHandle == IntPtr.Zero)
+            {
+                iconHandle = LoadImage(
+                    moduleHandle,
+                    (IntPtr)IdiApplicationResourceId,
+                    ImageIcon,
+                    0,
+                    0,
+                    LrDefaultSize);
+            }
+
+            if (iconHandle != IntPtr.Zero)
+            {
+                try
+                {
+                    using var wrapper = System.Drawing.Icon.FromHandle(iconHandle);
+                    return (Icon)wrapper.Clone();
+                }
+                finally
+                {
+                    DestroyIcon(iconHandle);
+                }
+            }
+        }
+
+        return System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application;
+    }
     private const int MaximumCachedFaviconHosts = 64;
     private readonly Dictionary<string, LinkedListNode<(string Host, Bitmap Icon, int Version)>> faviconCacheMap =
         new(StringComparer.OrdinalIgnoreCase);
@@ -388,6 +456,20 @@ public sealed partial class MainForm : Form
             && previewState is null
             && !state.CleanShutdown
             && state.OpenTabs.Any(BrowserPolicy.IsHttpUrl);
+        if (startBrowserOnShown
+            && !priorUncleanShutdown
+            && (this.startupAddress is not null || state.OpenTabs.Any(BrowserPolicy.IsHttpUrl)))
+        {
+            // Overlap WebView2 environment creation with BuildChrome() when we already
+            // know startup will navigate or restore at least one web tab.
+            EnsureUiSynchronizationContext();
+            var prewarmTask = GetOrCreateEnvironmentAsync();
+            _ = prewarmTask.ContinueWith(
+                static t => _ = t.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
         if (!isPrivateMode && startBrowserOnShown && previewState is null && state.RecentDownloads.Count > 0)
         {
             HydrateRecentDownloadsFromState();
@@ -456,8 +538,9 @@ public sealed partial class MainForm : Form
         ApplySavedWindowPresentation(savedWindowPlacement);
         if (startBrowserOnShown)
         {
-            if (adBlockEnabled)
+            if (adBlockEnabled && !adBlocker.IsReady)
             {
+                adBlockerLoadStarted = true;
                 _ = adBlocker.LoadAsync();
             }
             Load += (_, _) =>
@@ -556,9 +639,26 @@ public sealed partial class MainForm : Form
         return new Rectangle(x, y, width, height);
     }
 
-    internal bool ReceiveExternalNavigation(string? address)
+    internal void PrewarmEnvironmentOnUserInput()
     {
-        if (!string.IsNullOrWhiteSpace(address)
+        if (isClosing || IsDisposed || Disposing || environment is not null || environmentTask is not null)
+        {
+            return;
+        }
+
+        EnsureUiSynchronizationContext();
+        var prewarmTask = GetOrCreateEnvironmentAsync();
+        _ = prewarmTask.ContinueWith(
+            static t => _ = t.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    internal bool ReceiveExternalNavigation(string? address, bool preValidated = false)
+    {
+        if (!preValidated
+            && !string.IsNullOrWhiteSpace(address)
             && BrowserPolicy.ResolveAddress(address).Error is not null)
         {
             return false;

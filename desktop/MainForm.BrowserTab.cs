@@ -26,7 +26,9 @@ public sealed partial class MainForm
             Panel host,
             TabHeader header,
             TableLayoutPanel overlay,
+            RoundedPanel overlayCard,
             Label overlayTitle,
+            Label overlayHost,
             Label overlayDetail,
             Button overlayAction,
             string url)
@@ -34,7 +36,9 @@ public sealed partial class MainForm
             Host = host;
             Header = header;
             Overlay = overlay;
+            OverlayCard = overlayCard;
             OverlayTitle = overlayTitle;
+            OverlayHost = overlayHost;
             OverlayDetail = overlayDetail;
             OverlayAction = overlayAction;
             Url = url;
@@ -64,7 +68,9 @@ public sealed partial class MainForm
         public TabHeader Header { get; }
         public NativeStartPage? StartPageView { get; set; }
         public TableLayoutPanel Overlay { get; }
+        public RoundedPanel OverlayCard { get; }
         public Label OverlayTitle { get; }
+        public Label OverlayHost { get; }
         public Label OverlayDetail { get; }
         public Button OverlayAction { get; }
         public string Url { get; set; }
@@ -124,6 +130,11 @@ public sealed partial class MainForm
         public string? ChromeStoreInstallChannel { get; set; }
         public string? ChromeStoreBridgeScriptId { get; set; }
         public string? PendingScopedScriptNavigationUrl { get; set; }
+        public string? LastScopedScriptRegistrationUrl { get; set; }
+        public int LastScopedScriptAdBlockGeneration { get; set; }
+        public bool? AppliedAutoDarkOverride { get; set; }
+        public bool? AppliedPreferredColorSchemeDark { get; set; }
+        public long AppliedWebsiteThemeGeneration { get; set; } = -1;
         public HashSet<string> InstalledUserScriptKeys { get; } = new(StringComparer.Ordinal);
         public string? NoMotionScriptId { get; set; }
         public string? AdBlockPolicyScriptId { get; set; }
@@ -356,6 +367,10 @@ public sealed partial class MainForm
             ChromeStoreInstallChannel = null;
             ChromeStoreBridgeScriptId = null;
             PendingScopedScriptNavigationUrl = null;
+            LastScopedScriptRegistrationUrl = null;
+            AppliedAutoDarkOverride = null;
+            AppliedPreferredColorSchemeDark = null;
+            AppliedWebsiteThemeGeneration = -1;
             InstalledUserScriptKeys.Clear();
             ContextLinkTarget = null;
             LoadedFaviconHostKey = null;

@@ -18,7 +18,8 @@ public sealed partial class MainForm
         bool canScriptClose = false,
         bool isPinned = false,
         string? trustedExtensionId = null,
-        bool trimWhenDiscarded = true)
+        bool trimWhenDiscarded = true,
+        bool? startDiscarded = null)
     {
         if (isClosing) return null;
         if (tabs.Count >= MaximumTabs)
@@ -39,15 +40,25 @@ public sealed partial class MainForm
         }
 
         var initialUrl = resolution.IsStartPage ? StartPage.Url : resolution.Url!;
-        var tab = CreateBrowserTab(initialUrl, canScriptClose);
+        var createDiscarded = !resolution.IsStartPage
+            && !activate
+            && !waitForPopupNavigation
+            && (startDiscarded ?? true);
+        var effectivePinned = isPinned && !resolution.IsStartPage;
+        var effectiveKeepAwake = IsKeepAwakeHost(initialUrl);
+        var tab = CreateBrowserTab(
+            initialUrl,
+            canScriptClose,
+            startDiscarded: createDiscarded,
+            discardedDetail: createDiscarded ? "Waiting in the background" : null,
+            isPinned: effectivePinned,
+            keepAwake: effectiveKeepAwake);
         tab.DeferResourceFilteringUntilPopupAttached = waitForPopupNavigation;
         tab.AllowedPopupBootstrapUrl = waitForPopupNavigation
             && BrowserPolicy.IsPopupBootstrapUrl(initialUrl)
             ? initialUrl
             : null;
         tab.ExtensionOriginId = trustedExtensionId;
-        tab.IsPinned = isPinned && !resolution.IsStartPage;
-        tab.KeepAwake = IsKeepAwakeHost(initialUrl);
         tabs.Add(tab);
         tabStrip.Controls.Add(tab.Header);
         if (tab.IsPinned) ReorderTabForPinState(tab);
@@ -79,7 +90,10 @@ public sealed partial class MainForm
 
         if (!activate && !waitForPopupNavigation)
         {
-            MarkTabDiscarded(tab, "Waiting in the background", trimProcessMemory: trimWhenDiscarded);
+            if (createDiscarded && !restoringSession && trimWhenDiscarded)
+            {
+                TrimAllProcessMemory(allowManagedGc: true);
+            }
             return tab;
         }
 
@@ -103,7 +117,7 @@ public sealed partial class MainForm
         }
         else if (!waitForPopupNavigation && tab.NavigationRequestId == navigationRequestId)
         {
-            await EnsureUrlScopedScriptsRegisteredAsync(tab, resolution.Url!);
+            await EnsureUrlScopedScriptsRegisteredIfNeededAsync(tab, resolution.Url!);
             if (!isClosing
                 && !tab.IsClosed
                 && tab.NavigationRequestId == navigationRequestId
@@ -131,9 +145,16 @@ public sealed partial class MainForm
             : BrowserPolicy.ResolveAddress(input, searchProviderId);
     }
 
-    private BrowserTab CreateBrowserTab(string url, bool canScriptClose)
+    private BrowserTab CreateBrowserTab(
+        string url,
+        bool canScriptClose,
+        bool startDiscarded = false,
+        string? discardedDetail = null,
+        bool isPinned = false,
+        bool keepAwake = false)
     {
         var isStartPage = url.Equals(StartPage.Url, StringComparison.OrdinalIgnoreCase);
+        var initiallyDiscarded = startDiscarded && !isStartPage;
         var host = new TransparentPanelHost
         {
             Dock = DockStyle.None,
@@ -145,7 +166,12 @@ public sealed partial class MainForm
             host.Bounds = pageHost.ClientRectangle;
         }
 
-        var overlay = CreateTabOverlay(out var overlayTitle, out var overlayDetail, out var overlayAction);
+        var overlay = CreateTabOverlay(
+            out var overlayCard,
+            out var overlayTitle,
+            out var overlayHost,
+            out var overlayDetail,
+            out var overlayAction);
         TrySetBackColor(overlay, Color.Transparent, pageHost.BackColor);
         host.Controls.Add(overlay);
         overlay.BringToFront();
@@ -161,16 +187,28 @@ public sealed partial class MainForm
             host,
             header,
             overlay,
+            overlayCard,
             overlayTitle,
+            overlayHost,
             overlayDetail,
             overlayAction,
             url)
         {
             CanScriptClose = canScriptClose,
             IsStartPage = isStartPage,
+            IsPinned = isPinned && !isStartPage,
+            KeepAwake = keepAwake,
+            IsDiscarded = initiallyDiscarded,
             Title = isStartPage ? (isPrivateMode ? "Incognito" : "New tab") : HostFromUrl(url),
-            StatusText = isStartPage ? "Ready" : "Starting\u2026",
+            StatusText = isStartPage
+                ? "Ready"
+                : initiallyDiscarded ? "Unloaded to save memory" : "Starting\u2026",
             ConnectionState = isStartPage ? ConnectionState.Local : ConnectionState.Unknown
+        };
+
+        overlay.VisibleChanged += (_, _) =>
+        {
+            if (overlay.Visible && !tab.IsClosed) SyncTabOverlayContext(tab);
         };
 
         header.Activated += (_, _) => ActivateTab(tab);
@@ -200,20 +238,32 @@ public sealed partial class MainForm
         }
         overlayAction.Click += (_, _) => TriggerTabRecovery();
         overlay.Click += (_, _) => { if (tab.IsDiscarded) TriggerTabRecovery(); };
-        if (overlayTitle.Parent is Control overlayCard)
+        overlayCard.Click += (_, _) => { if (tab.IsDiscarded) TriggerTabRecovery(); };
+        foreach (Control child in overlayCard.Controls)
         {
-            overlayCard.Click += (_, _) => { if (tab.IsDiscarded) TriggerTabRecovery(); };
-            foreach (Control child in overlayCard.Controls)
-            {
-                if (child == overlayAction || child == overlayTitle || child == overlayDetail) continue;
-                child.Click += (_, _) => { if (tab.IsDiscarded) TriggerTabRecovery(); };
-            }
+            if (child == overlayAction || child == overlayTitle || child == overlayHost || child == overlayDetail) continue;
+            child.Click += (_, _) => { if (tab.IsDiscarded) TriggerTabRecovery(); };
         }
         overlayTitle.Click += (_, _) => { if (tab.IsDiscarded) TriggerTabRecovery(); };
+        overlayHost.Click += (_, _) => { if (tab.IsDiscarded) TriggerTabRecovery(); };
         overlayDetail.Click += (_, _) => { if (tab.IsDiscarded) TriggerTabRecovery(); };
-        if (!isStartPage)
+
+        if (initiallyDiscarded)
+        {
+            tab.NavigationRequestId++;
+            var detail = string.IsNullOrWhiteSpace(discardedDetail) ? "Waiting in the background" : discardedDetail;
+            ShowTabOverlay(
+                tab,
+                "Tab unloaded",
+                $"{detail}. It will reload when selected.",
+                "Reload tab",
+                () => RestoreDiscardedTabAsync(tab, focusPage: true));
+            SyncTabOverlayContext(tab);
+        }
+        else if (!isStartPage)
         {
             ShowTabOverlay(tab, "Starting\u2026", "Preparing the browser engine", null, null);
+            SyncTabOverlayContext(tab);
         }
         UpdateTabHeader(tab);
         return tab;
@@ -399,7 +449,9 @@ public sealed partial class MainForm
     }
 
     private TransparentTableLayoutPanel CreateTabOverlay(
+        out RoundedPanel card,
         out Label title,
+        out Label hostSubtitle,
         out Label detail,
         out Button action)
     {
@@ -421,11 +473,11 @@ public sealed partial class MainForm
         overlay.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         overlay.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
 
-        var card = new RoundedPanel
+        card = new RoundedPanel
         {
             AutoSize = true,
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            MinimumSize = new Size(340, 210),
+            MinimumSize = new Size(210, 156),
             MaximumSize = new Size(480, 0),
             Padding = new Padding(28, 22, 28, 24),
             CornerRadius = 18,
@@ -446,13 +498,14 @@ public sealed partial class MainForm
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 4,
+            RowCount = 5,
             Margin = Padding.Empty,
             Padding = Padding.Empty
         };
         TrySetBackColor(cardLayout, Color.Transparent, card.FillColor);
         cardLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         cardLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
+        cardLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         cardLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         cardLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         cardLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
@@ -478,19 +531,32 @@ public sealed partial class MainForm
             AutoSize = true,
             Dock = DockStyle.Fill,
             MaximumSize = new Size(410, 0),
-            Margin = new Padding(0, 2, 0, 6),
+            Margin = new Padding(0, 2, 0, 4),
             TextAlign = ContentAlignment.MiddleCenter,
             ForeColor = palette.HighContrast ? SystemColors.WindowText : NativeUiTheme.Text,
             Font = OverlayTitleFont
         };
         TrySetBackColor(title, Color.Transparent, card.FillColor);
 
+        hostSubtitle = new Label
+        {
+            AutoSize = true,
+            Dock = DockStyle.Fill,
+            MaximumSize = new Size(410, 0),
+            Margin = new Padding(0, 0, 0, 6),
+            TextAlign = ContentAlignment.MiddleCenter,
+            ForeColor = palette.HighContrast ? SystemColors.WindowText : NativeUiTheme.Accent,
+            Font = NativeUiTheme.GetSharedFont("Segoe UI Semibold", 8.5f),
+            Visible = false
+        };
+        TrySetBackColor(hostSubtitle, Color.Transparent, card.FillColor);
+
         detail = new Label
         {
             AutoSize = true,
             Dock = DockStyle.Fill,
             MaximumSize = new Size(410, 0),
-            Margin = new Padding(0, 0, 0, 16),
+            Margin = new Padding(0, 0, 0, 14),
             TextAlign = ContentAlignment.TopCenter,
             ForeColor = palette.MutedText,
             Font = OverlayDetailFont
@@ -514,11 +580,109 @@ public sealed partial class MainForm
 
         cardLayout.Controls.Add(logoHost, 0, 0);
         cardLayout.Controls.Add(title, 0, 1);
-        cardLayout.Controls.Add(detail, 0, 2);
-        cardLayout.Controls.Add(action, 0, 3);
+        cardLayout.Controls.Add(hostSubtitle, 0, 2);
+        cardLayout.Controls.Add(detail, 0, 3);
+        cardLayout.Controls.Add(action, 0, 4);
         card.Controls.Add(cardLayout);
         overlay.Controls.Add(card, 1, 1);
+
+        var capturedCard = card;
+        var capturedTitle = title;
+        var capturedHost = hostSubtitle;
+        var capturedDetail = detail;
+        var capturedAction = action;
+        var lastCompactBucket = -1;
+        void ApplyResponsiveOverlayMetrics()
+        {
+            var width = overlay.ClientSize.Width;
+            if (width <= 0) return;
+            var compact = width < 380;
+            var bucket = compact ? Math.Max(180, (width / 16) * 16) : 0;
+            if (bucket == lastCompactBucket) return;
+            lastCompactBucket = bucket;
+
+            var targetOuterPad = compact ? new Padding(8) : new Padding(24);
+            if (overlay.Padding != targetOuterPad) overlay.Padding = targetOuterPad;
+
+            var targetCardPad = compact ? new Padding(14, 14, 14, 16) : new Padding(28, 22, 28, 24);
+            if (capturedCard.Padding != targetCardPad) capturedCard.Padding = targetCardPad;
+
+            var targetCardMax = compact
+                ? new Size(Math.Max(210, width - 16), 0)
+                : new Size(480, 0);
+            if (capturedCard.MaximumSize != targetCardMax) capturedCard.MaximumSize = targetCardMax;
+
+            var maxTextWidth = compact ? Math.Max(156, width - 48) : 410;
+            var textMaxSize = new Size(maxTextWidth, 0);
+            if (capturedTitle.MaximumSize != textMaxSize) capturedTitle.MaximumSize = textMaxSize;
+            if (capturedHost.MaximumSize != textMaxSize) capturedHost.MaximumSize = textMaxSize;
+            if (capturedDetail.MaximumSize != textMaxSize) capturedDetail.MaximumSize = textMaxSize;
+
+            var targetActionWidth = compact ? Math.Clamp(maxTextWidth, 128, 168) : 168;
+            if (capturedAction.Width != targetActionWidth) capturedAction.Width = targetActionWidth;
+        }
+        overlay.Resize += (_, _) => ApplyResponsiveOverlayMetrics();
         return overlay;
+    }
+
+    private void SyncTabOverlayContext(BrowserTab tab)
+    {
+        var hostText = !tab.IsStartPage && BrowserPolicy.IsHttpUrl(tab.Url)
+            ? TextSafety.FormatHostForDisplay(tab.Url, 48)
+            : string.Empty;
+        if (hostText.Equals("Invalid address", StringComparison.OrdinalIgnoreCase))
+        {
+            hostText = string.Empty;
+        }
+        if (!string.Equals(tab.OverlayHost.Text, hostText, StringComparison.Ordinal))
+        {
+            tab.OverlayHost.Text = hostText;
+            tab.OverlayHost.AccessibleName = hostText;
+        }
+        var showHost = hostText.Length > 0;
+        if (tab.OverlayHost.Visible != showHost)
+        {
+            tab.OverlayHost.Visible = showHost;
+        }
+
+        var palette = ResolveChromeColorPolicy(IsHighContrastActive, isPrivateMode);
+        var isCrashOrError = !tab.IsDiscarded
+            && (tab.ConnectionState is ConnectionState.Failed or ConnectionState.CertificateError
+                || tab.RetryAction is not null);
+        Color targetBorder;
+        Color targetHostColor;
+        if (palette.HighContrast)
+        {
+            targetBorder = palette.Border;
+            targetHostColor = SystemColors.WindowText;
+        }
+        else if (isCrashOrError)
+        {
+            targetBorder = NativeUiTheme.Negative;
+            targetHostColor = NativeUiTheme.Negative;
+        }
+        else if (tab.IsDiscarded)
+        {
+            targetBorder = isPrivateMode
+                ? Color.FromArgb(116, 74, 152)
+                : Color.FromArgb(124, 68, 112);
+            targetHostColor = NativeUiTheme.Muted;
+        }
+        else
+        {
+            targetBorder = palette.Border;
+            targetHostColor = NativeUiTheme.Accent;
+        }
+
+        if (tab.OverlayCard.BorderColor != targetBorder)
+        {
+            tab.OverlayCard.BorderColor = targetBorder;
+            tab.OverlayCard.Invalidate();
+        }
+        if (tab.OverlayHost.ForeColor != targetHostColor)
+        {
+            tab.OverlayHost.ForeColor = targetHostColor;
+        }
     }
 
     private void ReplaceTabView(BrowserTab tab)
@@ -552,6 +716,10 @@ public sealed partial class MainForm
         tab.ChromeStoreInstallChannel = null;
         tab.ChromeStoreBridgeScriptId = null;
         tab.PendingScopedScriptNavigationUrl = null;
+        tab.LastScopedScriptRegistrationUrl = null;
+        tab.AppliedAutoDarkOverride = null;
+        tab.AppliedPreferredColorSchemeDark = null;
+        tab.AppliedWebsiteThemeGeneration = -1;
         tab.InstalledUserScriptKeys.Clear();
         tab.ContextLinkTarget = null;
         tab.PendingFileNavigationUrl = null;
@@ -818,9 +986,10 @@ public sealed partial class MainForm
         }
     }
 
-    private static void NavigateTabCore(BrowserTab tab, string targetUrl)
+    private void NavigateTabCore(BrowserTab tab, string targetUrl)
     {
         var core = tab.Core ?? throw new InvalidOperationException("The tab browser is not available.");
+        SyncWebsiteThemeBeforeNavigation(tab, targetUrl);
         tab.PendingFileNavigationUrl = BrowserPolicy.IsLocalFileUrl(targetUrl) ? targetUrl : null;
         core.Navigate(targetUrl);
     }
@@ -869,7 +1038,7 @@ public sealed partial class MainForm
             || !BrowserPolicy.UrlEquals(tab.Url, targetUrl)
             || tab.Core is null) return;
 
-        await EnsureUrlScopedScriptsRegisteredAsync(tab, targetUrl);
+        await EnsureUrlScopedScriptsRegisteredIfNeededAsync(tab, targetUrl);
         if (isClosing
             || tab.IsClosed
             || tab.NavigationRequestId != navigationRequestId
@@ -1035,7 +1204,13 @@ public sealed partial class MainForm
 
     private async Task RestoreDiscardedTabAsync(BrowserTab tab, bool focusPage)
     {
-        if (isClosing || tab.IsClosed || !tab.IsDiscarded || tab.IsInitializing) return;
+        if (!tab.IsDiscarded) return;
+        await RestoreTabContentAsync(tab, focusPage);
+    }
+
+    private async Task RestoreTabContentAsync(BrowserTab tab, bool focusPage)
+    {
+        if (isClosing || tab.IsClosed || tab.IsInitializing || (!tab.IsDiscarded && tab.Core is not null)) return;
         if (!CanContinueRequiredTabInitialization(tab)) return;
         if (tab.IsStartPage)
         {
@@ -1063,7 +1238,7 @@ public sealed partial class MainForm
         {
             return;
         }
-        await EnsureUrlScopedScriptsRegisteredAsync(tab, targetUrl);
+        await EnsureUrlScopedScriptsRegisteredIfNeededAsync(tab, targetUrl);
         if (isClosing
             || tab.IsClosed
             || tab.NavigationRequestId != navigationRequestId
@@ -1102,6 +1277,7 @@ public sealed partial class MainForm
             $"{detail}. It will reload when selected.",
             "Reload tab",
             () => RestoreDiscardedTabAsync(tab, focusPage: true));
+        SyncTabOverlayContext(tab);
         UpdateTabHeader(tab);
         if (!restoringSession)
         {
@@ -1700,6 +1876,8 @@ public sealed partial class MainForm
     }
 
     private BrowserTab? activeTabBeforeDrag;
+    private string? lastTabDragGhostLabel;
+    private bool lastTabDragGhostHighContrast;
 
     private void BeginTabDrag(BrowserTab tab, Point screenLocation)
     {
@@ -1711,12 +1889,25 @@ public sealed partial class MainForm
         tabDragIndicatorIndex = -1;
         tabDragScreenLocation = screenLocation;
         tab.Header.SetDragging(true);
-        tabDragGhost.SetState(tab.Title, IsHighContrastActive);
+        UpdateTabDragGhostLabel(tab.Title);
         if (!multiViewState.IsMultiViewActive || multiViewState.ContainsTab(tab.Id))
         {
             ActivateTab(tab, focusPage: false, restoreDiscarded: false);
         }
         UpdateTabDrag(screenLocation);
+    }
+
+    private void UpdateTabDragGhostLabel(string label)
+    {
+        var hc = IsHighContrastActive;
+        if (string.Equals(lastTabDragGhostLabel, label, StringComparison.Ordinal)
+            && lastTabDragGhostHighContrast == hc)
+        {
+            return;
+        }
+        lastTabDragGhostLabel = label;
+        lastTabDragGhostHighContrast = hc;
+        tabDragGhost.SetState(label, hc);
     }
 
     private void UpdateTabDrag(Point screenLocation)
@@ -1775,6 +1966,7 @@ public sealed partial class MainForm
         draggedTab?.Header.SetDragging(false);
         draggedTab = null;
         activeTabBeforeDrag = null;
+        lastTabDragGhostLabel = null;
         tabDragDropIndex = -1;
         tabDragIndicatorIndex = -1;
         tabDropIndicator.Visible = false;
@@ -1879,21 +2071,33 @@ public sealed partial class MainForm
     {
         var areaPoint = tabArea.PointToClient(screenLocation);
         var verticalAllowance = ScaleChromeLogical(24);
-        if (areaPoint.Y < -verticalAllowance
-            || areaPoint.Y > tabArea.ClientSize.Height + verticalAllowance)
+        var inTabStripBand = areaPoint.Y >= -verticalAllowance
+            && areaPoint.Y <= tabArea.ClientSize.Height + verticalAllowance;
+        string? dropActionLabel = null;
+        if (!inTabStripBand)
         {
-            tabDragGhost.Visible = false;
-            return;
+            dropActionLabel = ResolveMultiViewDropActionLabel(tab, screenLocation);
+            if (dropActionLabel is null)
+            {
+                tabDragGhost.Visible = false;
+                return;
+            }
         }
 
-        var ghostWidth = Math.Max(ScaleChromeLogical(72), tab.Header.Width);
+        UpdateTabDragGhostLabel(dropActionLabel ?? tab.Title);
+        var minimumGhostWidth = dropActionLabel is not null
+            ? ScaleChromeLogical(176)
+            : ScaleChromeLogical(72);
+        var ghostWidth = Math.Min(
+            Math.Max(1, tabArea.ClientSize.Width),
+            Math.Max(minimumGhostWidth, tab.Header.Width));
         var ghostHeight = Math.Max(ScaleChromeLogical(24), tab.Header.Height);
         var maximumX = Math.Max(0, tabArea.ClientSize.Width - ghostWidth);
         var ghostX = Math.Clamp(areaPoint.X - (ghostWidth / 2), 0, maximumX);
         var maximumY = Math.Max(0, tabArea.ClientSize.Height - ghostHeight);
         var ghostY = Math.Clamp(tabStrip.Top + tab.Header.Top, 0, maximumY);
         tabDragGhost.SetBounds(ghostX, ghostY, ghostWidth, ghostHeight);
-        tabDragGhost.Visible = true;
+        if (!tabDragGhost.Visible) tabDragGhost.Visible = true;
         tabDragGhost.BringToFront();
         if (tabDropIndicator.Visible) tabDropIndicator.BringToFront();
     }

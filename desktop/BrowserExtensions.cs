@@ -80,6 +80,7 @@ internal sealed class BrowserExtensions
     private const int MaximumRegistryBytes = 2 * 1024 * 1024;
     private const int MaximumManagedMarkersToScan = 1_024;
     private static readonly TimeSpan StalePreparedPackageAge = TimeSpan.FromHours(6);
+    private const long StaleCleanupThrottleMs = 30L * 60L * 1000L;
     // SHA-256 of Chromium's production CRX3 publisher SPKI
     // (components/crx_file/crx_verifier.cc). Store downloads must contain a
     // valid proof from this key in addition to the extension developer proof.
@@ -116,6 +117,7 @@ internal sealed class BrowserExtensions
     private string[] cachedScriptContents = Array.Empty<string>();
     private DateTime lastScriptDirectoryWriteUtc = DateTime.MinValue;
     private long lastScriptScanTick = long.MinValue;
+    private long lastStaleCleanupTick = long.MinValue;
 
     public BrowserExtensions(string? folderPath = null)
     {
@@ -405,8 +407,22 @@ internal sealed class BrowserExtensions
             lastWriteUtc,
             $"{path}|{lastWriteUtc.Ticks}|{length}",
             wrapped,
-            matches,
-            excludes);
+            CompileUserScriptPatterns(matches),
+            CompileUserScriptPatterns(excludes));
+    }
+
+    private static CompiledUserScriptPattern[] CompileUserScriptPatterns(IReadOnlyList<string> patterns)
+    {
+        if (patterns.Count == 0) return Array.Empty<CompiledUserScriptPattern>();
+        var compiled = new List<CompiledUserScriptPattern>(patterns.Count);
+        for (var i = 0; i < patterns.Count; i++)
+        {
+            if (CompiledUserScriptPattern.TryCompile(patterns[i], out var entry))
+            {
+                compiled.Add(entry);
+            }
+        }
+        return compiled.Count == 0 ? Array.Empty<CompiledUserScriptPattern>() : compiled.ToArray();
     }
 
     private static bool MatchesUserScriptUrl(CachedScript script, Uri uri)
@@ -418,11 +434,13 @@ internal sealed class BrowserExtensions
             return false;
         }
 
-        var pathWithQueryAndFragment = uri.AbsolutePath + uri.Query + uri.Fragment;
+        string? pathWithQueryAndFragment = null;
+        var scheme = uri.Scheme;
         var matched = false;
-        foreach (var pattern in script.Matches)
+        var matches = script.Matches;
+        for (var i = 0; i < matches.Length; i++)
         {
-            if (MatchesUserScriptPattern(pattern, uri.Scheme, host, pathWithQueryAndFragment))
+            if (matches[i].Matches(scheme, host, uri, ref pathWithQueryAndFragment))
             {
                 matched = true;
                 break;
@@ -430,9 +448,10 @@ internal sealed class BrowserExtensions
         }
         if (!matched) return false;
 
-        foreach (var pattern in script.Excludes)
+        var excludes = script.Excludes;
+        for (var i = 0; i < excludes.Length; i++)
         {
-            if (MatchesUserScriptPattern(pattern, uri.Scheme, host, pathWithQueryAndFragment))
+            if (excludes[i].Matches(scheme, host, uri, ref pathWithQueryAndFragment))
             {
                 return false;
             }
@@ -440,52 +459,127 @@ internal sealed class BrowserExtensions
         return true;
     }
 
-    private static bool MatchesUserScriptPattern(
-        string pattern,
-        string scheme,
-        string host,
-        string pathWithQueryAndFragment)
+    private readonly struct CompiledUserScriptPattern
     {
-        if (pattern.Equals("<all_urls>", StringComparison.OrdinalIgnoreCase)) return true;
-        var delimiter = pattern.IndexOf("://", StringComparison.Ordinal);
-        if (delimiter < 1) return false;
-        var patternScheme = pattern.AsSpan(0, delimiter);
-        var rest = pattern.AsSpan(delimiter + 3);
-        var slashIndex = rest.IndexOf('/');
-        if (slashIndex < 0) return false;
+        public bool IsAllUrls { get; }
+        public bool AnyScheme { get; }
+        public string? Scheme { get; }
+        public bool AnyHost { get; }
+        public bool SubdomainWildcard { get; }
+        public string? Host { get; }
+        public bool AnyPath { get; }
+        public string? PathPattern { get; }
 
-        var patternHost = rest[..slashIndex];
-        var patternPath = rest[slashIndex..];
-        if (!patternScheme.Equals("*", StringComparison.Ordinal))
+        private CompiledUserScriptPattern(
+            bool isAllUrls,
+            bool anyScheme,
+            string? scheme,
+            bool anyHost,
+            bool subdomainWildcard,
+            string? host,
+            bool anyPath,
+            string? pathPattern)
         {
-            if (!patternScheme.Equals(scheme.AsSpan(), StringComparison.OrdinalIgnoreCase)) return false;
-        }
-        else if (!scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
-            && !scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
+            IsAllUrls = isAllUrls;
+            AnyScheme = anyScheme;
+            Scheme = scheme;
+            AnyHost = anyHost;
+            SubdomainWildcard = subdomainWildcard;
+            Host = host;
+            AnyPath = anyPath;
+            PathPattern = pathPattern;
         }
 
-        if (!patternHost.Equals("*", StringComparison.Ordinal))
+        public static bool TryCompile(string pattern, out CompiledUserScriptPattern compiled)
         {
-            if (patternHost.StartsWith("*.", StringComparison.Ordinal))
+            if (pattern.Equals("<all_urls>", StringComparison.OrdinalIgnoreCase))
             {
-                var baseHost = patternHost[2..];
-                if (!host.AsSpan().Equals(baseHost, StringComparison.OrdinalIgnoreCase)
-                    && !(host.Length > baseHost.Length + 1
-                        && host[host.Length - baseHost.Length - 1] == '.'
-                        && host.AsSpan(host.Length - baseHost.Length).Equals(baseHost, StringComparison.OrdinalIgnoreCase)))
+                compiled = new CompiledUserScriptPattern(true, true, null, true, false, null, true, null);
+                return true;
+            }
+            var delimiter = pattern.IndexOf("://", StringComparison.Ordinal);
+            if (delimiter < 1)
+            {
+                compiled = default;
+                return false;
+            }
+            var schemeSpan = pattern.AsSpan(0, delimiter);
+            var rest = pattern.AsSpan(delimiter + 3);
+            var slashIndex = rest.IndexOf('/');
+            if (slashIndex < 0)
+            {
+                compiled = default;
+                return false;
+            }
+
+            var anyScheme = schemeSpan.Equals("*", StringComparison.Ordinal);
+            var scheme = anyScheme ? null : schemeSpan.ToString().ToLowerInvariant();
+            var hostSpan = rest[..slashIndex];
+            var pathSpan = rest[slashIndex..];
+            var anyHost = hostSpan.Equals("*", StringComparison.Ordinal);
+            var subdomainWildcard = !anyHost && hostSpan.StartsWith("*.", StringComparison.Ordinal);
+            var host = anyHost
+                ? null
+                : (subdomainWildcard
+                    ? hostSpan[2..].ToString().ToLowerInvariant()
+                    : hostSpan.ToString().ToLowerInvariant());
+            var anyPath = pathSpan.Equals("/*", StringComparison.Ordinal);
+            compiled = new CompiledUserScriptPattern(
+                false,
+                anyScheme,
+                scheme,
+                anyHost,
+                subdomainWildcard,
+                host,
+                anyPath,
+                anyPath ? null : pathSpan.ToString());
+            return true;
+        }
+
+        public bool Matches(
+            string scheme,
+            string lowerHost,
+            Uri uri,
+            ref string? pathWithQueryAndFragment)
+        {
+            if (IsAllUrls) return true;
+            if (AnyScheme)
+            {
+                if (!scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                    && !scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
                 {
                     return false;
                 }
             }
-            else if (!host.AsSpan().Equals(patternHost, StringComparison.OrdinalIgnoreCase))
+            else if (!scheme.Equals(Scheme, StringComparison.OrdinalIgnoreCase))
             {
                 return false;
             }
-        }
 
-        return WildcardPathMatches(patternPath, pathWithQueryAndFragment.AsSpan());
+            if (!AnyHost)
+            {
+                var targetHost = Host!;
+                if (SubdomainWildcard)
+                {
+                    if (!lowerHost.Equals(targetHost, StringComparison.Ordinal)
+                        && !(lowerHost.Length > targetHost.Length + 1
+                            && lowerHost[lowerHost.Length - targetHost.Length - 1] == '.'
+                            && lowerHost.AsSpan(lowerHost.Length - targetHost.Length)
+                                .Equals(targetHost.AsSpan(), StringComparison.Ordinal)))
+                    {
+                        return false;
+                    }
+                }
+                else if (!lowerHost.Equals(targetHost, StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+
+            if (AnyPath) return true;
+            pathWithQueryAndFragment ??= uri.AbsolutePath + uri.Query + uri.Fragment;
+            return WildcardPathMatches(PathPattern.AsSpan(), pathWithQueryAndFragment.AsSpan());
+        }
     }
 
     private static bool WildcardPathMatches(ReadOnlySpan<char> pattern, ReadOnlySpan<char> value)
@@ -1132,8 +1226,16 @@ internal sealed class BrowserExtensions
             + "if(!listingId()){if(existing)existing.remove();return;}if(existing)return;"
             + "const button=document.createElement('button');button.id=fallbackId;button.type='button';"
             + "button.textContent='Install in MishaWeb';button.setAttribute('aria-label','Install this extension in MishaWeb');"
-            + "button.style.cssText='position:fixed;right:20px;top:116px;z-index:2147483647;padding:11px 18px;border:0;border-radius:22px;background:#d63384;color:white;font:600 14px Arial,sans-serif;box-shadow:0 3px 12px #0005;cursor:pointer';"
+            + "const restShadow='inset 0 1px 0 rgba(255,255,255,0.42),0 8px 24px rgba(184,36,118,0.42)';"
+            + "const hoverShadow='inset 0 1px 0 rgba(255,255,255,0.52),0 12px 28px rgba(226,59,139,0.52)';"
+            + "button.style.cssText='position:fixed;right:20px;top:116px;z-index:2147483647;padding:11px 20px;border:1px solid rgba(255,214,234,0.48);border-radius:999px;background:linear-gradient(135deg,#e23b8b 0%,#b82476 100%);color:#fff;font:600 13.5px/1.2 system-ui,-apple-system,\"Segoe UI\",sans-serif;letter-spacing:0.01em;box-shadow:'+restShadow+';backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);cursor:pointer;transition:transform .16s ease,box-shadow .16s ease,opacity .16s ease';"
+            + "button.addEventListener('mouseenter',()=>{button.style.transform='translateY(-1px)';button.style.boxShadow=hoverShadow;});"
+            + "button.addEventListener('mouseleave',()=>{button.style.transform='';button.style.boxShadow=restShadow;});"
             + "document.documentElement.appendChild(button);};"
+            + "let feedbackTimer=0;"
+            + "const showInstallingFeedback=()=>{const pill=document.getElementById(fallbackId);if(!pill)return;"
+            + "pill.textContent='Installing in MishaWeb\\u2026';pill.style.opacity='0.88';"
+            + "clearTimeout(feedbackTimer);feedbackTimer=setTimeout(()=>{if(pill.isConnected){pill.textContent='Install in MishaWeb';pill.style.opacity='1';}},6000);};"
             + "let syncPending=false;const scheduleSync=()=>{if(syncPending)return;syncPending=true;setTimeout(()=>{syncPending=false;syncFallback();},50);};"
             + "const start=()=>{syncFallback();if(window.navigation&&typeof window.navigation.addEventListener==='function'){window.navigation.addEventListener('navigatesuccess',scheduleSync);}};"
             + "addEventListener('popstate',scheduleSync);addEventListener('hashchange',scheduleSync);"
@@ -1148,6 +1250,7 @@ internal sealed class BrowserExtensions
             + "const label=(button.getAttribute('aria-label')||button.textContent||'').replace(/\\s+/g,' ').trim();"
             + "if(button.id!==fallbackId&&jslog!=='177592'&&!/^add to chrome$/i.test(label))return;"
             + "event.preventDefault();event.stopImmediatePropagation();event.stopPropagation();"
+            + "showInstallingFeedback();"
             + "postMessage(channel+':'+id);"
             + "},true);"
             + "})();";
@@ -1255,7 +1358,6 @@ internal sealed class BrowserExtensions
                 throw new InvalidDataException("The extension package key did not match the store ID.");
             }
             AddManifestKey(manifestRoot, manifest.Root, publicKey);
-            manifest = ReadManifest(manifestRoot);
         }
 
         return FinalizePreparedExtension(
@@ -2407,8 +2509,14 @@ internal sealed class BrowserExtensions
 
     private string CreateStagingFolder()
     {
-        CleanupStaleStagingFolders();
-        CleanupStalePreparedPackages();
+        var nowTick = Environment.TickCount64;
+        var previousTick = Volatile.Read(ref lastStaleCleanupTick);
+        if ((previousTick == long.MinValue || nowTick - previousTick >= StaleCleanupThrottleMs)
+            && Interlocked.CompareExchange(ref lastStaleCleanupTick, nowTick, previousTick) == previousTick)
+        {
+            CleanupStaleStagingFolders();
+            CleanupStalePreparedPackages();
+        }
         var stagingPath = Path.Combine(managedFolderPath, ".staging-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(stagingPath);
         return stagingPath;
@@ -2928,8 +3036,8 @@ internal sealed class BrowserExtensions
         DateTime LastWriteUtc,
         string ScriptKey,
         string Content,
-        IReadOnlyList<string> Matches,
-        IReadOnlyList<string> Excludes);
+        CompiledUserScriptPattern[] Matches,
+        CompiledUserScriptPattern[] Excludes);
     private sealed record ManagedPackageMarkerInfo(
         string PackageFolderPath,
         ManagedPackageMarker Marker,
