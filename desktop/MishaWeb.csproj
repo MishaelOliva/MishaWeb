@@ -39,7 +39,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.Web.WebView2" Version="[1.0.4129.50]" PrivateAssets="all" GeneratePathProperty="true" />
+    <PackageReference Include="Microsoft.Web.WebView2" Version="[1.0.4314.35]" PrivateAssets="all" GeneratePathProperty="true" />
     <EmbeddedResource Include="$(PkgMicrosoft_Web_WebView2)\runtimes\win-x64\native\WebView2Loader.dll" LogicalName="MishaWeb.WebView2Loader.dll" />
     <EmbeddedResource Include="Assets\StartPage\Source\bunny-night-garden-v2.jpg" LogicalName="MishaWeb.StartPageBackdrop.jpg" />
     <EmbeddedResource Include="Assets\Brand\mishaweb-bunny-logo-runtime.png" LogicalName="MishaWeb.Brand.BunnyLogo.png" />
