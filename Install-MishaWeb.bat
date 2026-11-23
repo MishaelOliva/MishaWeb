@@ -9,7 +9,7 @@ echo.
 
 set "SCRIPT_DIR=%~dp0"
 set "LOCAL_SCRIPT=%SCRIPT_DIR%build\Install-MishaWeb.ps1"
-set "DEFAULT_RELEASE_TAG=v2.5.1"
+set "DEFAULT_RELEASE_TAG=v2.6.0"
 
 if exist "%LOCAL_SCRIPT%" (
     echo [INFO] Running installer from local repository package...

@@ -13,7 +13,7 @@ param(
     [string]$InstallPath = (Join-Path $env:LOCALAPPDATA 'Programs\MishaWeb'),
     [string]$RepoUrl = 'https://github.com/MishaelOliva/browser-engine',
     [string]$Branch = '',
-    [string]$ReleaseTag = 'v2.5.1',
+    [string]$ReleaseTag = 'v2.6.0',
     [string]$ExpectedSha256 = '',
     [switch]$ForceDownload,
     [switch]$NoGui

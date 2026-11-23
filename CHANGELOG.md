@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.6.0 - 2026-11-23
+
+### Performance, memory, and binary size
+
+- Reduced `MishaWeb.dll` and `publish/MishaWeb.exe` size by replacing duplicated `const string` script/data literals (`AdBlockDocumentScript.cs`, `PublicSuffixRules.cs`, `ReaderModeScript.cs`, `BrowserPerformance.cs`), re-encoding `bunny-night-garden-v2.jpg` at Q83 (275 KB to 201 KB) and optimizing `mishaweb-bunny-logo-v2.ico` (155 KB to 110 KB), disabling Release PDB emission, and turning off unused Release runtime feature switches (`EventSourceSupport`, `HttpActivityPropagationSupport`, `MetadataUpdaterSupport`, `StartupHookSupport`) in `desktop/MishaWeb.csproj`.
+- Cut title-bar `WM_NCHITTEST` Win32 calls by caching per-DPI resize frames and hit-testing chrome controls in client coordinates, deduplicated DWM frame calls, made main-menu submenus populate lazily on open, and cached GDI+ fonts, brushes, favicons, and `RoundedPanel` chrome surfaces.
+- Shrunk `FilterRule` memory layout to 40 bytes with optional scope sidecars, added rolling-hash 4-gram/3-gram indexing and span-based glob matching in `AdBlockEngine.cs`, cached full cosmetic wrapper scripts to avoid per-frame LOH allocations, reused parsed `Uri` instances in `OnWebResourceRequested`, and added a fast regex pre-check before YouTube payload sanitization.
+- Released the full-resolution Start Page backdrop source after a 3-second idle cooldown on all machines, pre-warmed WebView2 in parallel with chrome setup and omnibox typing, cut duplicate disk flushes and unchanged-collection re-sorting in `BrowserStateStore`, and reused active tab profiles in the Extensions Manager instead of spawning a hidden controller.
+
+### Chrome, Start Page 2.0, Multi-View 2.0, and Reader Mode 2.0
+
+- Clipped Liquid Glass specular highlights to rounded control bounds, added rounded Liquid Glass hover pills on window caption buttons, wired the Incognito badge to Site Info with matching violet tints, added per-monitor DPI scaling across chrome columns and menus, rendered compact pinned tabs as centered icon pills with a bottom loading bar, and added live transfer speed (`KB/s`, `MB/s`) to download progress.
+- Upgraded the native Start Page to a responsive 6-tile quick-link grid with vector icons for GitHub, ChatGPT/OpenAI, Reddit, Wikipedia, LinkedIn, and Netflix, host-hashed monogram gradients, middle-click and `Ctrl+Click` new-tab opening, a compact live status pill bar, inline invalid-address feedback, and a 1-click clear button in `SmartSearchBar`.
+- Kept up to three local matches (open tabs, bookmarks, exact/prefix hits) when live search suggestions arrive, fixed keyboard navigation focus in the Command Palette (`Ctrl+K`) and title splitting in the MRU Switcher (`Ctrl+Tab`), and switched Extensions Manager cards to in-place updates with folder, Store, and ID copy actions.
+- Upgraded Multi-View with a pane Maximize/Restore button, muted domain pills, 6px grab-pill splitters, live drag drop-zone target labels, and compact tab overlays that fit inside 240px split panes without clipping.
+- Rebuilt Reader Mode around a single-pass `TreeWalker` with lazy-image promotion (`data-src`/`data-lazy-src`/`data-original`), an automatic editorial header with reading time, a collapsible table of contents for multi-heading articles, and a GPU-composited reading progress bar.
+- Added blocked-request category counts (`Ads`, `Trackers`, `Privacy`, `Scripts`) and top blocked domains to Site Info, and updated the Chrome Web Store install pill styling.
+
+### Release pipeline, CI, and test speed
+
+- Bumped all version metadata and default installer release tags (`MishaWeb.csproj`, `app.manifest`, `package.json`, `build/Install-MishaWeb.ps1`, `Install-MishaWeb.bat`) to `2.6.0` / `v2.6.0`, and added an automated installer `ReleaseTag` drift gate in `build/Publish-MishaWeb.ps1` with negative drift coverage in `desktop.tests/PublishTransactionSmoke.ps1`.
+- Updated `build/Publish-MishaWeb.ps1` to run the five Node contract suites during local publish checks and to verify post-move presence and exact byte lengths without re-hashing the 53 MB portable executable immediately after staging validation (keeping full SHA-256 checks in staging and `-ValidateOnly`).
+- Switched `npm run desktop:test:node` and `.github/workflows/windows.yml` to parallel `node --test` execution and JSON-parsed NuGet vulnerability checks (`--format json`), and accelerated the C# smoke suite by eliminating offscreen window-activation stalls and repeated unleased backdrop decodes.
+
 ## 2.5.1 - 2026-11-22
 
 ### Reader mode, policies, and performance

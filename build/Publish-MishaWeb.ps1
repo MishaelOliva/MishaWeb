@@ -26,6 +26,8 @@ $projectPath = [System.IO.Path]::GetFullPath((Join-Path $desktopRoot 'MishaWeb.c
 $testProjectPath = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot 'desktop.tests\MishaWeb.SmokeTests.csproj'))
 $publishTransactionTestPath = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot 'desktop.tests\PublishTransactionSmoke.ps1'))
 $packagePath = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot 'package.json'))
+$installScriptPath = [System.IO.Path]::GetFullPath((Join-Path $buildRoot 'Install-MishaWeb.ps1'))
+$installBatPath = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot 'Install-MishaWeb.bat'))
 $noticeSourcePath = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot 'licenses\THIRD-PARTY-NOTICES.txt'))
 $dependencyInventoryPath = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot 'licenses\DEPENDENCY-INVENTORY.md'))
 $manifestName = 'MishaWeb.release.json'
@@ -268,10 +270,67 @@ function Get-FileRecord {
     }
 }
 
+function Get-ReleaseMetadata {
+    param(
+        [Parameter(Mandatory = $true)][string] $ProjectPath,
+        [Parameter(Mandatory = $true)][string] $PackagePath,
+        [Parameter(Mandatory = $true)][string] $InstallScriptPath,
+        [Parameter(Mandatory = $true)][string] $InstallBatPath
+    )
+
+    [xml] $projectXml = Get-Content -Raw -LiteralPath $ProjectPath
+    $productVersion = [string] (@($projectXml.Project.PropertyGroup.Version)[0])
+    $targetFramework = [string] (@($projectXml.Project.PropertyGroup.TargetFramework)[0])
+    $packageMetadata = Get-Content -Raw -LiteralPath $PackagePath | ConvertFrom-Json
+    if ([string]::IsNullOrWhiteSpace($productVersion) -or [string]::IsNullOrWhiteSpace($targetFramework)) {
+        throw 'Project version or target framework metadata is missing.'
+    }
+    if ($packageMetadata.version -ne $productVersion) {
+        throw "package.json version '$($packageMetadata.version)' does not match project version '$productVersion'."
+    }
+    if ($targetFramework -ne 'net10.0-windows') {
+        throw "Release project must target net10.0-windows; found '$targetFramework'."
+    }
+
+    $expectedReleaseTag = "v$productVersion"
+
+    $installScriptText = Get-Content -Raw -LiteralPath $InstallScriptPath
+    $psTagMatch = [regex]::Match(
+        $installScriptText,
+        '(?m)^\s*\[string\]\s*\$ReleaseTag\s*=\s*[''"](?<tag>[^''"]+)[''"]\s*,?\s*\r?$')
+    if (-not $psTagMatch.Success) {
+        throw "Could not locate default `$ReleaseTag in '$InstallScriptPath'."
+    }
+    $psReleaseTag = $psTagMatch.Groups['tag'].Value
+    if ($psReleaseTag -ne $expectedReleaseTag) {
+        throw "Install-MishaWeb.ps1 default ReleaseTag '$psReleaseTag' does not match expected tag '$expectedReleaseTag'."
+    }
+
+    $installBatText = Get-Content -Raw -LiteralPath $InstallBatPath
+    $batTagMatch = [regex]::Match(
+        $installBatText,
+        '(?m)^\s*set\s+"DEFAULT_RELEASE_TAG=(?<tag>[^"]+)"\s*\r?$')
+    if (-not $batTagMatch.Success) {
+        throw "Could not locate DEFAULT_RELEASE_TAG in '$InstallBatPath'."
+    }
+    $batReleaseTag = $batTagMatch.Groups['tag'].Value
+    if ($batReleaseTag -ne $expectedReleaseTag) {
+        throw "Install-MishaWeb.bat DEFAULT_RELEASE_TAG '$batReleaseTag' does not match expected tag '$expectedReleaseTag'."
+    }
+
+    return [pscustomobject]@{
+        ProjectXml = $projectXml
+        ProductVersion = $productVersion
+        TargetFramework = $targetFramework
+        ExpectedReleaseTag = $expectedReleaseTag
+    }
+}
+
 function Test-ReleaseOutput {
     param(
         [Parameter(Mandatory = $true)][string] $OutputPath,
-        [Parameter(Mandatory = $true)] $Definition
+        [Parameter(Mandatory = $true)] $Definition,
+        [object] $StagingValidation = $null
     )
 
     if (-not (Test-Path -LiteralPath $OutputPath -PathType Container)) {
@@ -289,17 +348,6 @@ function Test-ReleaseOutput {
         }
     }
 
-    $hashedNames = @($payloadNames + $manifestName)
-    $actualRecords = @{}
-    foreach ($name in $hashedNames) {
-        $actualRecords[$name] = Get-FileRecord -Directory $OutputPath -Name $name
-    }
-
-    $sourceNoticeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $noticeSourcePath).Hash.ToLowerInvariant()
-    if ($actualRecords['THIRD-PARTY-NOTICES.txt'].sha256 -ne $sourceNoticeHash) {
-        throw 'Release THIRD-PARTY-NOTICES.txt does not match the current dependency notice source.'
-    }
-
     if (-not $Definition.AllowUnrelatedFiles) {
         $actualNames = @(Get-ChildItem -Force -LiteralPath $OutputPath | ForEach-Object { $_.Name } | Sort-Object)
         $expectedNames = @($releaseNames | Sort-Object)
@@ -315,6 +363,41 @@ function Test-ReleaseOutput {
                 throw "One-click output retained legacy publish file '$legacyName'."
             }
         }
+    }
+
+    $hashedNames = @($payloadNames + $manifestName)
+    if ($null -ne $StagingValidation) {
+        # Staging payloads were just SHA-256 verified before promotion; avoid re-hashing
+        # the full executable immediately after moving and verify exact byte lengths instead.
+        foreach ($name in $hashedNames) {
+            $item = Get-Item -Force -LiteralPath (Join-Path $OutputPath $name)
+            $expectedBytes = [long] $StagingValidation.Records[$name].bytes
+            if ($item.PSIsContainer -or [long] $item.Length -ne $expectedBytes) {
+                throw "Post-move size mismatch for '$name'. Expected $expectedBytes bytes; got $($item.Length)."
+            }
+        }
+        $checksumItem = Get-Item -Force -LiteralPath (Join-Path $OutputPath $checksumName)
+        if ($checksumItem.PSIsContainer -or [long] $checksumItem.Length -ne [long] $StagingValidation.ChecksumBytes) {
+            throw "Post-move size mismatch for '$checksumName'. Expected $($StagingValidation.ChecksumBytes) bytes; got $($checksumItem.Length)."
+        }
+        return [pscustomobject]@{
+            Executable = (Join-Path $OutputPath 'MishaWeb.exe')
+            Bytes = $StagingValidation.Bytes
+            Sha256 = $StagingValidation.Sha256
+            AuthenticodeStatus = $StagingValidation.AuthenticodeStatus
+            Records = $StagingValidation.Records
+            ChecksumBytes = $StagingValidation.ChecksumBytes
+        }
+    }
+
+    $actualRecords = @{}
+    foreach ($name in $hashedNames) {
+        $actualRecords[$name] = Get-FileRecord -Directory $OutputPath -Name $name
+    }
+
+    $sourceNoticeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $noticeSourcePath).Hash.ToLowerInvariant()
+    if ($actualRecords['THIRD-PARTY-NOTICES.txt'].sha256 -ne $sourceNoticeHash) {
+        throw 'Release THIRD-PARTY-NOTICES.txt does not match the current dependency notice source.'
     }
 
     $manifestPath = Join-Path $OutputPath $manifestName
@@ -396,11 +479,14 @@ function Test-ReleaseOutput {
         throw "A valid Authenticode signature is required; current status is '$signatureStatus'."
     }
 
+    $checksumItem = Get-Item -Force -LiteralPath (Join-Path $OutputPath $checksumName)
     return [pscustomobject]@{
         Executable = $exePath
         Bytes = $exeRecord.bytes
         Sha256 = $exeRecord.sha256
         AuthenticodeStatus = $signatureStatus
+        Records = $actualRecords
+        ChecksumBytes = [long] $checksumItem.Length
     }
 }
 
@@ -507,7 +593,8 @@ function Move-FolderRelease {
     param(
         [Parameter(Mandatory = $true)][string] $StagingPath,
         [Parameter(Mandatory = $true)][string] $DestinationPath,
-        [Parameter(Mandatory = $true)] $Definition
+        [Parameter(Mandatory = $true)] $Definition,
+        [object] $StagingValidation = $null
     )
 
     $destinationLeaf = Split-Path -Leaf $DestinationPath
@@ -528,7 +615,12 @@ function Move-FolderRelease {
 
         Move-Item -LiteralPath $StagingPath -Destination $DestinationPath
         $newMoved = $true
-        $validation = Test-ReleaseOutput -OutputPath $DestinationPath -Definition $Definition
+        if ($null -ne $StagingValidation) {
+            $validation = Test-ReleaseOutput -OutputPath $DestinationPath -Definition $Definition -StagingValidation $StagingValidation
+        }
+        else {
+            $validation = Test-ReleaseOutput -OutputPath $DestinationPath -Definition $Definition
+        }
     }
     catch {
         if ($newMoved -and (Test-Path -LiteralPath $DestinationPath)) {
@@ -556,7 +648,8 @@ function Move-FolderRelease {
 function Move-OneClickRelease {
     param(
         [Parameter(Mandatory = $true)][string] $StagingPath,
-        [Parameter(Mandatory = $true)] $Definition
+        [Parameter(Mandatory = $true)] $Definition,
+        [object] $StagingValidation = $null
     )
 
     [void] (Assert-ExactPath -Candidate $Definition.OutputPath -Expected $repositoryRoot -Label 'One-click destination')
@@ -592,7 +685,12 @@ function Move-OneClickRelease {
             $installedNames += $name
         }
 
-        $validation = Test-ReleaseOutput -OutputPath $repositoryRoot -Definition $Definition
+        if ($null -ne $StagingValidation) {
+            $validation = Test-ReleaseOutput -OutputPath $repositoryRoot -Definition $Definition -StagingValidation $StagingValidation
+        }
+        else {
+            $validation = Test-ReleaseOutput -OutputPath $repositoryRoot -Definition $Definition
+        }
     }
     catch {
         foreach ($name in $installedNames) {
@@ -636,6 +734,8 @@ foreach ($requiredPath in @(
     $testProjectPath,
     $publishTransactionTestPath,
     $packagePath,
+    $installScriptPath,
+    $installBatPath,
     $noticeSourcePath,
     $dependencyInventoryPath
 )) {
@@ -644,19 +744,14 @@ foreach ($requiredPath in @(
     }
 }
 
-[xml] $projectXml = Get-Content -Raw -LiteralPath $projectPath
-$script:ProductVersion = [string] (@($projectXml.Project.PropertyGroup.Version)[0])
-$script:TargetFramework = [string] (@($projectXml.Project.PropertyGroup.TargetFramework)[0])
-$packageMetadata = Get-Content -Raw -LiteralPath $packagePath | ConvertFrom-Json
-if ([string]::IsNullOrWhiteSpace($script:ProductVersion) -or [string]::IsNullOrWhiteSpace($script:TargetFramework)) {
-    throw 'Project version or target framework metadata is missing.'
-}
-if ($packageMetadata.version -ne $script:ProductVersion) {
-    throw "package.json version '$($packageMetadata.version)' does not match project version '$($script:ProductVersion)'."
-}
-if ($script:TargetFramework -ne 'net10.0-windows') {
-    throw "Release project must target net10.0-windows; found '$($script:TargetFramework)'."
-}
+$releaseMetadata = Get-ReleaseMetadata `
+    -ProjectPath $projectPath `
+    -PackagePath $packagePath `
+    -InstallScriptPath $installScriptPath `
+    -InstallBatPath $installBatPath
+$projectXml = $releaseMetadata.ProjectXml
+$script:ProductVersion = $releaseMetadata.ProductVersion
+$script:TargetFramework = $releaseMetadata.TargetFramework
 
 $webView2References = @($projectXml.Project.ItemGroup.PackageReference |
     Where-Object { $_.Include -eq 'Microsoft.Web.WebView2' })
@@ -768,6 +863,17 @@ try {
             '--no-build',
             '--no-restore'
         )
+        $nodeTests = @(
+            (Join-Path $repositoryRoot 'desktop.tests\ProbeLaunchContract.test.mjs'),
+            (Join-Path $repositoryRoot 'desktop.tests\MemoryChurnAnalysis.test.mjs'),
+            (Join-Path $repositoryRoot 'desktop.tests\MemoryAcceptanceProbe.test.mjs'),
+            (Join-Path $repositoryRoot 'desktop.tests\ReaderModeScript.test.mjs'),
+            (Join-Path $repositoryRoot 'desktop.tests\AdBlockDocumentScript.test.mjs')
+        )
+        & node --test @nodeTests
+        if ($LASTEXITCODE -ne 0) {
+            throw "Node contract tests failed with exit code $LASTEXITCODE."
+        }
         & powershell -NoProfile -ExecutionPolicy Bypass -File $publishTransactionTestPath
         if ($LASTEXITCODE -ne 0) {
             throw "Publish transaction smoke tests failed with exit code $LASTEXITCODE."
@@ -832,13 +938,13 @@ try {
     }
 
     Add-ReleaseMetadata -StagingPath $stagingPath -Definition $definition -SdkVersion $dotnetSdkVersion
-    [void] (Test-ReleaseOutput -OutputPath $stagingPath -Definition $definition)
+    $stagingValidation = Test-ReleaseOutput -OutputPath $stagingPath -Definition $definition
 
     if ($Mode -eq 'OneClick') {
-        $finalValidation = Move-OneClickRelease -StagingPath $stagingPath -Definition $definition
+        $finalValidation = Move-OneClickRelease -StagingPath $stagingPath -Definition $definition -StagingValidation $stagingValidation
     }
     else {
-        $finalValidation = Move-FolderRelease -StagingPath $stagingPath -DestinationPath $definition.OutputPath -Definition $definition
+        $finalValidation = Move-FolderRelease -StagingPath $stagingPath -DestinationPath $definition.OutputPath -Definition $definition -StagingValidation $stagingValidation
     }
 
     Write-Host "Published $Mode release: $($finalValidation.Executable)"
