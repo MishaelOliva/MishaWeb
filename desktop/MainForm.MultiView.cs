@@ -2,6 +2,8 @@ namespace MishaWeb;
 
 public sealed partial class MainForm
 {
+    private const int MultiViewSplitterLogicalThickness = 6;
+    private const string MultiViewSplitterTooltip = "Drag to resize views \u00B7 Double-click to reset";
     private bool applyingMultiViewLayout;
     private readonly BrowserTab?[] multiViewVisibleTabs = new BrowserTab?[4];
     private readonly (Control Control, Rectangle Bounds)[] multiViewPlacements = new (Control Control, Rectangle Bounds)[10];
@@ -63,6 +65,8 @@ public sealed partial class MainForm
 
         pageHost.Controls.Add(multiViewSplitters[0]);
         pageHost.Controls.Add(multiViewSplitters[1]);
+        toolTip.SetToolTip(multiViewSplitters[0], MultiViewSplitterTooltip);
+        toolTip.SetToolTip(multiViewSplitters[1], MultiViewSplitterTooltip);
     }
 
     private BrowserTab? FindTabById(int tabId)
@@ -485,6 +489,56 @@ public sealed partial class MainForm
         ScheduleStateSave();
     }
 
+    private string? ResolveMultiViewDropActionLabel(BrowserTab tab, Point screenLocation)
+    {
+        if (isClosing || tab.IsClosed || !tabs.Contains(tab) || isDomFullScreen) return null;
+        if (pageHost.ClientSize.Width <= 0 || pageHost.ClientSize.Height <= 0) return null;
+
+        var localPoint = pageHost.PointToClient(screenLocation);
+        var hostRect = pageHost.ClientRectangle;
+        if (!hostRect.Contains(localPoint)) return null;
+
+        if (!multiViewState.IsMultiViewActive)
+        {
+            var anchor = activeTabBeforeDrag is { IsClosed: false } prev && prev != tab
+                ? prev
+                : tabs.FirstOrDefault(item => !item.IsClosed && item != tab);
+            if (anchor is null) return null;
+
+            var dropLeft = localPoint.X < hostRect.Left + (hostRect.Width / 2);
+            return dropLeft ? "Split Left \u00B7 Pane 1" : "Split Right \u00B7 Pane 2";
+        }
+
+        var layout = lastMultiViewLayout ?? MultiViewLayoutEngine.ComputeLayout(
+            hostRect,
+            multiViewState,
+            ScaleChromeLogical(MultiViewSplitterLogicalThickness),
+            ScaleChromeLogical(26));
+        var hitPane = -1;
+        for (var i = 0; i < layout.PaneCount; i++)
+        {
+            if (layout.PaneBounds[i].Contains(localPoint))
+            {
+                hitPane = i;
+                break;
+            }
+        }
+        if (hitPane < 0) hitPane = multiViewState.FocusedPaneIndex;
+
+        if (multiViewState.PaneCount < 4 && !multiViewState.ContainsTab(tab.Id))
+        {
+            var paneRect = layout.PaneBounds[hitPane];
+            var nearOuterEdge = localPoint.X >= paneRect.Right - Math.Max(48, paneRect.Width / 4)
+                || localPoint.Y >= paneRect.Bottom - Math.Max(48, paneRect.Height / 4);
+            if (nearOuterEdge)
+            {
+                return $"Add Pane {multiViewState.PaneCount + 1}";
+            }
+        }
+
+        return $"Open in Pane {hitPane + 1}";
+    }
+
     private bool TryDropTabOntoMultiViewPane(BrowserTab tab, Point screenLocation)
     {
         if (isClosing || tab.IsClosed || !tabs.Contains(tab) || isDomFullScreen) return false;
@@ -513,7 +567,7 @@ public sealed partial class MainForm
             var layout = lastMultiViewLayout ?? MultiViewLayoutEngine.ComputeLayout(
                 hostRect,
                 multiViewState,
-                ScaleChromeLogical(4),
+                ScaleChromeLogical(MultiViewSplitterLogicalThickness),
                 ScaleChromeLogical(26));
             var hitPane = -1;
             for (var i = 0; i < layout.PaneCount; i++)
@@ -556,10 +610,24 @@ public sealed partial class MainForm
         return true;
     }
 
+    private static string? GetPaneHeaderHostLabel(BrowserTab? tab)
+    {
+        if (tab is null || tab.IsStartPage || !BrowserPolicy.IsHttpUrl(tab.Url)) return null;
+        var host = TextSafety.FormatHostForDisplay(tab.Url, 36);
+        if (string.IsNullOrEmpty(host)
+            || host.Equals("Invalid address", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(host, tab.Title, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+        return host;
+    }
+
     private void RefreshMultiViewHeaders()
     {
         var hc = IsHighContrastActive;
         var visibleIds = multiViewState.GetVisibleTabIds();
+        var focusedMaximized = multiViewState.IsFocusedPaneMaximized;
         for (var i = 0; i < paneHeaders.Length; i++)
         {
             if (!multiViewState.IsMultiViewActive || isDomFullScreen || i >= visibleIds.Length)
@@ -568,13 +636,17 @@ public sealed partial class MainForm
             }
             var tab = FindTabById(visibleIds[i]);
             var title = tab?.Title ?? "New tab";
+            var isFocused = i == multiViewState.FocusedPaneIndex;
             paneHeaders[i].UpdateMetadata(
                 title,
-                focused: i == multiViewState.FocusedPaneIndex,
+                focused: isFocused,
                 privateMode: isPrivateMode,
                 highContrastActive: hc,
                 audible: tab is not null && IsTabAudible(tab),
-                muted: tab is not null && IsTabMuted(tab));
+                muted: tab is not null && IsTabMuted(tab),
+                host: GetPaneHeaderHostLabel(tab),
+                loading: tab is not null && (tab.IsLoading || tab.IsInitializing),
+                maximized: focusedMaximized && isFocused);
         }
         multiViewButton.ActiveViewCount = multiViewState.PaneCount;
     }
@@ -623,7 +695,7 @@ public sealed partial class MainForm
         var layout = MultiViewLayoutEngine.ComputeLayout(
             pageHost.ClientRectangle,
             multiViewState,
-            ScaleChromeLogical(4),
+            ScaleChromeLogical(MultiViewSplitterLogicalThickness),
             ScaleChromeLogical(26));
         lastMultiViewLayout = layout;
 
@@ -641,6 +713,10 @@ public sealed partial class MainForm
             fullHostRect.Y + fullHeaderHeight,
             fullHostRect.Width,
             Math.Max(1, fullHostRect.Height - fullHeaderHeight));
+        Span<bool> paneHostChanged = stackalloc bool[4];
+        Span<bool> headerBecameVisible = stackalloc bool[4];
+        Span<bool> splitterBecameVisible = stackalloc bool[2];
+        var anyPaneHostBecameVisible = false;
 
         try
         {
@@ -681,6 +757,7 @@ public sealed partial class MainForm
                 }
             }
 
+            var hc = IsHighContrastActive;
             for (var i = 0; i < paneHeaders.Length; i++)
             {
                 if (i < paneCount && (!focusedPaneMaximized || i == focusedPaneIndex))
@@ -689,20 +766,42 @@ public sealed partial class MainForm
                     var paneTab = visibleTabs[i];
                     var targetHeaderBounds = focusedPaneMaximized ? maximizedHeaderBounds : layout.HeaderBounds[i];
                     var targetContentBounds = focusedPaneMaximized ? maximizedContentBounds : layout.ContentBounds[i];
+                    var isFocused = i == multiViewState.FocusedPaneIndex;
                     header.UpdateMetadata(
                         paneTab?.Title ?? "New tab",
-                        focused: i == multiViewState.FocusedPaneIndex,
+                        focused: isFocused,
                         privateMode: isPrivateMode,
-                        highContrastActive: IsHighContrastActive,
+                        highContrastActive: hc,
                         audible: paneTab is not null && IsTabAudible(paneTab),
-                        muted: paneTab is not null && IsTabMuted(paneTab));
-                    if (!header.Visible) header.Visible = true;
-                    multiViewPlacements[placementCount++] = (header, targetHeaderBounds);
+                        muted: paneTab is not null && IsTabMuted(paneTab),
+                        host: GetPaneHeaderHostLabel(paneTab),
+                        loading: paneTab is not null && (paneTab.IsLoading || paneTab.IsInitializing),
+                        maximized: focusedPaneMaximized && isFocused);
+                    if (!header.Visible)
+                    {
+                        header.Visible = true;
+                        headerBecameVisible[i] = true;
+                    }
+                    if (header.Bounds != targetHeaderBounds || headerBecameVisible[i])
+                    {
+                        multiViewPlacements[placementCount++] = (header, targetHeaderBounds);
+                    }
                     if (paneTab is not null && !paneTab.IsClosed)
                     {
-                        if (paneTab.Host.Dock != DockStyle.None) paneTab.Host.Dock = DockStyle.None;
-                        if (!paneTab.Host.Visible) paneTab.Host.Visible = true;
-                        multiViewPlacements[placementCount++] = (paneTab.Host, targetContentBounds);
+                        var dockChanged = paneTab.Host.Dock != DockStyle.None;
+                        if (dockChanged) paneTab.Host.Dock = DockStyle.None;
+                        var hostWasHidden = !paneTab.Host.Visible;
+                        if (hostWasHidden)
+                        {
+                            paneTab.Host.Visible = true;
+                            anyPaneHostBecameVisible = true;
+                        }
+                        var boundsChanged = paneTab.Host.Bounds != targetContentBounds;
+                        paneHostChanged[i] = dockChanged || hostWasHidden || boundsChanged;
+                        if (paneHostChanged[i])
+                        {
+                            multiViewPlacements[placementCount++] = (paneTab.Host, targetContentBounds);
+                        }
                     }
                 }
                 else
@@ -718,8 +817,15 @@ public sealed partial class MainForm
                 {
                     var desc = layout.Splitters[s];
                     splitter.UpdateDragRegion(desc.DragRegionBounds);
-                    if (!splitter.Visible) splitter.Visible = true;
-                    multiViewPlacements[placementCount++] = (splitter, desc.Bounds);
+                    if (!splitter.Visible)
+                    {
+                        splitter.Visible = true;
+                        splitterBecameVisible[s] = true;
+                    }
+                    if (splitter.Bounds != desc.Bounds || splitterBecameVisible[s])
+                    {
+                        multiViewPlacements[placementCount++] = (splitter, desc.Bounds);
+                    }
                 }
                 else
                 {
@@ -744,12 +850,20 @@ public sealed partial class MainForm
                 var paneTab = visibleTabs[i];
                 if (paneTab is not null && !paneTab.IsClosed)
                 {
-                    if (paneTab.Host.Dock != DockStyle.None) paneTab.Host.Dock = DockStyle.None;
+                    if (paneTab.Host.Dock != DockStyle.None)
+                    {
+                        paneTab.Host.Dock = DockStyle.None;
+                        paneHostChanged[i] = true;
+                    }
                     if (paneTab.Host.Bounds != targetContentBounds)
                     {
                         paneTab.Host.Bounds = targetContentBounds;
+                        paneHostChanged[i] = true;
                     }
-                    paneTab.Host.PerformLayout();
+                    if (paneHostChanged[i])
+                    {
+                        paneTab.Host.PerformLayout();
+                    }
                 }
             }
             if (!focusedPaneMaximized)
@@ -775,12 +889,20 @@ public sealed partial class MainForm
                 if (paneTab.StartPageView is not null)
                 {
                     var showStart = paneTab.IsStartPage && !paneTab.Overlay.Visible;
+                    var becameVisible = showStart && !paneTab.StartPageView.Visible;
                     if (paneTab.StartPageView.Visible != showStart) paneTab.StartPageView.Visible = showStart;
                     if (showStart)
                     {
-                        if (paneTab.StartPageView.Bounds != innerBounds) paneTab.StartPageView.Bounds = innerBounds;
-                        paneTab.StartPageView.PerformLayout();
-                        paneTab.StartPageView.BringToFront();
+                        var startBoundsChanged = paneTab.StartPageView.Bounds != innerBounds;
+                        if (startBoundsChanged) paneTab.StartPageView.Bounds = innerBounds;
+                        if (becameVisible || startBoundsChanged)
+                        {
+                            paneTab.StartPageView.PerformLayout();
+                        }
+                        if (becameVisible)
+                        {
+                            paneTab.StartPageView.BringToFront();
+                        }
                     }
                 }
 
@@ -789,23 +911,40 @@ public sealed partial class MainForm
                     var showView = !isWindowMinimized
                         && !paneTab.Overlay.Visible
                         && paneTab.StartPageView?.Visible != true;
+                    var becameVisible = showView && !paneTab.View.Visible;
                     if (paneTab.View.Visible != showView) paneTab.View.Visible = showView;
                     if (showView)
                     {
                         if (paneTab.View.Bounds != innerBounds) paneTab.View.Bounds = innerBounds;
-                        paneTab.View.BringToFront();
+                        if (becameVisible) paneTab.View.BringToFront();
                     }
                 }
 
                 if (paneTab.Overlay.Visible)
                 {
                     if (paneTab.Overlay.Bounds != innerBounds) paneTab.Overlay.Bounds = innerBounds;
-                    paneTab.Overlay.BringToFront();
+                    if (paneHostChanged[i] && anyPaneHostBecameVisible) paneTab.Overlay.BringToFront();
                 }
             }
 
-            for (var i = 0; i < paneCount; i++) paneHeaders[i].BringToFront();
-            for (var s = 0; s < layout.Splitters.Length; s++) multiViewSplitters[s].BringToFront();
+            for (var i = 0; i < paneCount; i++)
+            {
+                if (focusedPaneMaximized && i != focusedPaneIndex) continue;
+                if (headerBecameVisible[i] || anyPaneHostBecameVisible)
+                {
+                    paneHeaders[i].BringToFront();
+                }
+            }
+            if (!focusedPaneMaximized)
+            {
+                for (var s = 0; s < layout.Splitters.Length; s++)
+                {
+                    if (splitterBecameVisible[s] || anyPaneHostBecameVisible)
+                    {
+                        multiViewSplitters[s].BringToFront();
+                    }
+                }
+            }
         }
         finally
         {
@@ -851,9 +990,9 @@ public sealed partial class MainForm
             var paneTab = FindTabById(visibleId);
             if (paneTab is null || paneTab.IsClosed) continue;
             if (paneTab.IsStartPage) PrepareNativeStartPage(paneTab);
-            else if (paneTab.IsDiscarded && !paneTab.IsInitializing)
+            else if ((paneTab.IsDiscarded || paneTab.Core is null) && !paneTab.IsInitializing)
             {
-                restoreTasks.Add(RestoreDiscardedTabAsync(paneTab, focusPage: false));
+                restoreTasks.Add(RestoreTabContentAsync(paneTab, focusPage: false));
             }
         }
         if (restoreTasks.Count > 0)
@@ -889,7 +1028,7 @@ public sealed partial class MainForm
         var layout = lastMultiViewLayout ?? MultiViewLayoutEngine.ComputeLayout(
             pageHost.ClientRectangle,
             multiViewState,
-            ScaleChromeLogical(4),
+            ScaleChromeLogical(MultiViewSplitterLogicalThickness),
             ScaleChromeLogical(26));
         return new MultiViewSnapshot(
             multiViewState.Preset,

@@ -40,15 +40,15 @@ internal static class Program
             return;
         }
 
-        var startupAddress = ResolveStartupAddressCandidates(startupArguments.NavigationArguments);
         var singleInstanceIdentity = GetCurrentUserSingleInstanceIdentity();
 
         using var mutex = CreateSingleInstanceMutex(singleInstanceIdentity.MutexName, out var isFirstInstance);
         if (!isFirstInstance)
         {
-            if (!SendNavigationToRunningInstance(singleInstanceIdentity.PipeName, startupAddress))
+            var handoffAddress = ResolveStartupAddressCandidates(startupArguments.NavigationArguments);
+            if (!SendNavigationToRunningInstance(singleInstanceIdentity.PipeName, handoffAddress))
             {
-                ShowNavigationHandoffFailure(startupAddress);
+                ShowNavigationHandoffFailure(handoffAddress);
             }
             return;
         }
@@ -60,6 +60,7 @@ internal static class Program
             catch { }
         });
         RegisterGlobalExceptionHandlers();
+        var startupAddress = ResolveStartupAddressCandidates(startupArguments.NavigationArguments);
 
         var startupHandoffs = new StartupHandoffRouter(MaximumQueuedStartupHandoffs);
         using var server = new SingleInstanceServer(
@@ -76,7 +77,7 @@ internal static class Program
         try
         {
             RegisterTopLevelWindow(form);
-            startupHandoffs.Attach(applicationContext.TryReceiveExternalNavigation);
+            startupHandoffs.Attach(address => applicationContext.TryReceiveExternalNavigation(address, preValidated: true));
             form.Show();
             Application.Run(applicationContext);
         }
@@ -566,6 +567,15 @@ internal static class Program
     {
         if (args.Length == 0) return null;
 
+        if (args.Length == 1)
+        {
+            var single = args[0];
+            if (string.IsNullOrEmpty(single) || single[0] == '-' || single[0] == '/') return null;
+            var normalized = single.Trim().Trim('"', '\'');
+            if (normalized.Length == 0 || normalized[0] == '-' || normalized[0] == '/') return null;
+            return BrowserPolicy.ResolveAddress(normalized).Error is null ? normalized : null;
+        }
+
         var nonSwitchArgs = args.Where(a => !a.StartsWith('-') && !a.StartsWith('/')).ToArray();
         if (nonSwitchArgs.Length == 0) return null;
         args = nonSwitchArgs;
@@ -1020,9 +1030,10 @@ internal static class Program
                 nonRestorableTabCount);
         }
 
-        internal bool TryReceiveExternalNavigation(string? address)
+        internal bool TryReceiveExternalNavigation(string? address, bool preValidated = false)
         {
-            if (!string.IsNullOrWhiteSpace(address)
+            if (!preValidated
+                && !string.IsNullOrWhiteSpace(address)
                 && BrowserPolicy.ResolveAddress(address).Error is not null)
             {
                 return false;
@@ -1040,7 +1051,7 @@ internal static class Program
                 if (candidate.IsDisposed
                     || candidate.Disposing
                     || candidate.IsClosingForApplicationContext) continue;
-                if (candidate.ReceiveExternalNavigation(address)) return true;
+                if (candidate.ReceiveExternalNavigation(address, preValidated: true)) return true;
             }
 
             var dispatcher = candidates.FirstOrDefault(window =>
@@ -1100,7 +1111,7 @@ internal static class Program
             }
             if (existingNormal is not null)
             {
-                return isTimedOut?.Invoke() != true && existingNormal.ReceiveExternalNavigation(address);
+                return isTimedOut?.Invoke() != true && existingNormal.ReceiveExternalNavigation(address, preValidated: true);
             }
 
             MainForm? created = null;
@@ -1114,7 +1125,7 @@ internal static class Program
                 if (!registered || isTimedOut?.Invoke() == true) return false;
                 showNormalWindow(created);
                 if (isTimedOut?.Invoke() == true) return false;
-                accepted = created.ReceiveExternalNavigation(address);
+                accepted = created.ReceiveExternalNavigation(address, preValidated: true);
                 return accepted;
             }
             catch (Exception error)

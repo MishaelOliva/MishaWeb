@@ -187,7 +187,7 @@ internal static class CommandRankingEngine
 
     private static bool IsSafeTarget(string? url)
     {
-        return url is null || BrowserPolicy.IsSafeTopLevelUrl(url);
+        return url is null || BrowserPolicy.IsSafeHttpUrlFast(url);
     }
 
     internal static string Normalize(string? value)

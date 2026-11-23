@@ -71,6 +71,20 @@ internal static class BrowserPolicy
             return NavigationResolution.Reject("That address is too long");
         }
 
+        if (value.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+        {
+            if (Uri.TryCreate(value, UriKind.Absolute, out var httpUri)
+                && (httpUri.Scheme == Uri.UriSchemeHttp || httpUri.Scheme == Uri.UriSchemeHttps))
+            {
+                return httpUri.AbsoluteUri.Length <= MaximumUrlLength
+                    ? NavigationResolution.Navigate(httpUri.AbsoluteUri)
+                    : NavigationResolution.Reject("That address is too long");
+            }
+
+            return NavigationResolution.Reject("That address uses an unsupported or unsafe scheme");
+        }
+
         if (TryResolveExistingLocalPath(value, out var localFileUrl))
         {
             return NavigationResolution.Navigate(localFileUrl);
@@ -127,6 +141,14 @@ internal static class BrowserPolicy
     {
         var value = input?.Trim() ?? string.Empty;
         if (value.Length == 0) return false;
+        if (value.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+        {
+            return Uri.TryCreate(value, UriKind.Absolute, out var httpUri)
+                && (httpUri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                    || httpUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase));
+        }
+
         if (TryResolveExistingLocalPath(value, out _)) return true;
 
         if (Uri.TryCreate(value, UriKind.Absolute, out var absoluteUri))
@@ -150,6 +172,87 @@ internal static class BrowserPolicy
         ".pif", ".com", ".cpl", ".reg", ".dll",
         ".sys", ".drv", ".ocx", ".jar", ".iso", ".img", ".vhd", ".vhdx"
     };
+
+    internal static bool IsSafeHttpUrlFast(string url)
+    {
+        if (string.IsNullOrEmpty(url) || url.Length > MaximumUrlLength) return false;
+
+        int authorityStart;
+        if (url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            authorityStart = 8;
+        }
+        else if (url.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+        {
+            authorityStart = 7;
+        }
+        else
+        {
+            return false;
+        }
+
+        if (authorityStart >= url.Length) return false;
+
+        var authorityEnd = url.Length;
+        for (var i = authorityStart; i < url.Length; i++)
+        {
+            var c = url[i];
+            if (c is '/' or '?' or '#')
+            {
+                authorityEnd = i;
+                break;
+            }
+        }
+
+        var authority = url.AsSpan(authorityStart, authorityEnd - authorityStart);
+        if (authority.IsEmpty) return false;
+
+        var hostEnd = authority.Length;
+        var colonIndex = authority.IndexOf(':');
+        if (colonIndex >= 0)
+        {
+            hostEnd = colonIndex;
+            var portSpan = authority[(colonIndex + 1)..];
+            if (portSpan.IsEmpty || portSpan.Length > 5)
+            {
+                return IsSafeTopLevelUrl(url, allowFileScheme: false);
+            }
+
+            var port = 0;
+            for (var i = 0; i < portSpan.Length; i++)
+            {
+                var digit = (uint)(portSpan[i] - '0');
+                if (digit > 9) return IsSafeTopLevelUrl(url, allowFileScheme: false);
+                port = (port * 10) + (int)digit;
+            }
+            if (port > 65535) return IsSafeTopLevelUrl(url, allowFileScheme: false);
+        }
+
+        var host = authority[..hostEnd];
+        if (!IsFastAsciiDnsHost(host, out _))
+        {
+            return IsSafeTopLevelUrl(url, allowFileScheme: false);
+        }
+
+        for (var i = authorityEnd; i < url.Length; i++)
+        {
+            var c = url[i];
+            if (c <= 0x20 || c >= 0x7F || c is '\\' or '<' or '>' or '"' or '{' or '}' or '|' or '^' or '`')
+            {
+                return IsSafeTopLevelUrl(url, allowFileScheme: false);
+            }
+            if (c == '%')
+            {
+                if (i + 2 >= url.Length || !Uri.IsHexDigit(url[i + 1]) || !Uri.IsHexDigit(url[i + 2]))
+                {
+                    return IsSafeTopLevelUrl(url, allowFileScheme: false);
+                }
+                i += 2;
+            }
+        }
+
+        return true;
+    }
 
     public static bool IsSafeTopLevelUrl(string url, bool allowFileScheme = false)
     {
@@ -284,6 +387,26 @@ internal static class BrowserPolicy
     {
         if (string.IsNullOrWhiteSpace(value)) return null;
 
+        var rawSpan = value.AsSpan();
+        var trimmedSpan = rawSpan.Trim().TrimEnd('.');
+        if (trimmedSpan.Length > 0 && IsFastAsciiDnsHost(trimmedSpan, out var hasUppercase))
+        {
+            if (!hasUppercase && trimmedSpan.Length == value.Length)
+            {
+                return value;
+            }
+
+            return string.Create(trimmedSpan.Length, value, static (dest, raw) =>
+            {
+                var src = raw.AsSpan().Trim().TrimEnd('.');
+                for (var i = 0; i < dest.Length; i++)
+                {
+                    var c = src[i];
+                    dest[i] = (uint)(c - 'A') <= ('Z' - 'A') ? (char)(c | 0x20) : c;
+                }
+            });
+        }
+
         var candidate = value.Trim();
         if (candidate.Contains("://", StringComparison.Ordinal))
         {
@@ -313,6 +436,54 @@ internal static class BrowserPolicy
         return Uri.TryCreate("https://" + candidate, UriKind.Absolute, out var hostUri)
             ? hostUri.IdnHost.TrimEnd('.').ToLowerInvariant()
             : null;
+    }
+
+    private static bool IsFastAsciiDnsHost(ReadOnlySpan<char> host, out bool hasUppercase)
+    {
+        hasUppercase = false;
+        if (host.IsEmpty || host.Length > 253) return false;
+
+        var labelStart = 0;
+        var lastLabelStart = 0;
+        for (var i = 0; i < host.Length; i++)
+        {
+            var c = host[i];
+            if (c == '.')
+            {
+                var labelLength = i - labelStart;
+                if (labelLength == 0 || labelLength > 63 || host[i - 1] == '-') return false;
+                labelStart = i + 1;
+                lastLabelStart = labelStart;
+            }
+            else if ((uint)(c - 'a') <= ('z' - 'a'))
+            {
+            }
+            else if ((uint)(c - 'A') <= ('Z' - 'A'))
+            {
+                hasUppercase = true;
+            }
+            else if ((uint)(c - '0') <= ('9' - '0'))
+            {
+            }
+            else if (c == '-')
+            {
+                if (i == labelStart) return false;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        var finalLabelLength = host.Length - labelStart;
+        if (finalLabelLength == 0 || finalLabelLength > 63 || host[^1] == '-') return false;
+
+        // Require the final label to begin with an ASCII letter so numeric/hex IPv4
+        // forms fall through to IPAddress.TryParse / Uri.TryCreate validation.
+        if (!char.IsAsciiLetter(host[lastLabelStart])) return false;
+
+        // Let punycode labels pass through Uri.IdnHost validation.
+        return host.IndexOf("xn--", StringComparison.OrdinalIgnoreCase) < 0;
     }
 
     public static bool IsExactHost(string? value, string? expectedHost)
@@ -390,12 +561,15 @@ internal static class BrowserPolicy
     private static bool TryResolveExistingLocalPath(string value, out string normalizedUrl)
     {
         normalizedUrl = string.Empty;
+        // Require an explicit Windows drive-letter prefix (e.g. C:\ or C:/) so
+        // omnibox '/' inputs and web URLs never probe File.Exists/Directory.Exists on the UI thread.
         if (string.IsNullOrWhiteSpace(value)
+            || value.Length < 3
             || value.Length > MaximumUrlLength
-            || ContainsControlChars(value)
-            || !Path.IsPathFullyQualified(value)
-            || value.StartsWith(@"\\", StringComparison.Ordinal)
-            || value.StartsWith("//", StringComparison.Ordinal))
+            || !char.IsAsciiLetter(value[0])
+            || value[1] != ':'
+            || (value[2] != '\\' && value[2] != '/')
+            || ContainsControlChars(value))
         {
             return false;
         }

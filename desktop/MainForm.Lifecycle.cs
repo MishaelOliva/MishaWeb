@@ -28,20 +28,29 @@ public sealed partial class MainForm
             return;
         }
 
-        var hasCandidates = tabs.Any(tab =>
-            !tab.IsClosed
-            && (tab.Core is not null || tab.IsInitializing)
-            && !tab.IsAudible
-            && !IsBackgroundProtected(tab)
-            && (!IsProtectedResidentTab(tab)
-                || (mode == TabLifecycleMode.Ultra
-                    && !tab.IsSuspended
-                    && !tab.IsLoading
-                    && !tab.IsInitializing
-                    && tab.ConsecutiveSuspendFailures
-                        < TabLifecyclePolicy.SuspendFailureFallbackThreshold))
-            && (!IsTabVisibleInAnyPane(tab) || isWindowMinimized)
-            && tab.ActiveDownloads == 0);
+        var protectedTabs = CaptureProtectedResidentTabs();
+        var hasCandidates = false;
+        for (var i = 0; i < tabs.Count; i++)
+        {
+            var tab = tabs[i];
+            if (!tab.IsClosed
+                && (tab.Core is not null || tab.IsInitializing)
+                && !tab.IsAudible
+                && !IsBackgroundProtected(tab)
+                && (GetProtectedResidentRank(tab, protectedTabs) < 0
+                    || (mode == TabLifecycleMode.Ultra
+                        && !tab.IsSuspended
+                        && !tab.IsLoading
+                        && !tab.IsInitializing
+                        && tab.ConsecutiveSuspendFailures
+                            < TabLifecyclePolicy.SuspendFailureFallbackThreshold))
+                && (!IsTabVisibleInAnyPane(tab) || isWindowMinimized)
+                && tab.ActiveDownloads == 0)
+            {
+                hasCandidates = true;
+                break;
+            }
+        }
         if (!hasCandidates)
         {
             var hasLiveWebViews = environment is not null && tabs.Any(tab => !tab.IsClosed && tab.Core is not null);
@@ -74,6 +83,23 @@ public sealed partial class MainForm
             Math.Max(state.ActiveTabIndex.GetValueOrDefault(0), 0),
             state.OpenTabs.Count - 1);
         var maxRestoreCount = Math.Min(state.OpenTabs.Count, MaximumTabs);
+        HashSet<int>? immediatelyVisibleIndices = null;
+        if (!isPrivateMode && state.MultiViewLayout is { PaneTabIndices.Length: >= 2 } plannedMultiView)
+        {
+            var validPaneIndices = new HashSet<int>();
+            foreach (var paneTabIndex in plannedMultiView.PaneTabIndices)
+            {
+                if (paneTabIndex >= 0 && paneTabIndex < maxRestoreCount)
+                {
+                    validPaneIndices.Add(paneTabIndex);
+                    if (validPaneIndices.Count >= 4) break;
+                }
+            }
+            if (validPaneIndices.Count >= 2)
+            {
+                immediatelyVisibleIndices = validPaneIndices;
+            }
+        }
         var visibleTab = activeTab;
         var restoredCount = 0;
 
@@ -86,10 +112,14 @@ public sealed partial class MainForm
             {
                 if (isClosing) return restoredCount > 0;
 
+                var startDiscarded = immediatelyVisibleIndices is not null
+                    ? !immediatelyVisibleIndices.Contains(index)
+                    : index != targetActiveIndex;
                 var restoredTab = await OpenNewTabAsync(
                     state.OpenTabs[index],
                     activate: false,
-                    isPinned: index < state.PinnedOpenTabCount);
+                    isPinned: index < state.PinnedOpenTabCount,
+                    startDiscarded: startDiscarded);
                 if (restoredTab is null) continue;
 
                 restoredCount++;
@@ -119,9 +149,9 @@ public sealed partial class MainForm
             {
                 restoredMultiView = await RestoreSavedMultiViewLayoutAsync(savedMultiView);
             }
-            if (!restoredMultiView && !visibleTab.IsStartPage && visibleTab.IsDiscarded)
+            if (!restoredMultiView && !visibleTab.IsStartPage && (visibleTab.IsDiscarded || visibleTab.Core is null))
             {
-                await RestoreDiscardedTabAsync(visibleTab, focusPage: false);
+                await RestoreTabContentAsync(visibleTab, focusPage: false);
             }
         }
 
@@ -183,54 +213,73 @@ public sealed partial class MainForm
             return;
         }
 
-        if (isWindowMinimized
-            || (systemMemory.IsValid && systemMemory.MemoryLoadPercent >= 75)
-            || tabs.Any(item => !item.IsClosed && item.IsSuspended))
+        // Reserve host working-set trims for window minimize or actual tab-discard
+        // sweeps so routine tab switches do not fault WinForms/GDI+ pages back in.
+        if (isWindowMinimized)
         {
             SystemResourceInfo.TrimCurrentProcessWorkingSet();
         }
     }
 
-    private bool IsOrdinaryResidentCandidate(BrowserTab tab)
+    private static bool IsOrdinaryResidentCandidate(BrowserTab tab)
     {
         return !tab.IsClosed
             && !tab.IsStartPage
-            && (tab.Core is not null || tab.IsInitializing)
-            && tabs.Contains(tab);
+            && (tab.Core is not null || tab.IsInitializing);
     }
 
-    private int GetProtectedResidentRank(BrowserTab target)
+    private (BrowserTab? Rank0, BrowserTab? Rank1, BrowserTab? Rank2) CaptureProtectedResidentTabs()
     {
+        BrowserTab? rank0 = null;
+        BrowserTab? rank1 = null;
+        BrowserTab? rank2 = null;
         var rank = 0;
+
         if (activeTab is { } active && IsOrdinaryResidentCandidate(active))
         {
-            if (ReferenceEquals(active, target)) return rank;
-            rank++;
+            rank0 = active;
+            rank = 1;
         }
 
-        foreach (var candidate in mruTabs.Order)
+        var order = mruTabs.Order;
+        for (var index = 0; index < order.Count && rank < TabLifecyclePolicy.ProtectedResidentTabCount; index++)
         {
-            if (ReferenceEquals(candidate, activeTab)
-                || !IsOrdinaryResidentCandidate(candidate))
+            var candidate = order[index];
+            if (ReferenceEquals(candidate, activeTab) || !IsOrdinaryResidentCandidate(candidate))
             {
                 continue;
             }
-            if (ReferenceEquals(candidate, target))
-            {
-                return rank < TabLifecyclePolicy.ProtectedResidentTabCount ? rank : -1;
-            }
+            if (rank == 0) rank0 = candidate;
+            else if (rank == 1) rank1 = candidate;
+            else rank2 = candidate;
             rank++;
-            if (rank >= TabLifecyclePolicy.ProtectedResidentTabCount) break;
         }
+
+        return (rank0, rank1, rank2);
+    }
+
+    private static int GetProtectedResidentRank(
+        BrowserTab target,
+        (BrowserTab? Rank0, BrowserTab? Rank1, BrowserTab? Rank2) protectedTabs)
+    {
+        if (ReferenceEquals(target, protectedTabs.Rank0)) return 0;
+        if (ReferenceEquals(target, protectedTabs.Rank1)) return 1;
+        if (ReferenceEquals(target, protectedTabs.Rank2)) return 2;
         return -1;
     }
+
+    private int GetProtectedResidentRank(BrowserTab target) =>
+        GetProtectedResidentRank(target, CaptureProtectedResidentTabs());
 
     private bool IsProtectedResidentTab(BrowserTab tab)
     {
         return GetProtectedResidentRank(tab) >= 0;
     }
 
-    private void ApplyLiveTabMemoryTarget(BrowserTab tab, bool foreground)
+    private void ApplyLiveTabMemoryTarget(
+        BrowserTab tab,
+        bool foreground,
+        (BrowserTab? Rank0, BrowserTab? Rank1, BrowserTab? Rank2)? protectedTabs = null)
     {
         if (!tab.SupportsMemoryUsageTarget
             || tab.IsSuspended
@@ -245,7 +294,10 @@ public sealed partial class MainForm
             || tab.IsLoading
             || tab.IsInitializing
             || IsTabAudible(tab);
-        var retainedSuspendFailures = IsProtectedResidentTab(tab)
+        var isProtected = protectedTabs is { } cachedProtected
+            ? GetProtectedResidentRank(tab, cachedProtected) >= 0
+            : IsProtectedResidentTab(tab);
+        var retainedSuspendFailures = isProtected
             ? tab.ConsecutiveSuspendFailures
             : 0;
         var target = TabLifecyclePolicy.ShouldUseLowMemoryTarget(
@@ -260,12 +312,13 @@ public sealed partial class MainForm
 
     private void RefreshLiveTabMemoryTargets()
     {
+        var protectedTabs = CaptureProtectedResidentTabs();
         for (var index = 0; index < tabs.Count; index++)
         {
             var tab = tabs[index];
             if (!tab.IsClosed)
             {
-                ApplyLiveTabMemoryTarget(tab, IsTabForegroundForLifecycle(tab));
+                ApplyLiveTabMemoryTarget(tab, IsTabForegroundForLifecycle(tab), protectedTabs);
             }
         }
     }
@@ -359,21 +412,31 @@ public sealed partial class MainForm
         }
         CheckApplicationInactivity();
         if (DateTimeOffset.UtcNow < nextLifecycleScanAt) return;
-        if (!tabs.Any(item =>
-            (item.Core is not null || item.IsInitializing)
-            && !item.IsClosed
-            && !item.IsAudible
-            && !IsBackgroundProtected(item)
-            && (!IsProtectedResidentTab(item)
-                || (mode == TabLifecycleMode.Ultra
-                    && !item.IsSuspended
-                    && !item.IsLoading
-                    && !item.IsInitializing
-                    && item.ConsecutiveSuspendFailures
-                        < TabLifecyclePolicy.SuspendFailureFallbackThreshold))
-            && (!IsTabVisibleInAnyPane(item) || isWindowMinimized)
-            && item.ActiveDownloads == 0
-            && !item.IsDiscarded))
+        var protectedTabs = CaptureProtectedResidentTabs();
+        var hasSweepCandidate = false;
+        for (var i = 0; i < tabs.Count; i++)
+        {
+            var item = tabs[i];
+            if ((item.Core is not null || item.IsInitializing)
+                && !item.IsClosed
+                && !item.IsAudible
+                && !IsBackgroundProtected(item)
+                && (GetProtectedResidentRank(item, protectedTabs) < 0
+                    || (mode == TabLifecycleMode.Ultra
+                        && !item.IsSuspended
+                        && !item.IsLoading
+                        && !item.IsInitializing
+                        && item.ConsecutiveSuspendFailures
+                            < TabLifecyclePolicy.SuspendFailureFallbackThreshold))
+                && (!IsTabVisibleInAnyPane(item) || isWindowMinimized)
+                && item.ActiveDownloads == 0
+                && !item.IsDiscarded)
+            {
+                hasSweepCandidate = true;
+                break;
+            }
+        }
+        if (!hasSweepCandidate)
         {
             systemMemory = SystemResourceInfo.CaptureMemory();
             var allWindowsMinimized = Program.AreAllOpenWindowsMinimized(this);
@@ -414,7 +477,7 @@ public sealed partial class MainForm
                     tab.Core is not null,
                     tab.IsSuspended,
                     IsBackgroundProtected(tab),
-                    GetProtectedResidentRank(tab),
+                    GetProtectedResidentRank(tab, protectedTabs),
                     !isWindowMinimized && IsTabVisibleInAnyPane(tab));
             }
             var decisions = TabLifecyclePolicy.PlanSweep(

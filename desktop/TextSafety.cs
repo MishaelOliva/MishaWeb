@@ -9,7 +9,17 @@ internal static class TextSafety
     public static string SanitizeSingleLine(string? value, int maximumLength)
     {
         if (string.IsNullOrEmpty(value) || maximumLength <= 0) return string.Empty;
-        if (IsAlreadyCleanSingleLine(value, maximumLength)) return value;
+        if (value.Length <= maximumLength)
+        {
+            if (IsAlreadyCleanSingleLine(value)) return value;
+        }
+        else if (!char.IsWhiteSpace(value[0])
+            && IsCleanSingleLineCharacters(value.AsSpan(0, maximumLength)))
+        {
+            if (maximumLength == 1) return "…";
+            var cleanPrefix = value.AsSpan(0, maximumLength - 1).TrimEnd();
+            return cleanPrefix.IsEmpty ? "…" : string.Concat(cleanPrefix, "…");
+        }
         var maximumInspectedCharacters = Math.Min(
             value.Length,
             maximumLength > (int.MaxValue - 2) / 2
@@ -61,18 +71,22 @@ internal static class TextSafety
         return prefix.Length == 0 ? "…" : prefix + "…";
     }
 
-    private static bool IsAlreadyCleanSingleLine(string value, int maximumLength)
+    private static bool IsAlreadyCleanSingleLine(string value)
     {
-        if (value.Length > maximumLength
-            || char.IsWhiteSpace(value[0])
-            || char.IsWhiteSpace(value[^1]))
+        if (char.IsWhiteSpace(value[0]) || char.IsWhiteSpace(value[^1]))
         {
             return false;
         }
 
+        return IsCleanSingleLineCharacters(value.AsSpan());
+    }
+
+    private static bool IsCleanSingleLineCharacters(ReadOnlySpan<char> value)
+    {
         for (var index = 0; index < value.Length; index++)
         {
             var character = value[index];
+            if (character >= 0x20 && character < 0x7F) continue;
             if (char.IsSurrogate(character)
                 || char.IsControl(character)
                 || (character >= 0x00AD
