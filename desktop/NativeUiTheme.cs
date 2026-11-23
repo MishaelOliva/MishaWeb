@@ -48,19 +48,20 @@ internal static class NativeUiTheme
 
     private static readonly object SharedFontSync = new();
     private static readonly Dictionary<(string Family, int QuarterPointSize, FontStyle Style), Font> SharedFonts = new();
+    private static readonly Dictionary<(string Family, int QuarterPointSize, int Dpi, FontStyle Style), Font> SharedDpiFonts = new();
+    private static readonly object SharedGdiSync = new();
+    private static readonly Dictionary<int, SolidBrush> SharedBrushes = new();
+    private static readonly Dictionary<(int Argb, int WidthTenths), Pen> SharedPens = new();
+    private static readonly object BadgeWidthSync = new();
+    private static readonly Dictionary<(string Text, int Dpi, int MaxLogicalWidth), int> CachedBadgeWidths = new();
+    private const int MaximumCachedBadgeWidths = 256;
     private static readonly PropertyInfo? DoubleBufferedProperty =
         typeof(Control).GetProperty("DoubleBuffered", BindingFlags.Instance | BindingFlags.NonPublic);
 
-    private static readonly Font ToolTipFont = GetSharedFont("Segoe UI", 9f);
-    private static readonly Font RowTitleFont = GetSharedFont("Segoe UI Semibold", 9.5f);
-    private static readonly Font RowDetailFont = GetSharedFont("Segoe UI", 8.5f);
-    private static readonly Font RowBadgeFont = GetSharedFont("Segoe UI Semibold", 9f);
-    private static readonly Font RowPillFont = GetSharedFont("Segoe UI Semibold", 8f);
-
     private static readonly ConditionalWeakTable<Form, AppliedFormThemeState> AppliedForms = new();
-    private static readonly ConditionalWeakTable<Form, object> FramedForms = new();
+    private static readonly ConditionalWeakTable<Form, WindowFrameState> FramedForms = new();
     private static readonly ConditionalWeakTable<Control, object> DarkScrollbarControls = new();
-    private static readonly ConditionalWeakTable<ToolStripDropDown, object> FramedMenus = new();
+    private static readonly ConditionalWeakTable<ToolStripDropDown, MenuFrameState> FramedMenus = new();
     private static readonly ConditionalWeakTable<ToolTip, object> GlassToolTips = new();
     private static readonly ConditionalWeakTable<Button, ButtonVisualState> StyledButtons = new();
     private static readonly ConditionalWeakTable<ListBox, ModernListBoxState> StyledListBoxes = new();
@@ -82,6 +83,94 @@ internal static class NativeUiTheme
             SharedFonts[key] = created;
             return created;
         }
+    }
+
+    internal static Font GetSharedFontForDpi(
+        string familyName,
+        float logicalPointSize,
+        int dpi,
+        FontStyle style = FontStyle.Regular)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(familyName);
+        var effectiveDpi = Math.Max(96, dpi);
+        var quarterPoints = Math.Max(4, (int)MathF.Round(logicalPointSize * 4f));
+        var key = (familyName, quarterPoints, effectiveDpi, style);
+        lock (SharedFontSync)
+        {
+            if (SharedDpiFonts.TryGetValue(key, out var existing)) return existing;
+            var pixelSize = Math.Max(4f, (quarterPoints / 4f) * (effectiveDpi / 72f));
+            var created = new Font(familyName, pixelSize, style, GraphicsUnit.Pixel);
+            SharedDpiFonts[key] = created;
+            return created;
+        }
+    }
+
+    internal static SolidBrush GetSharedBrush(Color color)
+    {
+        var argb = color.ToArgb();
+        lock (SharedGdiSync)
+        {
+            if (SharedBrushes.TryGetValue(argb, out var existing)) return existing;
+            var created = new SolidBrush(color);
+            SharedBrushes[argb] = created;
+            return created;
+        }
+    }
+
+    internal static Pen GetSharedPen(Color color, float width = 1f)
+    {
+        var widthTenths = Math.Max(1, (int)MathF.Round(width * 10f));
+        var key = (color.ToArgb(), widthTenths);
+        lock (SharedGdiSync)
+        {
+            if (SharedPens.TryGetValue(key, out var existing)) return existing;
+            var created = new Pen(color, widthTenths / 10f);
+            SharedPens[key] = created;
+            return created;
+        }
+    }
+
+    internal static Color BlendColor(Color from, Color to, float amount)
+    {
+        var t = Math.Clamp(amount, 0f, 1f);
+        var a = (int)Math.Round(from.A + ((to.A - from.A) * t));
+        var r = (int)Math.Round(from.R + ((to.R - from.R) * t));
+        var g = (int)Math.Round(from.G + ((to.G - from.G) * t));
+        var b = (int)Math.Round(from.B + ((to.B - from.B) * t));
+        return Color.FromArgb(
+            Math.Clamp(a, 0, 255),
+            Math.Clamp(r, 0, 255),
+            Math.Clamp(g, 0, 255),
+            Math.Clamp(b, 0, 255));
+    }
+
+    private static int GetCachedPillTextWidth(string text, Font pillFont, int dpi, int maxLogicalWidth)
+    {
+        var effectiveDpi = Math.Max(96, dpi);
+        var key = (text, effectiveDpi, maxLogicalWidth);
+        lock (BadgeWidthSync)
+        {
+            if (CachedBadgeWidths.TryGetValue(key, out var cached)) return cached;
+        }
+
+        var scale = effectiveDpi / 96f;
+        var maxPx = Math.Max(1, (int)Math.Round(maxLogicalWidth * scale));
+        var maxHeightPx = Math.Max(1, (int)Math.Round(22 * scale));
+        var measured = TextRenderer.MeasureText(
+            text,
+            pillFont,
+            new Size(maxPx, maxHeightPx),
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix).Width;
+
+        lock (BadgeWidthSync)
+        {
+            if (CachedBadgeWidths.Count >= MaximumCachedBadgeWidths)
+            {
+                CachedBadgeWidths.Clear();
+            }
+            CachedBadgeWidths[key] = measured;
+        }
+        return measured;
     }
 
     internal static void EnableDoubleBuffering(Control control)
@@ -127,18 +216,37 @@ internal static class NativeUiTheme
     internal static void ApplyWindowFrame(Form form)
     {
         ArgumentNullException.ThrowIfNull(form);
-        if (FramedForms.TryGetValue(form, out _))
+        ApplyWindowFrame(form, captionColor: null, borderColor: null, textColor: null);
+    }
+
+    internal static void ApplyWindowFrame(
+        Form form,
+        Color? captionColor,
+        Color? borderColor,
+        Color? textColor)
+    {
+        ArgumentNullException.ThrowIfNull(form);
+        if (FramedForms.TryGetValue(form, out var state))
         {
-            ApplyWindowFrameCore(form);
+            if (captionColor.HasValue) state.CustomCaptionColor = captionColor.Value;
+            if (borderColor.HasValue) state.CustomBorderColor = borderColor.Value;
+            if (textColor.HasValue) state.CustomTextColor = textColor.Value;
+            ApplyWindowFrameCore(form, state);
             return;
         }
 
-        FramedForms.Add(form, new object());
-        form.HandleCreated += (_, _) => ApplyWindowFrameCore(form);
-        form.SystemColorsChanged += (_, _) => ApplyWindowFrameCore(form);
+        state = new WindowFrameState
+        {
+            CustomCaptionColor = captionColor,
+            CustomBorderColor = borderColor,
+            CustomTextColor = textColor
+        };
+        FramedForms.Add(form, state);
+        form.HandleCreated += (_, _) => ApplyWindowFrameCore(form, state);
+        form.SystemColorsChanged += (_, _) => ApplyWindowFrameCore(form, state);
         if (form.IsHandleCreated)
         {
-            ApplyWindowFrameCore(form);
+            ApplyWindowFrameCore(form, state);
         }
     }
 
@@ -160,22 +268,27 @@ internal static class NativeUiTheme
         }
     }
 
-    internal static void ApplyMenuWindowFrame(ToolStripDropDown menu)
+    internal static void ApplyMenuWindowFrame(ToolStripDropDown menu, Color? borderColor = null)
     {
         ArgumentNullException.ThrowIfNull(menu);
-        if (FramedMenus.TryGetValue(menu, out _))
+        if (FramedMenus.TryGetValue(menu, out var state))
         {
-            ApplyMenuWindowFrameCore(menu);
+            if (borderColor.HasValue) state.CustomBorderColor = borderColor.Value;
+            ApplyMenuWindowFrameCore(menu, state);
             return;
         }
 
-        FramedMenus.Add(menu, new object());
-        menu.HandleCreated += (_, _) => ApplyMenuWindowFrameCore(menu);
-        menu.Opening += (_, _) => ApplyMenuWindowFrameCore(menu);
-        menu.SystemColorsChanged += (_, _) => ApplyMenuWindowFrameCore(menu);
+        state = new MenuFrameState
+        {
+            CustomBorderColor = borderColor
+        };
+        FramedMenus.Add(menu, state);
+        menu.HandleCreated += (_, _) => ApplyMenuWindowFrameCore(menu, state);
+        menu.Opening += (_, _) => ApplyMenuWindowFrameCore(menu, state);
+        menu.SystemColorsChanged += (_, _) => ApplyMenuWindowFrameCore(menu, state);
         if (menu.IsHandleCreated)
         {
-            ApplyMenuWindowFrameCore(menu);
+            ApplyMenuWindowFrameCore(menu, state);
         }
     }
 
@@ -267,17 +380,20 @@ internal static class NativeUiTheme
         ArgumentNullException.ThrowIfNull(graphics);
         if (bounds.Width <= 2 || bounds.Height <= 2) return;
 
-        var scale = Math.Max(96, dpi) / 96f;
+        var effectiveDpi = Math.Max(96, dpi);
+        var scale = effectiveDpi / 96f;
         int Scaled(int value) => Math.Max(1, (int)Math.Round(value * scale));
+
+        var titleFont = GetSharedFontForDpi("Segoe UI Semibold", 9.5f, effectiveDpi);
+        var detailFont = GetSharedFontForDpi("Segoe UI", 8.5f, effectiveDpi);
+        var badgeFont = GetSharedFontForDpi("Segoe UI Semibold", 9f, effectiveDpi);
+        var pillFont = GetSharedFontForDpi("Segoe UI Semibold", 8f, effectiveDpi);
 
         var highContrast = SystemInformation.HighContrast;
         var selected = (state & DrawItemState.Selected) != 0;
         var focused = (state & DrawItemState.Focus) != 0 && (state & DrawItemState.NoFocusRect) == 0;
         var backdropColor = highContrast ? SystemColors.Window : Field;
-        using (var backdrop = new SolidBrush(backdropColor))
-        {
-            graphics.FillRectangle(backdrop, bounds);
-        }
+        graphics.FillRectangle(GetSharedBrush(backdropColor), bounds);
 
         graphics.SmoothingMode = SmoothingMode.AntiAlias;
         var pillBounds = new RectangleF(
@@ -292,12 +408,10 @@ internal static class NativeUiTheme
             if (selected || isHovered)
             {
                 using var hcPath = CreateRoundedPath(pillBounds, radius);
-                using var hcBrush = new SolidBrush(selected ? SystemColors.Highlight : SystemColors.Control);
-                graphics.FillPath(hcBrush, hcPath);
+                graphics.FillPath(GetSharedBrush(selected ? SystemColors.Highlight : SystemColors.Control), hcPath);
                 if (selected)
                 {
-                    using var hcPen = new Pen(SystemColors.HighlightText, 1f);
-                    graphics.DrawPath(hcPen, hcPath);
+                    graphics.DrawPath(GetSharedPen(SystemColors.HighlightText, 1f), hcPath);
                 }
             }
             if (focused)
@@ -321,16 +435,41 @@ internal static class NativeUiTheme
                     LinearGradientMode.Vertical);
                 graphics.FillPath(fill, pillPath);
 
-                var sheenRect = new RectangleF(pillBounds.X + 1f, pillBounds.Y + 1f, Math.Max(2f, pillBounds.Width - 2f), Math.Max(3f, pillBounds.Height * 0.35f));
-                using var sheen = new LinearGradientBrush(
-                    sheenRect,
-                    Color.FromArgb(36, 255, 240, 250),
-                    Color.FromArgb(0, SurfaceRaised),
-                    LinearGradientMode.Vertical);
-                graphics.FillRectangle(sheen, sheenRect);
+                var clipState = graphics.Save();
+                try
+                {
+                    graphics.SetClip(pillPath, CombineMode.Intersect);
+                    var sheenRect = new RectangleF(
+                        pillBounds.X,
+                        pillBounds.Y,
+                        Math.Max(2f, pillBounds.Width),
+                        Math.Max(3f, pillBounds.Height * 0.36f));
+                    using var sheen = new LinearGradientBrush(
+                        sheenRect,
+                        Color.FromArgb(36, 255, 240, 250),
+                        Color.FromArgb(0, SurfaceRaised),
+                        LinearGradientMode.Vertical);
+                    graphics.FillRectangle(sheen, sheenRect);
 
-                using var rim = new Pen(Color.FromArgb(focused ? 245 : 190, Focus), focused ? 1.5f : 1f);
-                graphics.DrawPath(rim, pillPath);
+                    var causticHeight = Math.Max(3f, pillBounds.Height * 0.28f);
+                    var causticRect = new RectangleF(
+                        pillBounds.X,
+                        pillBounds.Bottom - causticHeight,
+                        Math.Max(2f, pillBounds.Width),
+                        causticHeight + 1f);
+                    using var caustic = new LinearGradientBrush(
+                        causticRect,
+                        Color.FromArgb(0, Accent),
+                        Color.FromArgb(36, Accent),
+                        LinearGradientMode.Vertical);
+                    graphics.FillRectangle(caustic, causticRect);
+                }
+                finally
+                {
+                    graphics.Restore(clipState);
+                }
+
+                graphics.DrawPath(GetSharedPen(Color.FromArgb(focused ? 245 : 190, Focus), focused ? 1.5f : 1f), pillPath);
 
                 var cueWidth = Math.Max(2.5f, Scaled(3));
                 var cueRect = new RectangleF(
@@ -339,29 +478,26 @@ internal static class NativeUiTheme
                     cueWidth,
                     Math.Max(4f, pillBounds.Height - Scaled(14)));
                 using var cuePath = CreateRoundedPath(cueRect, cueWidth / 2f);
-                using var cueBrush = new SolidBrush(Accent);
-                graphics.FillPath(cueBrush, cuePath);
+                graphics.FillPath(GetSharedBrush(Accent), cuePath);
             }
             else if (isHovered)
             {
-                using var hoverFill = new SolidBrush(Color.FromArgb(155, Hover));
-                graphics.FillPath(hoverFill, pillPath);
-                using var hoverRim = new Pen(
-                    focused ? Color.FromArgb(200, Focus) : Color.FromArgb(95, Border),
-                    focused ? 1.35f : 1f);
-                graphics.DrawPath(hoverRim, pillPath);
+                graphics.FillPath(GetSharedBrush(Color.FromArgb(155, Hover)), pillPath);
+                graphics.DrawPath(
+                    GetSharedPen(
+                        focused ? Color.FromArgb(200, Focus) : Color.FromArgb(95, Border),
+                        focused ? 1.35f : 1f),
+                    pillPath);
             }
             else
             {
-                using var focusRim = new Pen(Color.FromArgb(195, Focus), 1.35f);
-                graphics.DrawPath(focusRim, pillPath);
+                graphics.DrawPath(GetSharedPen(Color.FromArgb(195, Focus), 1.35f), pillPath);
             }
         }
         else
         {
-            using var dividerPen = new Pen(Color.FromArgb(46, Border), 1f);
             graphics.DrawLine(
-                dividerPen,
+                GetSharedPen(Color.FromArgb(46, Border), 1f),
                 bounds.X + Scaled(46),
                 bounds.Bottom - 1,
                 bounds.Right - Scaled(12),
@@ -388,18 +524,12 @@ internal static class NativeUiTheme
                 : (selected ? Text : badgeAccent);
             var badgeRectF = new RectangleF(badgeRect.X, badgeRect.Y, badgeRect.Width, badgeRect.Height);
             using var badgePath = CreateRoundedPath(badgeRectF, Math.Max(4f, badgeSize * 0.28f));
-            using (var badgeFill = new SolidBrush(badgeBg))
-            {
-                graphics.FillPath(badgeFill, badgePath);
-            }
-            using (var badgeRim = new Pen(badgeBorder, 1f))
-            {
-                graphics.DrawPath(badgeRim, badgePath);
-            }
+            graphics.FillPath(GetSharedBrush(badgeBg), badgePath);
+            graphics.DrawPath(GetSharedPen(badgeBorder, 1f), badgePath);
             TextRenderer.DrawText(
                 graphics,
                 row.BadgeGlyph,
-                RowBadgeFont,
+                badgeFont,
                 badgeRect,
                 badgeText,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
@@ -408,13 +538,8 @@ internal static class NativeUiTheme
         var rightEdge = bounds.Right - Scaled(14);
         if (!string.IsNullOrWhiteSpace(row.ShortcutText))
         {
-            var shortcutSize = TextRenderer.MeasureText(
-                graphics,
-                row.ShortcutText,
-                RowPillFont,
-                new Size(Scaled(140), Scaled(22)),
-                TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
-            var pillWidth = Math.Min(Scaled(130), shortcutSize.Width + Scaled(12));
+            var shortcutTextWidth = GetCachedPillTextWidth(row.ShortcutText, pillFont, effectiveDpi, 140);
+            var pillWidth = Math.Min(Scaled(130), shortcutTextWidth + Scaled(12));
             var pillHeight = Scaled(20);
             var shortcutRect = new Rectangle(
                 rightEdge - pillWidth,
@@ -423,14 +548,12 @@ internal static class NativeUiTheme
                 pillHeight);
             var shortcutRectF = new RectangleF(shortcutRect.X, shortcutRect.Y, shortcutRect.Width, shortcutRect.Height);
             using var shortcutPath = CreateRoundedPath(shortcutRectF, Scaled(6));
-            using var shortcutBg = new SolidBrush(highContrast ? SystemColors.Control : Surface);
-            using var shortcutPen = new Pen(highContrast ? SystemColors.WindowText : Border, 1f);
-            graphics.FillPath(shortcutBg, shortcutPath);
-            graphics.DrawPath(shortcutPen, shortcutPath);
+            graphics.FillPath(GetSharedBrush(highContrast ? SystemColors.Control : Surface), shortcutPath);
+            graphics.DrawPath(GetSharedPen(highContrast ? SystemColors.WindowText : Border, 1f), shortcutPath);
             TextRenderer.DrawText(
                 graphics,
                 row.ShortcutText,
-                RowPillFont,
+                pillFont,
                 shortcutRect,
                 highContrast ? SystemColors.ControlText : SecondaryText,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
@@ -440,13 +563,8 @@ internal static class NativeUiTheme
         if (!string.IsNullOrWhiteSpace(row.StatusText))
         {
             var statusAccent = row.StatusColor.IsEmpty ? Accent : row.StatusColor;
-            var statusSize = TextRenderer.MeasureText(
-                graphics,
-                row.StatusText,
-                RowPillFont,
-                new Size(Scaled(130), Scaled(22)),
-                TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
-            var pillWidth = Math.Min(Scaled(124), statusSize.Width + Scaled(14));
+            var statusTextWidth = GetCachedPillTextWidth(row.StatusText, pillFont, effectiveDpi, 130);
+            var pillWidth = Math.Min(Scaled(124), statusTextWidth + Scaled(14));
             var pillHeight = Scaled(20);
             var statusRect = new Rectangle(
                 rightEdge - pillWidth,
@@ -455,18 +573,22 @@ internal static class NativeUiTheme
                 pillHeight);
             var statusRectF = new RectangleF(statusRect.X, statusRect.Y, statusRect.Width, statusRect.Height);
             using var statusPath = CreateRoundedPath(statusRectF, pillHeight / 2f);
-            using var statusBg = new SolidBrush(highContrast
-                ? (selected ? SystemColors.Highlight : SystemColors.Control)
-                : Color.FromArgb(40, statusAccent));
-            using var statusPen = new Pen(highContrast
-                ? (selected ? SystemColors.HighlightText : SystemColors.WindowText)
-                : Color.FromArgb(145, statusAccent), 1f);
-            graphics.FillPath(statusBg, statusPath);
-            graphics.DrawPath(statusPen, statusPath);
+            graphics.FillPath(
+                GetSharedBrush(highContrast
+                    ? (selected ? SystemColors.Highlight : SystemColors.Control)
+                    : Color.FromArgb(40, statusAccent)),
+                statusPath);
+            graphics.DrawPath(
+                GetSharedPen(
+                    highContrast
+                        ? (selected ? SystemColors.HighlightText : SystemColors.WindowText)
+                        : Color.FromArgb(145, statusAccent),
+                    1f),
+                statusPath);
             TextRenderer.DrawText(
                 graphics,
                 row.StatusText,
-                RowPillFont,
+                pillFont,
                 statusRect,
                 highContrast
                     ? (selected ? SystemColors.HighlightText : SystemColors.ControlText)
@@ -490,7 +612,7 @@ internal static class NativeUiTheme
             TextRenderer.DrawText(
                 graphics,
                 row.Title,
-                RowTitleFont,
+                titleFont,
                 titleRect,
                 titleColor,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
@@ -504,14 +626,14 @@ internal static class NativeUiTheme
             TextRenderer.DrawText(
                 graphics,
                 row.Title,
-                RowTitleFont,
+                titleFont,
                 titleRect,
                 titleColor,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
             TextRenderer.DrawText(
                 graphics,
                 row.Detail,
-                RowDetailFont,
+                detailFont,
                 detailRect,
                 detailColor,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
@@ -822,26 +944,13 @@ internal static class NativeUiTheme
         var padX = Math.Max(8, (int)Math.Round(10 * scale));
         var padY = Math.Max(5, (int)Math.Round(6 * scale));
         var maxWidth = Math.Max(220, (int)Math.Round(380 * scale));
+        var font = GetSharedFontForDpi("Segoe UI", 9f, dpi);
 
-        Size measured;
-        if (control.IsHandleCreated)
-        {
-            using var g = control.CreateGraphics();
-            measured = TextRenderer.MeasureText(
-                g,
-                text,
-                ToolTipFont,
-                new Size(maxWidth, 0),
-                TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix);
-        }
-        else
-        {
-            measured = TextRenderer.MeasureText(
-                text,
-                ToolTipFont,
-                new Size(maxWidth, 0),
-                TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix);
-        }
+        var measured = TextRenderer.MeasureText(
+            text,
+            font,
+            new Size(maxWidth, 0),
+            TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix);
 
         e.ToolTipSize = new Size(
             Math.Max(padX * 2 + 12, measured.Width + (padX * 2)),
@@ -852,6 +961,9 @@ internal static class NativeUiTheme
     {
         if (e.Bounds.Width <= 2 || e.Bounds.Height <= 2) return;
 
+        var dpi = Math.Max(96, e.AssociatedControl?.DeviceDpi ?? 96);
+        var font = GetSharedFontForDpi("Segoe UI", 9f, dpi);
+
         if (SystemInformation.HighContrast)
         {
             e.DrawBackground();
@@ -860,20 +972,17 @@ internal static class NativeUiTheme
             TextRenderer.DrawText(
                 e.Graphics,
                 e.ToolTipText,
-                ToolTipFont,
+                font,
                 hcRect,
                 SystemColors.InfoText,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
             return;
         }
 
-        var dpi = Math.Max(96, e.AssociatedControl?.DeviceDpi ?? 96);
+        var isPrivate = e.AssociatedControl?.FindForm() is MainForm { IsPrivateWindow: true };
         var scale = dpi / 96f;
         var g = e.Graphics;
-        using (var backdrop = new SolidBrush(Window))
-        {
-            g.FillRectangle(backdrop, e.Bounds);
-        }
+        g.FillRectangle(GetSharedBrush(isPrivate ? Color.FromArgb(24, 11, 25) : Window), e.Bounds);
 
         g.SmoothingMode = SmoothingMode.AntiAlias;
         var cardRect = new RectangleF(
@@ -886,8 +995,8 @@ internal static class NativeUiTheme
 
         using (var fill = new LinearGradientBrush(
             cardRect,
-            Color.FromArgb(255, 58, 25, 52),
-            Color.FromArgb(255, 31, 13, 28),
+            isPrivate ? Color.FromArgb(255, 52, 22, 68) : Color.FromArgb(255, 58, 25, 52),
+            isPrivate ? Color.FromArgb(255, 28, 12, 36) : Color.FromArgb(255, 31, 13, 28),
             LinearGradientMode.Vertical))
         {
             g.FillPath(fill, cardPath);
@@ -900,8 +1009,8 @@ internal static class NativeUiTheme
             var sheenRect = new RectangleF(cardRect.X, cardRect.Y, cardRect.Width, Math.Max(4f, cardRect.Height * 0.42f));
             using var sheen = new LinearGradientBrush(
                 sheenRect,
-                Color.FromArgb(42, 255, 240, 250),
-                Color.FromArgb(0, Chrome),
+                isPrivate ? Color.FromArgb(44, 244, 228, 255) : Color.FromArgb(42, 255, 240, 250),
+                Color.FromArgb(0, isPrivate ? Color.FromArgb(38, 16, 48) : Chrome),
                 LinearGradientMode.Vertical);
             g.FillRectangle(sheen, sheenRect);
         }
@@ -912,8 +1021,8 @@ internal static class NativeUiTheme
 
         using (var rimBrush = new LinearGradientBrush(
             cardRect,
-            Color.FromArgb(200, 255, 224, 246),
-            Color.FromArgb(140, Focus),
+            isPrivate ? Color.FromArgb(210, 236, 198, 255) : Color.FromArgb(200, 255, 224, 246),
+            isPrivate ? Color.FromArgb(165, Lavender) : Color.FromArgb(140, Focus),
             LinearGradientMode.Vertical))
         using (var rimPen = new Pen(rimBrush, 1f))
         {
@@ -930,7 +1039,7 @@ internal static class NativeUiTheme
         TextRenderer.DrawText(
             g,
             e.ToolTipText,
-            ToolTipFont,
+            font,
             textRect,
             Text,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
@@ -976,34 +1085,59 @@ internal static class NativeUiTheme
         return Color.FromArgb(255, Math.Clamp(r, 0, 255), Math.Clamp(g, 0, 255), Math.Clamp(b, 0, 255));
     }
 
-    private static void ApplyWindowFrameCore(Form form)
+    private static void ApplyWindowFrameCore(Form form, WindowFrameState state)
     {
         if (form.IsDisposed || !form.IsHandleCreated) return;
+        var handle = form.Handle;
+        var highContrast = SystemInformation.HighContrast;
+        var defaultColor = unchecked((int)0xFFFFFFFF);
+        var borderRef = highContrast ? defaultColor : ToColorRef(state.CustomBorderColor ?? Border);
+        var captionRef = highContrast ? defaultColor : ToColorRef(state.CustomCaptionColor ?? Chrome);
+        var textRef = highContrast ? defaultColor : ToColorRef(state.CustomTextColor ?? Text);
+
+        if (state.HasApplied
+            && state.AppliedHandle == handle
+            && state.AppliedHighContrast == highContrast
+            && state.AppliedBorderColorRef == borderRef
+            && state.AppliedCaptionColorRef == captionRef
+            && state.AppliedTextColorRef == textRef)
+        {
+            return;
+        }
+
         try
         {
-            if (SystemInformation.HighContrast)
+            if (highContrast)
             {
                 var darkOff = 0;
-                _ = NativeMethods.DwmSetWindowAttribute(form.Handle, 20, ref darkOff, sizeof(int));
+                _ = NativeMethods.DwmSetWindowAttribute(handle, 20, ref darkOff, sizeof(int));
                 var cornerDefault = 0;
-                _ = NativeMethods.DwmSetWindowAttribute(form.Handle, 33, ref cornerDefault, sizeof(int));
-                var defaultColor = unchecked((int)0xFFFFFFFF);
-                _ = NativeMethods.DwmSetWindowAttribute(form.Handle, 34, ref defaultColor, sizeof(int));
-                _ = NativeMethods.DwmSetWindowAttribute(form.Handle, 35, ref defaultColor, sizeof(int));
-                _ = NativeMethods.DwmSetWindowAttribute(form.Handle, 36, ref defaultColor, sizeof(int));
-                return;
+                _ = NativeMethods.DwmSetWindowAttribute(handle, 33, ref cornerDefault, sizeof(int));
+                var hcColor = defaultColor;
+                _ = NativeMethods.DwmSetWindowAttribute(handle, 34, ref hcColor, sizeof(int));
+                _ = NativeMethods.DwmSetWindowAttribute(handle, 35, ref hcColor, sizeof(int));
+                _ = NativeMethods.DwmSetWindowAttribute(handle, 36, ref hcColor, sizeof(int));
+            }
+            else
+            {
+                var darkMode = 1;
+                _ = NativeMethods.DwmSetWindowAttribute(handle, 20, ref darkMode, sizeof(int));
+                var roundedCorners = 2;
+                _ = NativeMethods.DwmSetWindowAttribute(handle, 33, ref roundedCorners, sizeof(int));
+                var border = borderRef;
+                _ = NativeMethods.DwmSetWindowAttribute(handle, 34, ref border, sizeof(int));
+                var caption = captionRef;
+                _ = NativeMethods.DwmSetWindowAttribute(handle, 35, ref caption, sizeof(int));
+                var text = textRef;
+                _ = NativeMethods.DwmSetWindowAttribute(handle, 36, ref text, sizeof(int));
             }
 
-            var darkMode = 1;
-            _ = NativeMethods.DwmSetWindowAttribute(form.Handle, 20, ref darkMode, sizeof(int));
-            var roundedCorners = 2;
-            _ = NativeMethods.DwmSetWindowAttribute(form.Handle, 33, ref roundedCorners, sizeof(int));
-            var border = ToColorRef(Border);
-            _ = NativeMethods.DwmSetWindowAttribute(form.Handle, 34, ref border, sizeof(int));
-            var caption = ToColorRef(Chrome);
-            _ = NativeMethods.DwmSetWindowAttribute(form.Handle, 35, ref caption, sizeof(int));
-            var text = ToColorRef(Text);
-            _ = NativeMethods.DwmSetWindowAttribute(form.Handle, 36, ref text, sizeof(int));
+            state.AppliedHandle = handle;
+            state.AppliedHighContrast = highContrast;
+            state.AppliedBorderColorRef = borderRef;
+            state.AppliedCaptionColorRef = captionRef;
+            state.AppliedTextColorRef = textRef;
+            state.HasApplied = true;
         }
         catch (Exception error) when (error is DllNotFoundException or EntryPointNotFoundException)
         {
@@ -1011,28 +1145,47 @@ internal static class NativeUiTheme
         }
     }
 
-    private static void ApplyMenuWindowFrameCore(ToolStripDropDown menu)
+    private static void ApplyMenuWindowFrameCore(ToolStripDropDown menu, MenuFrameState state)
     {
         if (menu.IsDisposed || !menu.IsHandleCreated) return;
+        var handle = menu.Handle;
+        var highContrast = SystemInformation.HighContrast;
+        var defaultColor = unchecked((int)0xFFFFFFFF);
+        var borderRef = highContrast ? defaultColor : ToColorRef(state.CustomBorderColor ?? Border);
+
+        if (state.HasApplied
+            && state.AppliedHandle == handle
+            && state.AppliedHighContrast == highContrast
+            && state.AppliedBorderColorRef == borderRef)
+        {
+            return;
+        }
+
         try
         {
-            if (SystemInformation.HighContrast)
+            if (highContrast)
             {
                 var darkOff = 0;
-                _ = NativeMethods.DwmSetWindowAttribute(menu.Handle, 20, ref darkOff, sizeof(int));
+                _ = NativeMethods.DwmSetWindowAttribute(handle, 20, ref darkOff, sizeof(int));
                 var cornerDefault = 0;
-                _ = NativeMethods.DwmSetWindowAttribute(menu.Handle, 33, ref cornerDefault, sizeof(int));
-                var defaultColor = unchecked((int)0xFFFFFFFF);
-                _ = NativeMethods.DwmSetWindowAttribute(menu.Handle, 34, ref defaultColor, sizeof(int));
-                return;
+                _ = NativeMethods.DwmSetWindowAttribute(handle, 33, ref cornerDefault, sizeof(int));
+                var hcColor = defaultColor;
+                _ = NativeMethods.DwmSetWindowAttribute(handle, 34, ref hcColor, sizeof(int));
+            }
+            else
+            {
+                var darkMode = 1;
+                _ = NativeMethods.DwmSetWindowAttribute(handle, 20, ref darkMode, sizeof(int));
+                var roundedCorners = 2;
+                _ = NativeMethods.DwmSetWindowAttribute(handle, 33, ref roundedCorners, sizeof(int));
+                var border = borderRef;
+                _ = NativeMethods.DwmSetWindowAttribute(handle, 34, ref border, sizeof(int));
             }
 
-            var darkMode = 1;
-            _ = NativeMethods.DwmSetWindowAttribute(menu.Handle, 20, ref darkMode, sizeof(int));
-            var roundedCorners = 2;
-            _ = NativeMethods.DwmSetWindowAttribute(menu.Handle, 33, ref roundedCorners, sizeof(int));
-            var border = ToColorRef(Border);
-            _ = NativeMethods.DwmSetWindowAttribute(menu.Handle, 34, ref border, sizeof(int));
+            state.AppliedHandle = handle;
+            state.AppliedHighContrast = highContrast;
+            state.AppliedBorderColorRef = borderRef;
+            state.HasApplied = true;
         }
         catch (Exception error) when (error is DllNotFoundException or EntryPointNotFoundException)
         {
@@ -1058,6 +1211,28 @@ internal static class NativeUiTheme
 
     private static int ToColorRef(Color color) => color.R | (color.G << 8) | (color.B << 16);
 
+    private sealed class WindowFrameState
+    {
+        public Color? CustomCaptionColor { get; set; }
+        public Color? CustomBorderColor { get; set; }
+        public Color? CustomTextColor { get; set; }
+        public IntPtr AppliedHandle { get; set; }
+        public bool AppliedHighContrast { get; set; }
+        public int AppliedBorderColorRef { get; set; }
+        public int AppliedCaptionColorRef { get; set; }
+        public int AppliedTextColorRef { get; set; }
+        public bool HasApplied { get; set; }
+    }
+
+    private sealed class MenuFrameState
+    {
+        public Color? CustomBorderColor { get; set; }
+        public IntPtr AppliedHandle { get; set; }
+        public bool AppliedHighContrast { get; set; }
+        public int AppliedBorderColorRef { get; set; }
+        public bool HasApplied { get; set; }
+    }
+
     private sealed class AppliedFormThemeState
     {
         public bool EventsWired { get; set; }
@@ -1078,6 +1253,185 @@ internal static class NativeUiTheme
         public int HoverIndex { get; set; } = -1;
         public bool EventsWired { get; set; }
         public Func<int, DrawItemState, ModernListRowVisual>? RowSelector { get; set; }
+    }
+
+    internal static class UiTransitionAnimator
+    {
+        internal const int DefaultDurationMs = 110;
+
+        [ThreadStatic]
+        private static System.Windows.Forms.Timer? threadTimer;
+
+        [ThreadStatic]
+        private static List<FloatTransition>? activeTransitions;
+
+        private sealed class FloatTransition
+        {
+            public required Control Owner { get; init; }
+            public required string Key { get; init; }
+            public float StartValue { get; init; }
+            public float TargetValue { get; init; }
+            public float CurrentValue { get; set; }
+            public long StartTick { get; init; }
+            public int DurationMs { get; init; }
+            public required Action<float> Apply { get; init; }
+        }
+
+        internal static void AnimateFloat(
+            Control owner,
+            string key,
+            float fromValue,
+            float targetValue,
+            Action<float> apply,
+            int durationMs = DefaultDurationMs)
+        {
+            ArgumentNullException.ThrowIfNull(owner);
+            ArgumentNullException.ThrowIfNull(apply);
+
+            if (SystemInformation.HighContrast
+                || !SystemInformation.UIEffectsEnabled
+                || durationMs <= 0
+                || owner.IsDisposed
+                || !owner.IsHandleCreated
+                || !owner.Visible
+                || MathF.Abs(targetValue - fromValue) < 0.001f)
+            {
+                RemoveExisting(owner, key);
+                if (!owner.IsDisposed) apply(targetValue);
+                return;
+            }
+
+            var list = activeTransitions ??= new List<FloatTransition>(8);
+            var startValue = fromValue;
+            for (var index = list.Count - 1; index >= 0; index--)
+            {
+                var item = list[index];
+                if (ReferenceEquals(item.Owner, owner) && string.Equals(item.Key, key, StringComparison.Ordinal))
+                {
+                    startValue = item.CurrentValue;
+                    list.RemoveAt(index);
+                    break;
+                }
+            }
+
+            if (MathF.Abs(targetValue - startValue) < 0.001f)
+            {
+                apply(targetValue);
+                StopTimerIfIdle();
+                return;
+            }
+
+            list.Add(new FloatTransition
+            {
+                Owner = owner,
+                Key = key,
+                StartValue = startValue,
+                TargetValue = targetValue,
+                CurrentValue = startValue,
+                StartTick = Environment.TickCount64,
+                DurationMs = durationMs,
+                Apply = apply
+            });
+
+            EnsureTimerRunning();
+        }
+
+        internal static void Cancel(Control owner)
+        {
+            if (activeTransitions is not { Count: > 0 } list) return;
+            for (var index = list.Count - 1; index >= 0; index--)
+            {
+                if (ReferenceEquals(list[index].Owner, owner))
+                {
+                    list.RemoveAt(index);
+                }
+            }
+            StopTimerIfIdle();
+        }
+
+        private static void RemoveExisting(Control owner, string key)
+        {
+            if (activeTransitions is not { Count: > 0 } list) return;
+            for (var index = list.Count - 1; index >= 0; index--)
+            {
+                var item = list[index];
+                if (ReferenceEquals(item.Owner, owner) && string.Equals(item.Key, key, StringComparison.Ordinal))
+                {
+                    list.RemoveAt(index);
+                }
+            }
+            StopTimerIfIdle();
+        }
+
+        private static void EnsureTimerRunning()
+        {
+            if (threadTimer is null)
+            {
+                threadTimer = new System.Windows.Forms.Timer { Interval = 16 };
+                threadTimer.Tick += OnTimerTick;
+            }
+            if (!threadTimer.Enabled)
+            {
+                threadTimer.Start();
+            }
+        }
+
+        private static void StopTimerIfIdle()
+        {
+            if (activeTransitions is { Count: > 0 }) return;
+            if (threadTimer is not null)
+            {
+                threadTimer.Stop();
+                threadTimer.Tick -= OnTimerTick;
+                threadTimer.Dispose();
+                threadTimer = null;
+            }
+        }
+
+        private static void OnTimerTick(object? sender, EventArgs e)
+        {
+            var list = activeTransitions;
+            if (list is null || list.Count == 0)
+            {
+                StopTimerIfIdle();
+                return;
+            }
+
+            var nowTick = Environment.TickCount64;
+            var immediateSnap = SystemInformation.HighContrast || !SystemInformation.UIEffectsEnabled;
+            for (var index = list.Count - 1; index >= 0; index--)
+            {
+                var transition = list[index];
+                if (transition.Owner.IsDisposed)
+                {
+                    list.RemoveAt(index);
+                    continue;
+                }
+
+                if (immediateSnap || !transition.Owner.IsHandleCreated || !transition.Owner.Visible)
+                {
+                    transition.CurrentValue = transition.TargetValue;
+                    list.RemoveAt(index);
+                    transition.Apply(transition.TargetValue);
+                    continue;
+                }
+
+                var elapsed = nowTick - transition.StartTick;
+                var progress = Math.Clamp((float)elapsed / transition.DurationMs, 0f, 1f);
+                var eased = 1f - MathF.Pow(1f - progress, 3f);
+                var nextValue = progress >= 1f
+                    ? transition.TargetValue
+                    : transition.StartValue + ((transition.TargetValue - transition.StartValue) * eased);
+                transition.CurrentValue = nextValue;
+                if (progress >= 1f)
+                {
+                    list.RemoveAt(index);
+                }
+                transition.Apply(nextValue);
+            }
+
+            StopTimerIfIdle();
+        }
     }
 
     private static class NativeMethods

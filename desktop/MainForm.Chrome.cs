@@ -11,25 +11,32 @@ namespace MishaWeb;
 
 public sealed partial class MainForm
 {
+    private int cachedResizeFrameDpi;
+    private int cachedResizeFrameX;
+    private int cachedResizeFrameY;
+    private long lastUserInteractionTick = Environment.TickCount64;
+    private TableLayoutPanel? omniboxLayout;
+    private (string Primary, bool IsHoverPrimary, int Blocked, int ActiveDownloads, int Sleeping, int Unloaded) lastStatusTuple;
+    private bool hasStatusTuple;
+
+    internal bool IsPrivateWindow => isPrivateMode;
+
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
         NativeMethods.ApplyBorderlessResizableStyle(Handle);
-        NativeUiTheme.ApplyWindowFrame(this);
-        if (!IsHighContrastActive)
-        {
-            var palette = ResolveChromeColorPolicy(false, isPrivateMode);
-            NativeMethods.TryEnableModernWindowFrame(
-                Handle,
-                palette.ChromeSurface,
-                palette.WindowFrameBorder,
-                palette.WindowFrameText);
-        }
+        var palette = ResolveChromeColorPolicy(IsHighContrastActive, isPrivateMode);
+        NativeUiTheme.ApplyWindowFrame(
+            this,
+            palette.ChromeSurface,
+            palette.WindowFrameBorder,
+            palette.WindowFrameText);
     }
 
     protected override void OnDpiChanged(DpiChangedEventArgs e)
     {
         base.OnDpiChanged(e);
+        ApplyChromeDpiMetrics();
         UpdateChromeRowsForFullscreen();
         UpdateResponsiveToolbar();
         UpdateFindBarLayout();
@@ -156,7 +163,7 @@ public sealed partial class MainForm
                 }
             }
 
-            if (IsPointInsideControl(maximizeButton, screenPoint))
+            if (IsClientPointInsideControl(maximizeButton, clientPoint))
             {
                 message.Result = (IntPtr)NativeMethods.HtMaxButton;
                 return;
@@ -191,15 +198,22 @@ public sealed partial class MainForm
 
     private void NoteUserInteraction()
     {
-        lastUserInteractionUtc = DateTime.UtcNow;
+        var nowTick = Environment.TickCount64;
         if (isAppIdleLowPowerActive)
         {
+            lastUserInteractionTick = nowTick;
+            lastUserInteractionUtc = DateTime.UtcNow;
             isAppIdleLowPowerActive = false;
-            if (activeTab is not null && !isWindowMinimized)
+            if (!isWindowMinimized)
             {
-                ApplyLiveTabMemoryTarget(activeTab, foreground: true);
+                RefreshLiveTabMemoryTargets();
             }
+            return;
         }
+
+        if (nowTick - lastUserInteractionTick < 1_000) return;
+        lastUserInteractionTick = nowTick;
+        lastUserInteractionUtc = DateTime.UtcNow;
     }
 
     private void CheckApplicationInactivity()
@@ -215,11 +229,12 @@ public sealed partial class MainForm
             if (observedInteractionUtc > lastUserInteractionUtc)
             {
                 lastUserInteractionUtc = observedInteractionUtc;
+                lastUserInteractionTick = Environment.TickCount64;
             }
             if (isAppIdleLowPowerActive)
             {
                 isAppIdleLowPowerActive = false;
-                ApplyLiveTabMemoryTarget(activeTab, foreground: true);
+                RefreshLiveTabMemoryTargets();
             }
             return;
         }
@@ -227,15 +242,30 @@ public sealed partial class MainForm
         if (idleDuration >= threshold && !isAppIdleLowPowerActive)
         {
             isAppIdleLowPowerActive = true;
-            ApplyLiveTabMemoryTarget(activeTab, foreground: false);
+            RefreshLiveTabMemoryTargets();
+            for (var index = 0; index < tabs.Count; index++)
+            {
+                var tab = tabs[index];
+                if (!tab.IsClosed)
+                {
+                    ApplyLiveTabMemoryTarget(tab, foreground: false);
+                }
+            }
             TrimAllProcessMemory();
         }
     }
 
     private int GetResizeHitTest(Point point)
     {
-        var frameX = NativeMethods.GetResizeFrameThickness(DeviceDpi, horizontal: true);
-        var frameY = NativeMethods.GetResizeFrameThickness(DeviceDpi, horizontal: false);
+        var dpi = DeviceDpi;
+        if (cachedResizeFrameDpi != dpi)
+        {
+            cachedResizeFrameX = NativeMethods.GetResizeFrameThickness(dpi, horizontal: true);
+            cachedResizeFrameY = NativeMethods.GetResizeFrameThickness(dpi, horizontal: false);
+            cachedResizeFrameDpi = dpi;
+        }
+        var frameX = cachedResizeFrameX;
+        var frameY = cachedResizeFrameY;
         var left = point.X >= 0 && point.X < frameX;
         var right = point.X <= ClientSize.Width && point.X >= ClientSize.Width - frameX;
         var top = point.Y >= 0 && point.Y < frameY;
@@ -254,28 +284,72 @@ public sealed partial class MainForm
 
     private bool IsCaptionPoint(Point clientPoint, Point screenPoint)
     {
-        if (clientPoint.Y < 0 || clientPoint.Y >= titleBar.Bottom) return false;
-        if (IsPointInsideControl(newTabButton, screenPoint)
-            || IsPointInsideControl(tabListButton, screenPoint)
-            || IsPointInsideControl(minimizeButton, screenPoint)
-            || IsPointInsideControl(maximizeButton, screenPoint)
-            || IsPointInsideControl(closeWindowButton, screenPoint))
+        _ = screenPoint;
+        if (!TryGetControlOriginInFormClient(titleBar, out _, out var titleBarTop)) return false;
+        if (clientPoint.Y < 0 || clientPoint.Y >= titleBarTop + titleBar.Height) return false;
+        if (IsClientPointInsideControl(newTabButton, clientPoint)
+            || IsClientPointInsideControl(tabListButton, clientPoint)
+            || (incognitoBadge is not null && IsClientPointInsideControl(incognitoBadge, clientPoint))
+            || IsClientPointInsideControl(minimizeButton, clientPoint)
+            || IsClientPointInsideControl(maximizeButton, clientPoint)
+            || IsClientPointInsideControl(closeWindowButton, clientPoint))
         {
             return false;
         }
 
-        if (IsPointInsideControl(tabStrip, screenPoint))
+        if (TryGetControlOriginInFormClient(tabStrip, out var tabStripLeft, out var tabStripTop))
         {
-            // Keep the actual tab headers in the client area so their mouse
-            // events can start a reorder drag. Only the unused strip space
-            // should behave like a draggable window caption.
-            for (var index = 0; index < tabs.Count; index++)
+            var localX = clientPoint.X - tabStripLeft;
+            var localY = clientPoint.Y - tabStripTop;
+            if (localX >= 0 && localX < tabStrip.ClientSize.Width
+                && localY >= 0 && localY < tabStrip.ClientSize.Height)
             {
-                if (IsPointInsideControl(tabs[index].Header, screenPoint)) return false;
+                // Keep the actual tab headers in the client area so their mouse
+                // events can start a reorder drag. Only the unused strip space
+                // should behave like a draggable window caption.
+                for (var index = 0; index < tabs.Count; index++)
+                {
+                    var header = tabs[index].Header;
+                    if (!header.Visible) continue;
+                    if (localX >= header.Left && localX < header.Right
+                        && localY >= header.Top && localY < header.Bottom)
+                    {
+                        return false;
+                    }
+                }
+                return true;
             }
-            return true;
         }
         return true;
+    }
+
+    private bool TryGetControlOriginInFormClient(Control? control, out int originX, out int originY)
+    {
+        originX = 0;
+        originY = 0;
+        if (control is null || !control.Visible) return false;
+
+        Control? current = control;
+        while (current is not null && !ReferenceEquals(current, this))
+        {
+            if (!current.Visible) return false;
+            originX += current.Left;
+            originY += current.Top;
+            current = current.Parent;
+        }
+        return ReferenceEquals(current, this);
+    }
+
+    private bool IsClientPointInsideControl(Control? control, Point formClientPoint)
+    {
+        if (control is null || !TryGetControlOriginInFormClient(control, out var originX, out var originY))
+        {
+            return false;
+        }
+        var localX = formClientPoint.X - originX;
+        var localY = formClientPoint.Y - originY;
+        return localX >= 0 && localX < control.Width
+            && localY >= 0 && localY < control.Height;
     }
 
     private void BeginWindowDrag(object? sender, MouseEventArgs e)
@@ -508,7 +582,7 @@ public sealed partial class MainForm
         findBox.BackColor = palette.FieldSurface;
         findBox.ForeColor = palette.FieldText;
         statusLabel.ForeColor = palette.MutedText;
-        findMatchLabel.ForeColor = palette.MutedText;
+        UpdateFindMatchVisualState();
 
         menuRenderer.HighContrast = palette.HighContrast;
         multiViewButton.Palette = palette;
@@ -526,21 +600,11 @@ public sealed partial class MainForm
         UpdateSiteInfo();
         UpdateFavoriteButton();
 
-        if (IsHandleCreated)
-        {
-            if (palette.HighContrast)
-            {
-                NativeUiTheme.ApplyWindowFrame(this);
-            }
-            else
-            {
-                NativeMethods.TryEnableModernWindowFrame(
-                    Handle,
-                    palette.ChromeSurface,
-                    palette.WindowFrameBorder,
-                    palette.WindowFrameText);
-            }
-        }
+        NativeUiTheme.ApplyWindowFrame(
+            this,
+            palette.ChromeSurface,
+            palette.WindowFrameBorder,
+            palette.WindowFrameText);
         Invalidate(true);
     }
 
@@ -567,7 +631,7 @@ public sealed partial class MainForm
     private static void ApplyMenuPalette(ToolStripDropDown menu, ChromeColorPolicy palette)
     {
         if (menu.IsDisposed) return;
-        NativeUiTheme.ApplyMenuWindowFrame(menu);
+        NativeUiTheme.ApplyMenuWindowFrame(menu, palette.WindowFrameBorder);
         menu.BackColor = palette.MenuSurface;
         menu.ForeColor = palette.MenuText;
         foreach (ToolStripItem item in menu.Items)
@@ -653,7 +717,6 @@ public sealed partial class MainForm
         BuildToolbar();
         BuildFindBar();
         BuildMenus();
-        NativeUiTheme.ApplyWindowFrame(this);
         NativeUiTheme.ConfigureGlassToolTip(toolTip);
         NativeUiTheme.ApplyDarkScrollbars(tabStrip);
 
@@ -676,6 +739,7 @@ public sealed partial class MainForm
         addressSuggestionPopup.BringToFront();
 
         WireChromeEvents();
+        ApplyChromeDpiMetrics();
         UpdateNavigationChrome();
         UpdateResponsiveToolbar();
         UpdateWindowControls();
@@ -771,10 +835,18 @@ public sealed partial class MainForm
         toolbar.Paint += (_, e) =>
         {
             if (IsHighContrastActive || toolbar.Width <= 2 || toolbar.Height <= 2) return;
-            using var topRim = new Pen(Color.FromArgb(32, 255, 232, 248), 1f);
-            e.Graphics.DrawLine(topRim, 0, 0, toolbar.Width - 1, 0);
-            using var bottomSep = new Pen(Color.FromArgb(62, 255, 224, 245), 1f);
-            e.Graphics.DrawLine(bottomSep, 0, toolbar.Height - 1, toolbar.Width - 1, toolbar.Height - 1);
+            e.Graphics.DrawLine(
+                NativeUiTheme.GetSharedPen(Color.FromArgb(32, 255, 232, 248), 1f),
+                0,
+                0,
+                toolbar.Width - 1,
+                0);
+            e.Graphics.DrawLine(
+                NativeUiTheme.GetSharedPen(Color.FromArgb(62, 255, 224, 245), 1f),
+                0,
+                toolbar.Height - 1,
+                toolbar.Width - 1,
+                toolbar.Height - 1);
         };
         toolbar.RowCount = 1;
         toolbar.ColumnCount = 9;
@@ -885,7 +957,7 @@ public sealed partial class MainForm
         omniboxPanel.CornerRadius = 15;
         omniboxPanel.Padding = new Padding(2);
 
-        var omniboxLayout = new TableLayoutPanel
+        omniboxLayout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             Margin = Padding.Empty,
@@ -948,6 +1020,16 @@ public sealed partial class MainForm
         findBar.Margin = Padding.Empty;
         findBar.Padding = new Padding(12, 5, 10, 5);
         findBar.BackColor = ToolbarColor;
+        findBar.Paint += (_, e) =>
+        {
+            if (IsHighContrastActive || findBar.Width <= 2 || findBar.Height <= 2) return;
+            e.Graphics.DrawLine(
+                NativeUiTheme.GetSharedPen(Color.FromArgb(62, 255, 224, 245), 1f),
+                0,
+                findBar.Height - 1,
+                findBar.Width - 1,
+                findBar.Height - 1);
+        };
         findBar.RowCount = 1;
         findBar.ColumnCount = 6;
         findBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -982,6 +1064,7 @@ public sealed partial class MainForm
         findMatchLabel.Font = NativeUiTheme.GetSharedFont("Segoe UI", 8.5f);
         findMatchLabel.Text = string.Empty;
         findMatchLabel.AccessibleName = "Find match count";
+        findMatchLabel.TextChanged += (_, _) => UpdateFindMatchVisualState();
 
         ConfigureToolbarButton(findCaseSensitiveButton, string.Empty, "Match case", "Match case", 10f);
         ConfigureToolbarButton(findPreviousButton, string.Empty, "Previous match (\u2191, Shift+F3)", "Previous match", 11f);
@@ -1154,6 +1237,7 @@ public sealed partial class MainForm
         reloadButton.Click += (_, _) => ReloadOrStop();
         homeButton.Click += (_, _) => ShowStartPage(activeTab);
         siteInfoButton.Click += (_, _) => ShowSiteInformation();
+        if (incognitoBadge is not null) incognitoBadge.Click += (_, _) => ShowSiteInformation();
         favoriteButton.Click += (_, _) => ToggleFavorite();
         newTabButton.Click += (_, _) => RunUiTask(() => OpenNewTabAsync(StartPage.Url), "Could not open a tab");
         tabListButton.Click += (_, _) => ShowTabListMenu();
@@ -1643,9 +1727,12 @@ public sealed partial class MainForm
 
         if (scope is null or CommandSource.OpenTab)
         {
-            var mruRanks = mruTabs.Order
-                .Select((tab, index) => (tab, index))
-                .ToDictionary(item => item.tab, item => item.index);
+            var mruRanks = new Dictionary<BrowserTab, int>(tabs.Count);
+            var mruRankIndex = 0;
+            foreach (var orderedTab in mruTabs.Order)
+            {
+                mruRanks.TryAdd(orderedTab, mruRankIndex++);
+            }
             for (var index = 0; index < tabs.Count; index++)
             {
                 var tab = tabs[index];
@@ -1689,15 +1776,15 @@ public sealed partial class MainForm
                     Target: session);
             }
 
-            for (var index = 0; index < closedTabs.Count; index++)
+            var closedIndex = 0;
+            foreach (var closed in closedTabs)
             {
-                var closed = closedTabs.ElementAt(index);
                 yield return new CommandCandidate(
                     closed.Title,
                     FormatBrowserChromeUrlForDisplay(closed.Url),
                     CommandSource.RecentlyClosed,
                     closed.Url,
-                    SourceIndex: index,
+                    SourceIndex: closedIndex++,
                     Target: closed);
             }
 
@@ -2902,8 +2989,8 @@ public sealed partial class MainForm
 
     private void UpdateSiteInfo()
     {
-        var palette = ResolveChromeColorPolicy(IsHighContrastActive);
-        var muted = palette.HighContrast ? palette.FieldText : MutedTextColor;
+        var palette = ResolveChromeColorPolicy(IsHighContrastActive, isPrivateMode);
+        var muted = palette.HighContrast ? palette.FieldText : palette.MutedText;
         var positive = palette.HighContrast ? palette.FieldText : PositiveColor;
         var negative = palette.HighContrast ? palette.FieldText : NegativeColor;
         var tab = activeTab;
@@ -2963,15 +3050,70 @@ public sealed partial class MainForm
 
     private void UpdateFavoriteButton()
     {
-        var palette = ResolveChromeColorPolicy(IsHighContrastActive);
+        var palette = ResolveChromeColorPolicy(IsHighContrastActive, isPrivateMode);
         var tab = activeTab;
         var isFavorite = tab is not null && state.Bookmarks.Any(item =>
             BrowserPolicy.UrlEquals(item.Url, tab.Url));
         favoriteButton.GlyphState = isFavorite ? "filled" : "outline";
         favoriteButton.ForeColor = palette.HighContrast
             ? palette.FieldText
-            : isFavorite ? AccentColor : MutedTextColor;
+            : isFavorite
+                ? (isPrivateMode ? NativeUiTheme.Lavender : AccentColor)
+                : palette.MutedText;
         favoriteButton.AccessibleName = isFavorite ? "Remove from favorites" : "Add to favorites";
+    }
+
+    private void ApplyChromeDpiMetrics()
+    {
+        if (titleBar.ColumnStyles.Count >= 7)
+        {
+            titleBar.SuspendLayout();
+            try
+            {
+                titleBar.ColumnStyles[0].Width = ScaleChromeLogical(34);
+                titleBar.ColumnStyles[2].Width = ScaleChromeLogical(28);
+                titleBar.ColumnStyles[3].Width = ScaleChromeLogical(isPrivateMode ? 86 : 4);
+                titleBar.ColumnStyles[4].Width = ScaleChromeLogical(46);
+                titleBar.ColumnStyles[5].Width = ScaleChromeLogical(46);
+                titleBar.ColumnStyles[6].Width = ScaleChromeLogical(46);
+            }
+            finally
+            {
+                titleBar.ResumeLayout(false);
+            }
+        }
+
+        var nextNewTabSize = new Size(ScaleChromeLogical(28), ScaleChromeLogical(27));
+        if (newTabButton.Size != nextNewTabSize)
+        {
+            newTabButton.Size = nextNewTabSize;
+        }
+        if (incognitoBadge is not null)
+        {
+            var nextBadgeSize = new Size(ScaleChromeLogical(82), ScaleChromeLogical(26));
+            if (incognitoBadge.Size != nextBadgeSize)
+            {
+                incognitoBadge.Size = nextBadgeSize;
+            }
+        }
+        if (omniboxLayout is { ColumnStyles.Count: >= 3 })
+        {
+            var embeddedWidth = ScaleToolbarLogical(32);
+            omniboxLayout.ColumnStyles[0].Width = embeddedWidth;
+            omniboxLayout.ColumnStyles[2].Width = embeddedWidth;
+        }
+    }
+
+    private void UpdateFindMatchVisualState()
+    {
+        var palette = ResolveChromeColorPolicy(IsHighContrastActive, isPrivateMode);
+        var isNoMatch = findMatchLabel.Text.StartsWith("No match", StringComparison.OrdinalIgnoreCase);
+        findMatchLabel.ForeColor = palette.HighContrast
+            ? palette.MutedText
+            : isNoMatch ? NativeUiTheme.Negative : palette.MutedText;
+        findOmniboxPanel.FocusBorderColor = palette.HighContrast
+            ? palette.Focus
+            : isNoMatch ? NativeUiTheme.Negative : palette.Focus;
     }
 
     private void UpdateResponsiveToolbar()
@@ -2980,6 +3122,18 @@ public sealed partial class MainForm
         toolbar.SuspendLayout();
         try
         {
+            var navColumnWidth = ScaleToolbarLogical(40);
+            toolbar.ColumnStyles[0].Width = navColumnWidth;
+            toolbar.ColumnStyles[1].Width = navColumnWidth;
+            toolbar.ColumnStyles[2].Width = navColumnWidth;
+            toolbar.ColumnStyles[8].Width = ScaleToolbarLogical(42);
+            if (omniboxLayout is { ColumnStyles.Count: >= 3 })
+            {
+                var embeddedWidth = ScaleToolbarLogical(32);
+                omniboxLayout.ColumnStyles[0].Width = embeddedWidth;
+                omniboxLayout.ColumnStyles[2].Width = embeddedWidth;
+            }
+
             var width = toolbar.ClientSize.Width;
             SetToolbarColumnVisibility(3, width >= ScaleToolbarLogical(560), ScaleToolbarLogical(36));
             SetToolbarColumnVisibility(6, downloadsButtonAutoVisible, ScaleToolbarLogical(38));
@@ -2993,11 +3147,14 @@ public sealed partial class MainForm
             SetToolbarColumnVisibility(7, showMultiView, ScaleToolbarLogical(compactMultiView ? 38 : 144));
             multiViewButton.Visible = showMultiView;
 
-            var fixedWidth = toolbar.Padding.Horizontal;
-            foreach (var column in new[] { 0, 1, 2, 3, 6, 7, 8 })
-            {
-                fixedWidth += (int)Math.Ceiling(toolbar.ColumnStyles[column].Width);
-            }
+            var fixedWidth = toolbar.Padding.Horizontal
+                + (int)Math.Ceiling(toolbar.ColumnStyles[0].Width)
+                + (int)Math.Ceiling(toolbar.ColumnStyles[1].Width)
+                + (int)Math.Ceiling(toolbar.ColumnStyles[2].Width)
+                + (int)Math.Ceiling(toolbar.ColumnStyles[3].Width)
+                + (int)Math.Ceiling(toolbar.ColumnStyles[6].Width)
+                + (int)Math.Ceiling(toolbar.ColumnStyles[7].Width)
+                + (int)Math.Ceiling(toolbar.ColumnStyles[8].Width);
 
             // Keep hover/status geometry stable. Text is ellipsized inside one
             // fixed column, so frequent link changes never trigger measurement or
@@ -3110,7 +3267,6 @@ public sealed partial class MainForm
     private void UpdateStatus()
     {
         if (isClosing) return;
-        var parts = new List<string>(4);
         var tab = activeTab;
         if (tab?.HasPendingHoverStatus == true)
         {
@@ -3119,30 +3275,72 @@ public sealed partial class MainForm
             tab.HasPendingHoverStatus = false;
             tab.HoverStatus = FormatHoverStatusForDisplay(pendingStatus);
         }
-        if (!string.IsNullOrWhiteSpace(transientStatus)) parts.Add(transientStatus);
-        else if (!string.IsNullOrWhiteSpace(tab?.HoverStatus)) parts.Add(tab.HoverStatus);
-        else if (tab is not null) parts.Add(tab.StatusText);
-        else parts.Add(environment is null ? "Starting\u2026" : "Ready");
 
-        if (tab?.BlockedRequestCount > 0) parts.Add($"{tab.BlockedRequestCount} blocked");
-        var activeDownloads = tabs.Sum(item => item.ActiveDownloads);
-        if (activeDownloads > 0) parts.Add($"{activeDownloads} downloading");
-        var sleeping = tabs.Count(item => item.IsSuspended);
-        if (sleeping > 0) parts.Add($"{sleeping} sleeping");
-        var unloaded = tabs.Count(item => item.IsDiscarded);
-        if (unloaded > 0) parts.Add($"{unloaded} unloaded");
-
-        var text = string.Join(" \u00B7 ", parts);
-        var displayText = text.Equals("Ready", StringComparison.Ordinal) ? string.Empty : text;
-        if (!text.Equals(lastRenderedStatusText, StringComparison.Ordinal))
+        var isHoverPrimary = false;
+        string primary;
+        if (!string.IsNullOrWhiteSpace(transientStatus))
         {
-            var statusVisibilityChanged = StatusTextVisibilityChanged(statusLabel.Text, displayText);
-            lastRenderedStatusText = text;
-            statusLabel.Text = displayText;
-            statusLabel.AccessibleName = $"Browser status: {text}";
-            toolTip.SetToolTip(statusLabel, text);
-            if (statusVisibilityChanged) UpdateResponsiveToolbar();
+            primary = transientStatus;
         }
+        else if (!string.IsNullOrWhiteSpace(tab?.HoverStatus))
+        {
+            primary = tab.HoverStatus;
+            isHoverPrimary = true;
+        }
+        else if (tab is not null)
+        {
+            primary = tab.StatusText;
+        }
+        else
+        {
+            primary = environment is null ? "Starting\u2026" : "Ready";
+        }
+
+        var blocked = tab?.BlockedRequestCount ?? 0;
+        var activeDownloads = 0;
+        var sleeping = 0;
+        var unloaded = 0;
+        for (var index = 0; index < tabs.Count; index++)
+        {
+            var item = tabs[index];
+            activeDownloads += item.ActiveDownloads;
+            if (item.IsSuspended) sleeping++;
+            if (item.IsDiscarded) unloaded++;
+        }
+
+        var currentTuple = (primary, isHoverPrimary, blocked, activeDownloads, sleeping, unloaded);
+        if (!hasStatusTuple || currentTuple != lastStatusTuple)
+        {
+            hasStatusTuple = true;
+            lastStatusTuple = currentTuple;
+
+            string text;
+            if (blocked <= 0 && activeDownloads <= 0 && sleeping <= 0 && unloaded <= 0)
+            {
+                text = primary;
+            }
+            else
+            {
+                var parts = new List<string>(5) { primary };
+                if (blocked > 0) parts.Add($"{blocked} blocked");
+                if (activeDownloads > 0) parts.Add($"{activeDownloads} downloading");
+                if (sleeping > 0) parts.Add($"{sleeping} sleeping");
+                if (unloaded > 0) parts.Add($"{unloaded} unloaded");
+                text = string.Join(" \u00B7 ", parts);
+            }
+
+            var displayText = text.Equals("Ready", StringComparison.Ordinal) ? string.Empty : text;
+            if (!text.Equals(lastRenderedStatusText, StringComparison.Ordinal))
+            {
+                var statusVisibilityChanged = StatusTextVisibilityChanged(statusLabel.Text, displayText);
+                lastRenderedStatusText = text;
+                statusLabel.Text = displayText;
+                statusLabel.AccessibleName = $"Browser status: {text}";
+                toolTip.SetToolTip(statusLabel, text);
+                if (statusVisibilityChanged) UpdateResponsiveToolbar();
+            }
+        }
+
         var semanticStatus = !string.IsNullOrWhiteSpace(transientStatus)
             ? transientStatus
             : string.IsNullOrWhiteSpace(tab?.HoverStatus)
