@@ -999,15 +999,14 @@ internal static class AdBlockDocumentScript
                 } catch (_) { return bodyText; }
             };
 
-            const createSanitizedStream = (nativeBody, contentType) => {
-                if (!nativeBody
-                    || typeof nativeBody.getReader !== 'function'
+            const createSanitizedStream = (getNativeBody, contentType) => {
+                if (!getNativeBody
                     || typeof ReadableStream !== 'function'
                     || typeof TextDecoder !== 'function'
                     || typeof TextEncoder !== 'function') {
-                    return nativeBody;
+                    return typeof getNativeBody === 'function' ? getNativeBody() : getNativeBody;
                 }
-                const reader = nativeBody.getReader();
+                let reader = null;
                 const decoder = new TextDecoder('utf-8');
                 const encoder = new TextEncoder();
                 let boundary = extractMultipartBoundary(contentType, '');
@@ -1043,6 +1042,20 @@ internal static class AdBlockDocumentScript
                 return new ReadableStream({
                     async pull(controller) {
                         try {
+                            if (!reader) {
+                                // Acquire the native reader lazily on the first consumer pull so
+                                // inspecting response.body before response.clone()/text()/json()
+                                // never locks the underlying Response stream prematurely, and resolve
+                                // dynamically in case response.clone() teed/replaced the stream.
+                                const currentBody = typeof getNativeBody === 'function'
+                                    ? getNativeBody()
+                                    : getNativeBody;
+                                if (!currentBody || typeof currentBody.getReader !== 'function') {
+                                    controller.close();
+                                    return;
+                                }
+                                reader = currentBody.getReader();
+                            }
                             while (true) {
                                 const { done, value } = await reader.read();
                                 if (done) {
@@ -1095,10 +1108,15 @@ internal static class AdBlockDocumentScript
                         }
                     },
                     cancel(reason) {
-                        try { return reader.cancel(reason); }
-                        catch (_) { return Promise.resolve(); }
+                        try {
+                            if (reader) return reader.cancel(reason);
+                            const currentBody = typeof getNativeBody === 'function'
+                                ? getNativeBody()
+                                : getNativeBody;
+                            return currentBody?.cancel ? currentBody.cancel(reason) : Promise.resolve();
+                        } catch (_) { return Promise.resolve(); }
                     }
-                });
+                }, { highWaterMark: 0 });
             };
 
             const patchResponse = (response, request) => {
@@ -1169,6 +1187,7 @@ internal static class AdBlockDocumentScript
                         && (bodyGetter || hasOwnValueBody)
                         && (!ownBodyDesc || ownBodyDesc.configurable)) {
                         const initialBodyValue = hasOwnValueBody ? ownBodyDesc.value : undefined;
+                        const getNativeBody = () => (bodyGetter ? bodyGetter.call(response) : initialBodyValue);
                         let sanitizedBodyStream;
                         let bodyResolved = false;
                         Object.defineProperty(response, 'body', {
@@ -1177,8 +1196,13 @@ internal static class AdBlockDocumentScript
                             get() {
                                 if (bodyResolved) return sanitizedBodyStream;
                                 bodyResolved = true;
-                                const nativeBody = bodyGetter ? bodyGetter.call(response) : initialBodyValue;
-                                sanitizedBodyStream = createSanitizedStream(nativeBody, contentType);
+                                const initialNativeBody = getNativeBody();
+                                if (!initialNativeBody
+                                    || typeof initialNativeBody.getReader !== 'function') {
+                                    sanitizedBodyStream = initialNativeBody;
+                                    return sanitizedBodyStream;
+                                }
+                                sanitizedBodyStream = createSanitizedStream(getNativeBody, contentType);
                                 return sanitizedBodyStream;
                             }
                         });
@@ -1206,6 +1230,7 @@ internal static class AdBlockDocumentScript
                             const url = isReq ? firstArg.url : requestUrl(firstArg);
                             if (isReq && shouldSanitizePlayerPayload(firstArg)) {
                                 return (async () => {
+                                    let reqToSend = null;
                                     try {
                                         const bodyText = await firstArg.clone().text();
                                         const rewritten = rewritePlayerRequest(url, bodyText);
@@ -1228,13 +1253,13 @@ internal static class AdBlockDocumentScript
                                                 signal: firstArg.signal,
                                                 body: rewritten
                                             };
-                                            const newReq = new Request(firstArg.url, init);
-                                            const response = await Reflect.apply(target, thisArg, [newReq]);
-                                            return patchResponse(response, newReq);
+                                            reqToSend = new Request(firstArg.url, init);
                                         }
                                     } catch (_) { }
-                                    const res = await Reflect.apply(target, thisArg, args);
-                                    return patchResponse(res, firstArg);
+                                    const res = reqToSend
+                                        ? await Reflect.apply(target, thisArg, [reqToSend])
+                                        : await Reflect.apply(target, thisArg, args);
+                                    return patchResponse(res, reqToSend || firstArg);
                                 })();
                             }
                             const body = args[1]?.body;
@@ -2375,11 +2400,13 @@ internal static class AdBlockDocumentScript
                 queueCleanup();
                 scheduleFallback(false);
             };
-            const sanitizePageDataEnvelope = candidate => {
+            const sanitizePageDataEnvelope = (candidate, isPlayer = false) => {
                 if (!candidate || typeof candidate !== 'object') return;
                 const sanitized = sanitize(candidate);
-                repairPlayerResponse(sanitized);
-                inspectPlayerResponse(sanitized);
+                if (isPlayer) {
+                    repairPlayerResponse(sanitized);
+                    inspectPlayerResponse(sanitized);
+                }
             };
             const onPageDataFetched = event => {
                 if (!isEnabled()) return;
@@ -2388,11 +2415,11 @@ internal static class AdBlockDocumentScript
                     if (detail && typeof detail === 'object') {
                         const pageData = detail.pageData;
                         if (pageData && typeof pageData === 'object') {
-                            sanitizePageDataEnvelope(pageData.playerResponse);
-                            sanitizePageDataEnvelope(pageData.response);
+                            sanitizePageDataEnvelope(pageData.playerResponse, true);
+                            sanitizePageDataEnvelope(pageData.response, false);
                         }
-                        sanitizePageDataEnvelope(detail.response);
-                        sanitizePageDataEnvelope(detail.playerResponse);
+                        sanitizePageDataEnvelope(detail.response, false);
+                        sanitizePageDataEnvelope(detail.playerResponse, true);
                     }
                     if (isYouTubeWatch()) {
                         observePlayer();

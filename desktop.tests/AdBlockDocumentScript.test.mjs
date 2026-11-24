@@ -488,6 +488,7 @@ function runYouTubeSandbox({ pathname = '/watch', hidden = false, initialFetch =
   assert.equal('adPlacements' in eventDetail.pageData.playerResponse, false);
   assert.equal('playerAds' in eventDetail.pageData.playerResponse, false);
   assert.equal(eventDetail.pageData.playerResponse.videoDetails.videoId, 'vid789');
+  assert.equal('videoDetails' in eventDetail.pageData.response, false);
   assert.equal(eventDetail.pageData.response.contents.length, 1);
   assert.equal(eventDetail.pageData.response.contents[0].videoRenderer.videoId, 'vid789');
 }
@@ -529,6 +530,97 @@ function runYouTubeSandbox({ pathname = '/watch', hidden = false, initialFetch =
   env.setAdShowing(false);
   flushCleanPass();
   assert.equal(env.video.muted, false, 'Unmuted state before ad must be restored when ad ends');
+}
+
+// 10. YouTube Ixz.fetch flow: inspect res.body BEFORE res.clone().body.getReader() then read res.body.getReader()
+{
+  const env = runYouTubeSandbox({ pathname: '/', hidden: false });
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  const streamingArrayPayload = JSON.stringify([
+    {
+      playerResponse: {
+        videoDetails: { videoId: 'O6yWDJDyu70' },
+        adPlacements: [{ ad: true }],
+        playerAds: [1]
+      }
+    },
+    {
+      response: {
+        contents: [
+          { adSlotRenderer: { slotId: 'ad2' } },
+          { videoRenderer: { videoId: 'keep2' } }
+        ]
+      }
+    }
+  ]);
+
+  env.setFetch(async () => new Response(streamingArrayPayload, {
+    status: 200,
+    headers: { 'content-type': 'application/json; charset=UTF-8' }
+  }));
+
+  const req = new env.sandbox.Request('https://www.youtube.com/youtubei/v1/get_watch?prettyPrint=false', {
+    method: 'POST',
+    body: JSON.stringify({
+      context: { client: { clientName: 'WEB' } },
+      playerRequest: { videoId: 'O6yWDJDyu70', playbackContext: { contentPlaybackContext: {} } }
+    })
+  });
+  const res = await env.sandbox.fetch(req);
+  assert.equal(res.ok, true);
+  assert.ok(res.body && typeof res.body.getReader === 'function', 'Inspecting res.body must expose getReader');
+  assert.equal(res.bodyUsed, false, 'Inspecting res.body must not consume or lock native response stream');
+
+  const cloneReader = res.clone().body.getReader();
+  const firstProbe = await cloneReader.read();
+  cloneReader.cancel().catch(() => {});
+  assert.equal(firstProbe.value?.[0], 91, 'Cloned stream probe must start with "[" (91)');
+
+  const reader = res.body.getReader();
+  let fullText = '';
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    fullText += dec.decode(chunk.value, { stream: true });
+  }
+  fullText += dec.decode();
+  const items = JSON.parse(fullText);
+  assert.equal(items.length, 2);
+  assert.equal(items[0].playerResponse.videoDetails.videoId, 'O6yWDJDyu70');
+  assert.equal('adPlacements' in items[0].playerResponse, false);
+  assert.equal('playerAds' in items[0].playerResponse, false);
+  assert.equal(items[1].response.contents.length, 1);
+  assert.equal(items[1].response.contents[0].videoRenderer.videoId, 'keep2');
+}
+
+// 11. Inspecting res.body before .text() / .json() / .clone() must leave Response readable
+{
+  const env = runYouTubeSandbox({ pathname: '/watch', hidden: false });
+  const payload = JSON.stringify({
+    videoDetails: { videoId: 'vid999' },
+    adPlacements: [{ ad: true }]
+  });
+  env.setFetch(async () => new Response(payload, {
+    status: 200,
+    headers: { 'content-type': 'application/json; charset=UTF-8' }
+  }));
+
+  const r1 = await env.sandbox.fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false');
+  assert.equal(typeof r1.body.getReader, 'function');
+  assert.equal(r1.bodyUsed, false);
+  const textOut = JSON.parse(await r1.text());
+  assert.equal(textOut.videoDetails.videoId, 'vid999');
+  assert.equal('adPlacements' in textOut, false);
+
+  const r2 = await env.sandbox.fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false');
+  assert.ok(r2.body);
+  const cloned = r2.clone();
+  const jsonOut = await r2.json();
+  const clonedJsonOut = await cloned.json();
+  assert.equal(jsonOut.videoDetails.videoId, 'vid999');
+  assert.equal('adPlacements' in jsonOut, false);
+  assert.equal('adPlacements' in clonedJsonOut, false);
 }
 
 console.log(JSON.stringify({ status: 'PASS', contract: 'AdBlockDocumentScript universal/youtube split, timer gating, WeakSet dedupe, XHR/stream sanitization, and SPA ad-skip hygiene verified' }));
